@@ -1,0 +1,156 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum MediaAssetType {
+  video
+}
+
+enum MediaAssetSourceType {
+  upload
+  external_url
+}
+
+enum SubtitleFormat {
+  srt
+  vtt
+  ass
+  ssa
+  ttml
+  other
+}
+
+enum AudioTrackFormat {
+  mp3
+  aac
+  m4a
+  wav
+  ogg
+  webm
+  other
+}
+
+enum PlaybackStatus {
+  stopped
+  playing
+  paused
+}
+
+enum RoomEventType {
+  join
+  play
+  pause
+  stop
+  seek
+}
+
+model MediaAsset {
+  id               String               @id @default(cuid())
+  assetType        MediaAssetType       @default(video)
+  sourceType       MediaAssetSourceType @default(upload)
+  title            String
+  originalFilename String
+  mimeType         String               @default("video/mp4")
+  storagePath      String
+  durationSeconds  Float?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  audioTracks    AudioTrack[]
+  subtitleTracks SubtitleTrack[]
+  rooms          Room[]
+
+  @@index([createdAt])
+}
+
+model AudioTrack {
+  id             String           @id @default(cuid())
+  mediaAssetId   String
+  language       String
+  label          String
+  originalFormat AudioTrackFormat
+  sourcePath     String
+  normalizedPath String
+  isDefault      Boolean          @default(false)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  mediaAsset MediaAsset @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+
+  @@unique([mediaAssetId, sourcePath])
+  @@index([mediaAssetId, language])
+}
+
+model SubtitleTrack {
+  id             String         @id @default(cuid())
+  mediaAssetId   String
+  language       String
+  label          String
+  originalFormat SubtitleFormat
+  sourcePath     String
+  normalizedPath String?
+  isRenderable   Boolean        @default(false)
+  isDefault      Boolean        @default(false)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  mediaAsset MediaAsset @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+
+  @@unique([mediaAssetId, sourcePath])
+  @@index([mediaAssetId, language, isRenderable])
+}
+
+model Room {
+  id           String   @id @default(cuid())
+  publicId     String   @unique @default(cuid())
+  mediaAssetId String
+  name         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  mediaAsset    MediaAsset         @relation(fields: [mediaAssetId], references: [id], onDelete: Restrict)
+  playbackState RoomPlaybackState?
+  events        RoomEvent[]
+
+  @@index([mediaAssetId, createdAt])
+}
+
+model RoomPlaybackState {
+  roomId       String         @id
+  status       PlaybackStatus @default(stopped)
+  currentTime  Float          @default(0)
+  playbackRate Float          @default(1)
+  // Increment this in the application for optimistic concurrency on sync updates.
+  version      Int            @default(1)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+}
+
+model RoomEvent {
+  id              String        @id @default(cuid())
+  roomId          String
+  type            RoomEventType
+  actorSessionId  String?
+  currentTime     Float?
+  playbackRate    Float?
+  playbackVersion Int?
+  payload         Json?
+  createdAt       DateTime      @default(now())
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@index([roomId, createdAt])
+  @@index([roomId, type, createdAt])
+}
