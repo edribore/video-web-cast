@@ -1,9 +1,11 @@
 import "server-only";
 
 import { createPublicRoomId } from "@/lib/room-id";
-import { prisma } from "@/server/prisma";
+import { getPrismaClient } from "@/server/prisma";
 
 export async function createRoomForMediaAsset(mediaAssetId: string) {
+  const prisma = getPrismaClient();
+
   return prisma.room.create({
     data: {
       mediaAssetId,

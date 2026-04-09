@@ -8,7 +8,7 @@ import {
   storedUploadHref,
 } from "@/lib/routes";
 import { getUrlOrigin } from "@/lib/public-origin";
-import { prisma } from "@/server/prisma";
+import { getPrismaClient } from "@/server/prisma";
 import { getRoomRealtimeSnapshot } from "@/server/room-realtime";
 import type { RoomScaffoldSnapshot } from "@/types/room-sync";
 
@@ -17,6 +17,8 @@ export async function getRoomScaffoldSnapshot(
   publicBaseUrl: string | null,
   castBaseUrl: string | null,
 ): Promise<RoomScaffoldSnapshot> {
+  const prisma = getPrismaClient();
+
   const [room, realtimeSnapshot] = await Promise.all([
     prisma.room.findUnique({
       where: {
@@ -114,7 +116,5 @@ export async function getRoomScaffoldSnapshot(
     media,
   };
 
-  // Future group video call signaling should stay adjacent to room sync, but
-  // separate from playback state so those concerns can evolve independently.
   return snapshot;
 }

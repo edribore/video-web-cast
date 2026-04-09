@@ -21,7 +21,7 @@ import {
   isAcceptedSubtitleExtension,
   isAcceptedVideoFile,
 } from "@/lib/media";
-import { prisma } from "@/server/prisma";
+import { getPrismaClient } from "@/server/prisma";
 import { getLocalFileStorage } from "@/server/storage/local-file-storage";
 import { convertSrtToWebVtt } from "@/server/subtitles/srt-to-vtt";
 import type { UploadFormState, UploadScaffoldConfig } from "@/types/upload";
@@ -293,7 +293,6 @@ async function buildStoredSubtitleTrackPayload(
     originalFormat,
     sourcePath: storedSourceFile.relativePath,
     normalizedPath: null,
-    // TODO: Normalize ASS/SSA/TTML uploads into WebVTT when that pipeline is added.
     isRenderable: false,
     isDefault: track.isDefault,
   };
@@ -380,6 +379,7 @@ export function validateUploadSubmission(
 }
 
 export async function createUploadedMediaAsset(input: ParsedUploadSubmission) {
+  const prisma = getPrismaClient();
   const storage = getLocalFileStorage();
   const storageScope = `media-assets/${createSafeId("asset")}`;
 
@@ -443,6 +443,8 @@ export async function createUploadedMediaAsset(input: ParsedUploadSubmission) {
 }
 
 export async function getMediaAssetDetails(mediaId: string) {
+  const prisma = getPrismaClient();
+
   return prisma.mediaAsset.findUnique({
     where: {
       id: mediaId,
