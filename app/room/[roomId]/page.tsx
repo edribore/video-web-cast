@@ -9,6 +9,8 @@ import {
 import { normalizeRoomId } from "@/lib/room-id";
 import { getRoomScaffoldSnapshot } from "@/server/room-sync";
 
+export const dynamic = "force-dynamic";
+
 type RoomPageProps = {
   params: Promise<{ roomId: string }>;
 };
