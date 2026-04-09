@@ -6,7 +6,7 @@ import {
   createInitialPlaybackState,
   resolveSynchronizedPlaybackTime,
 } from "../lib/playback";
-import { prisma } from "./prisma";
+import { getPrismaClient } from "./prisma";
 import type {
   RoomSocketHydrationPayload,
   RoomSocketPlaybackSyncPayload,
@@ -60,6 +60,8 @@ function toRoomSyncEvent(
 export async function getRoomRealtimeSnapshot(
   publicRoomId: string,
 ): Promise<RoomSocketHydrationPayload | null> {
+  const prisma = getPrismaClient();
+
   const room = await prisma.room.findUnique({
     where: {
       publicId: publicRoomId,
@@ -89,6 +91,8 @@ export async function recordRoomJoin(
   publicRoomId: string,
   actorSessionId: string,
 ): Promise<RoomSocketHydrationPayload | null> {
+  const prisma = getPrismaClient();
+
   return prisma.$transaction(async (tx) => {
     const room = await tx.room.findUnique({
       where: {
@@ -133,6 +137,8 @@ export async function recordRoomJoin(
 export async function applySharedRoomControl(
   command: SharedRoomControlCommand,
 ): Promise<RoomSocketPlaybackSyncPayload | null> {
+  const prisma = getPrismaClient();
+
   return prisma.$transaction(async (tx) => {
     const room = await tx.room.findUnique({
       where: {
