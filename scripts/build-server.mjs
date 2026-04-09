@@ -18,6 +18,7 @@ await build({
     "react-dom",
     "pg",
     "socket.io",
-    "socket.io-client"
+    "socket.io-client",
+    "dotenv"
   ]
 });
