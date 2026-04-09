@@ -1,8 +1,11 @@
+import { mkdir } from "node:fs/promises";
 import { build } from "esbuild";
+
+await mkdir("dist", { recursive: true });
 
 await build({
   entryPoints: ["server.ts"],
-  outfile: ".next/standalone-server.js",
+  outfile: "dist/server.mjs",
   bundle: true,
   platform: "node",
   target: "node20",
@@ -13,9 +16,8 @@ await build({
     "next/*",
     "react",
     "react-dom",
-    "@prisma/client",
     "pg",
     "socket.io",
-    "socket.io-client",
-  ],
+    "socket.io-client"
+  ]
 });

@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "tsx server.ts --dev",
     "build": "prisma generate && next build && node scripts/build-server.mjs",
-    "start": "node .next/standalone-server.js --prod",
+    "start": "node dist/server.mjs --prod",
     "lint": "eslint",
     "postinstall": "prisma generate"
   },
