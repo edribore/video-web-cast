@@ -10,7 +10,6 @@ import {
   useState,
 } from "react";
 import {
-  syncChromecastSubtitleSelection,
   syncRoomPlaybackToChromecast,
   useChromecastAvailability,
   type ChromecastAvailabilityStatus,
@@ -339,8 +338,10 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       if (castStatusRef.current === "connected") {
         try {
           await syncRoomPlaybackToChromecast(
+            snapshot.roomId,
             snapshot.media,
             playback,
+            participantPreferencesRef.current.selectedAudioTrackId,
             participantPreferencesRef.current.selectedSubtitleTrackId,
           );
         } catch (error) {
@@ -549,33 +550,15 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     }
 
     void syncRoomPlaybackToChromecast(
+      snapshot.roomId,
       snapshot.media,
       authoritativePlaybackRef.current,
-      participantPreferencesRef.current.selectedSubtitleTrackId,
-    )
-      .catch((error) => {
-        const message = "Cast connected, but room media could not load.";
-        logDebugEvent({
-          level: "error",
-          category: "cast",
-          message,
-          source: "cast",
-          data: error,
-        });
-      });
-  }, [castStatus, snapshot.media]);
-
-  useEffect(() => {
-    if (castStatus !== "connected") {
-      return;
-    }
-
-    void syncChromecastSubtitleSelection(
-      snapshot.media,
+      participantPreferences.selectedAudioTrackId,
       participantPreferences.selectedSubtitleTrackId,
     )
       .catch((error) => {
-        const message = "Cast stayed connected, but subtitles could not update.";
+        const message =
+          "Cast stayed connected, but the selected audio or subtitle variant could not reload.";
         logDebugEvent({
           level: "error",
           category: "cast",
@@ -584,7 +567,13 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           data: error,
         });
       });
-  }, [castStatus, participantPreferences.selectedSubtitleTrackId, snapshot.media]);
+  }, [
+    castStatus,
+    participantPreferences.selectedAudioTrackId,
+    participantPreferences.selectedSubtitleTrackId,
+    snapshot.media,
+    snapshot.roomId,
+  ]);
 
   async function handleCastButton() {
     if (isCastActive) {
@@ -622,8 +611,9 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
               Shared room timeline, local language choices
             </h2>
             <p className="mt-3 max-w-2xl text-sm leading-6 text-muted">
-              Play, pause, seek, and stop are shared across the room. Subtitle
-              selection stays local, and Chromecast mirrors the same room state.
+              Play, pause, seek, and stop are shared across the room. Audio and
+              subtitle choices stay per-participant, and the current Cast session
+              uses the same selected tracks.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3 lg:justify-end">
@@ -757,7 +747,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
               {snapshot.shareUrl}
             </div>
             <p className="mt-3 text-xs leading-6 text-muted">
-              Shared controls affect everyone. Language selectors only affect this browser.
+              Shared controls affect everyone. Language selectors stay per participant and drive this browser plus its active Cast session.
             </p>
             <div className="mt-4 space-y-2 rounded-2xl border border-line bg-panel/80 px-4 py-3 text-xs leading-6 text-muted">
               <p>
@@ -792,7 +782,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           <div className="space-y-4">
             <div>
               <label htmlFor="audio-select" className="text-sm font-semibold uppercase tracking-[0.25em] text-muted">
-                Audio track (local only)
+                Audio track
               </label>
               <select
                 id="audio-select"
@@ -855,7 +845,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
             </div>
             <div>
               <label htmlFor="subtitle-select" className="text-sm font-semibold uppercase tracking-[0.25em] text-muted">
-                Subtitle track (local only)
+                Subtitle track
               </label>
               <select
                 id="subtitle-select"

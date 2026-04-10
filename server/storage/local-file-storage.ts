@@ -5,7 +5,12 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { createStorageFilename } from "@/lib/file-names";
 import type { FileStorage, SaveFileInput, StoredFile } from "@/server/storage/storage-service";
 
-const uploadRootDirectory = path.join(process.cwd(), "storage", "dev", "uploads");
+const uploadRootDirectory = path.join(
+  /* turbopackIgnore: true */ process.cwd(),
+  "storage",
+  "dev",
+  "uploads",
+);
 
 function toSystemPath(relativePath: string) {
   return relativePath.split("/").join(path.sep);
