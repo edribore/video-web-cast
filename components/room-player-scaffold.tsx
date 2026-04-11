@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import {
+  prepareChromecastMediaForSession,
   syncRoomPlaybackToChromecast,
   useChromecastAvailability,
   type ChromecastAvailabilityStatus,
@@ -589,6 +590,25 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
         category: "cast",
         message,
         source: "local_user",
+      });
+      return;
+    }
+
+    try {
+      await prepareChromecastMediaForSession(
+        snapshot.roomId,
+        snapshot.media,
+        participantPreferences.selectedAudioTrackId,
+        participantPreferences.selectedSubtitleTrackId,
+      );
+    } catch (error) {
+      logDebugEvent({
+        level: "warn",
+        category: "cast",
+        message:
+          "Cast start was blocked before requesting a session because the selected media variant could not be prepared.",
+        source: "local_user",
+        data: error,
       });
       return;
     }

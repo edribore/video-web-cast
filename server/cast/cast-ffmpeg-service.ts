@@ -1,6 +1,7 @@
 import "server-only";
 
 import { spawn } from "node:child_process";
+import { resolveConfiguredFfmpegBinary } from "@/server/cast/ffmpeg-availability";
 
 const ffmpegLogTailLength = 4000;
 
@@ -42,10 +43,6 @@ function trimOutputTail(value: string) {
   return value.slice(-ffmpegLogTailLength);
 }
 
-function resolveFfmpegBinary() {
-  return process.env.FFMPEG_BIN || process.env.FFMPEG_PATH || "ffmpeg";
-}
-
 function buildCommandString(binary: string, args: string[]) {
   return [binary, ...args]
     .map((part) =>
@@ -57,7 +54,7 @@ function buildCommandString(binary: string, args: string[]) {
 export async function muxCastVariantToMp4(
   input: CastFfmpegMuxInput,
 ): Promise<CastFfmpegRunDiagnostics> {
-  const ffmpegBinary = resolveFfmpegBinary();
+  const ffmpegBinary = resolveConfiguredFfmpegBinary();
   const args = [
     "-y",
     "-nostdin",

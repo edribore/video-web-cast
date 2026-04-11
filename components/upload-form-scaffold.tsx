@@ -1,8 +1,7 @@
 "use client";
 
-import { useActionState, useEffect, useState } from "react";
-import { useFormStatus } from "react-dom";
-import { uploadMediaAction } from "@/app/upload/actions";
+import { startTransition, useEffect, useState, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
 import { createSafeId } from "@/lib/create-safe-id";
 import { logDebugEvent } from "@/lib/debug-store";
 import {
@@ -14,7 +13,9 @@ import {
   useDebugRuntimeState,
 } from "@/components/debug-runtime";
 import {
-  initialUploadFormState,
+  initialUploadClientState,
+  type UploadApiFailureResponse,
+  type UploadApiSuccessResponse,
   type UploadScaffoldConfig,
 } from "@/types/upload";
 
@@ -26,22 +27,145 @@ type TrackRow = {
   id: string;
 };
 
+type UploadRequestCallbacks = {
+  onProcessing(): void;
+  onProgress(progress: { loaded: number; total: number }): void;
+};
+
+type UploadRequestError = {
+  message: string;
+  payload: UploadApiFailureResponse | null;
+  status: number | null;
+};
+
 function createTrackRow(): TrackRow {
   return {
     id: createSafeId("track"),
   };
 }
 
-function UploadSubmitButton() {
-  const { pending } = useFormStatus();
+function formatByteCount(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
+  }
 
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let currentValue = value;
+  let unitIndex = 0;
+
+  while (currentValue >= 1024 && unitIndex < units.length - 1) {
+    currentValue /= 1024;
+    unitIndex += 1;
+  }
+
+  const fractionDigits = unitIndex === 0 ? 0 : currentValue >= 100 ? 0 : 1;
+  return `${currentValue.toFixed(fractionDigits)} ${units[unitIndex]}`;
+}
+
+function calculateSelectedFileBytes(formData: FormData) {
+  let totalBytes = 0;
+
+  for (const value of formData.values()) {
+    if (value instanceof File && value.size > 0) {
+      totalBytes += value.size;
+    }
+  }
+
+  return totalBytes;
+}
+
+function parseUploadApiPayload(xhr: XMLHttpRequest) {
+  const response = xhr.response;
+
+  if (response && typeof response === "object") {
+    return response as UploadApiSuccessResponse | UploadApiFailureResponse;
+  }
+
+  if (!xhr.responseText) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(xhr.responseText) as
+      | UploadApiSuccessResponse
+      | UploadApiFailureResponse;
+  } catch {
+    return null;
+  }
+}
+
+function submitUploadRequest(
+  formData: FormData,
+  callbacks: UploadRequestCallbacks,
+) {
+  return new Promise<UploadApiSuccessResponse>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload");
+    xhr.responseType = "json";
+
+    xhr.upload.addEventListener("progress", (event) => {
+      callbacks.onProgress({
+        loaded: event.loaded,
+        total: event.lengthComputable ? event.total : 0,
+      });
+    });
+
+    xhr.upload.addEventListener("load", () => {
+      callbacks.onProcessing();
+    });
+
+    xhr.addEventListener("error", () => {
+      reject({
+        message: "The upload request failed before the server returned a response.",
+        payload: null,
+        status: null,
+      } satisfies UploadRequestError);
+    });
+
+    xhr.addEventListener("abort", () => {
+      reject({
+        message: "The upload request was interrupted before it finished.",
+        payload: null,
+        status: null,
+      } satisfies UploadRequestError);
+    });
+
+    xhr.addEventListener("load", () => {
+      const payload = parseUploadApiPayload(xhr);
+
+      if (xhr.status >= 200 && xhr.status < 300 && payload?.ok) {
+        resolve(payload);
+        return;
+      }
+
+      reject({
+        message:
+          payload && !payload.ok
+            ? payload.message
+            : "The upload could not be completed.",
+        payload: payload && !payload.ok ? payload : null,
+        status: xhr.status,
+      } satisfies UploadRequestError);
+    });
+
+    xhr.send(formData);
+  });
+}
+
+function UploadSubmitButton({
+  disabled,
+  label,
+}: {
+  disabled: boolean;
+  label: string;
+}) {
   return (
     <button
       type="submit"
-      disabled={pending}
+      disabled={disabled}
       className="rounded-full bg-accent px-5 py-3 text-sm font-semibold text-white transition hover:bg-accent-strong disabled:cursor-not-allowed disabled:bg-[#d9c4b8]"
     >
-      {pending ? "Uploading..." : "Upload media"}
+      {label}
     </button>
   );
 }
@@ -54,6 +178,7 @@ type TrackSectionProps = {
   accept: string;
   supportedExtensions: readonly string[];
   defaultIndex: number;
+  disabled: boolean;
   onDefaultIndexChange(nextIndex: number): void;
   onAddRow(): void;
   onRemoveRow(index: number): void;
@@ -68,6 +193,7 @@ function TrackSection({
   accept,
   supportedExtensions,
   defaultIndex,
+  disabled,
   onDefaultIndexChange,
   onAddRow,
   onRemoveRow,
@@ -85,7 +211,7 @@ function TrackSection({
       : "defaultSubtitleTrackIndex";
 
   return (
-    <fieldset className="rounded-3xl border border-line bg-white/75 p-5">
+    <fieldset className="rounded-3xl border border-line bg-white/75 p-5" disabled={disabled}>
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <legend className="text-base font-semibold">{legend}</legend>
@@ -94,7 +220,8 @@ function TrackSection({
         <button
           type="button"
           onClick={onAddRow}
-          className="rounded-full border border-line px-4 py-2 text-sm font-semibold transition hover:border-accent hover:text-accent-strong"
+          disabled={disabled}
+          className="rounded-full border border-line px-4 py-2 text-sm font-semibold transition hover:border-accent hover:text-accent-strong disabled:cursor-not-allowed disabled:text-muted"
         >
           Add {groupName} track
         </button>
@@ -122,7 +249,8 @@ function TrackSection({
               <button
                 type="button"
                 onClick={() => onRemoveRow(index)}
-                className="rounded-full border border-line px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] transition hover:border-accent hover:text-accent-strong"
+                disabled={disabled}
+                className="rounded-full border border-line px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] transition hover:border-accent hover:text-accent-strong disabled:cursor-not-allowed disabled:text-muted"
               >
                 Remove
               </button>
@@ -135,7 +263,8 @@ function TrackSection({
                   name={fileFieldName}
                   type="file"
                   accept={accept}
-                  className="mt-2 block w-full rounded-2xl border border-dashed border-line bg-white px-4 py-4 text-sm"
+                  disabled={disabled}
+                  className="mt-2 block w-full rounded-2xl border border-dashed border-line bg-white px-4 py-4 text-sm disabled:cursor-not-allowed disabled:text-muted"
                 />
               </label>
               <label className="text-sm font-semibold">
@@ -144,7 +273,8 @@ function TrackSection({
                   name={languageFieldName}
                   type="text"
                   placeholder="en"
-                  className="mt-2 min-h-12 w-full rounded-2xl border border-line bg-white px-4 outline-none transition focus:border-accent"
+                  disabled={disabled}
+                  className="mt-2 min-h-12 w-full rounded-2xl border border-line bg-white px-4 outline-none transition focus:border-accent disabled:cursor-not-allowed disabled:text-muted"
                 />
               </label>
               <label className="text-sm font-semibold">
@@ -155,7 +285,8 @@ function TrackSection({
                   placeholder={
                     groupName === "audio" ? "English dubbing" : "English captions"
                   }
-                  className="mt-2 min-h-12 w-full rounded-2xl border border-line bg-white px-4 outline-none transition focus:border-accent"
+                  disabled={disabled}
+                  className="mt-2 min-h-12 w-full rounded-2xl border border-line bg-white px-4 outline-none transition focus:border-accent disabled:cursor-not-allowed disabled:text-muted"
                 />
               </label>
             </div>
@@ -167,6 +298,7 @@ function TrackSection({
                 value={String(index)}
                 checked={defaultIndex === index}
                 onChange={() => onDefaultIndexChange(index)}
+                disabled={disabled}
                 className="h-4 w-4 accent-accent"
               />
               Use as this media asset&apos;s default {groupName} track
@@ -186,26 +318,46 @@ function TrackSection({
 }
 
 export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
-  const [state, formAction] = useActionState(
-    uploadMediaAction,
-    initialUploadFormState,
-  );
-  const [titleInput, setTitleInput] = useState(state.values.title);
+  const router = useRouter();
+  const [uploadState, setUploadState] = useState(initialUploadClientState);
+  const [titleInput, setTitleInput] = useState("");
   const [audioRows, setAudioRows] = useState<TrackRow[]>(() => [createTrackRow()]);
   const [subtitleRows, setSubtitleRows] = useState<TrackRow[]>(() => [
     createTrackRow(),
   ]);
   const [defaultAudioIndex, setDefaultAudioIndex] = useState(0);
   const [defaultSubtitleIndex, setDefaultSubtitleIndex] = useState(0);
+  const isBusy =
+    uploadState.status === "uploading" ||
+    uploadState.status === "processing" ||
+    uploadState.status === "success";
+  const submitButtonLabel =
+    uploadState.status === "uploading"
+      ? "Uploading..."
+      : uploadState.status === "processing"
+        ? "Processing..."
+        : uploadState.status === "success"
+          ? "Redirecting..."
+          : "Upload media";
+  const showProgressCard =
+    uploadState.status === "uploading" ||
+    uploadState.status === "processing" ||
+    uploadState.status === "success";
 
   useDebugFeatureFlags({
     debugExportEnabled: true,
   });
 
   useDebugRuntimeState("upload/form", {
-    status: state.status,
-    message: state.message,
-    fieldErrors: state.fieldErrors,
+    status: uploadState.status,
+    progressPercent: uploadState.progressPercent,
+    uploadedBytes: uploadState.uploadedBytes,
+    totalBytes: uploadState.totalBytes,
+    message: uploadState.message,
+    fieldErrors: uploadState.fieldErrors,
+    serverError: uploadState.serverError,
+    redirectTriggered: uploadState.redirectTriggered,
+    redirectTarget: uploadState.redirectTarget,
     titleInput,
     audioRowCount: audioRows.length,
     subtitleRowCount: subtitleRows.length,
@@ -215,20 +367,27 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
   });
 
   useEffect(() => {
-    if (state.status !== "error") {
+    if (uploadState.status !== "error") {
       return;
     }
 
     logDebugEvent({
       level: "warn",
       category: "upload",
-      message: state.message || "Upload validation failed.",
+      message: uploadState.message || "Upload failed.",
       source: "local_user",
-      data: state.fieldErrors,
+      data: {
+        fieldErrors: uploadState.fieldErrors,
+        serverError: uploadState.serverError,
+      },
     });
-  }, [state.fieldErrors, state.message, state.status]);
+  }, [uploadState]);
 
   function removeAudioRow(index: number) {
+    if (isBusy) {
+      return;
+    }
+
     setAudioRows((currentRows) => {
       if (currentRows.length === 1) {
         return currentRows;
@@ -261,6 +420,10 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
   }
 
   function removeSubtitleRow(index: number) {
+    if (isBusy) {
+      return;
+    }
+
     setSubtitleRows((currentRows) => {
       if (currentRows.length === 1) {
         return currentRows;
@@ -292,6 +455,139 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
     });
   }
 
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (isBusy) {
+      return;
+    }
+
+    const formElement = event.currentTarget;
+    const formData = new FormData(formElement);
+    const estimatedTotalBytes = calculateSelectedFileBytes(formData);
+
+    setUploadState({
+      status: "uploading",
+      progressPercent: 0,
+      uploadedBytes: 0,
+      totalBytes: estimatedTotalBytes,
+      message:
+        estimatedTotalBytes > 0
+          ? "Uploading media files to the server..."
+          : "Starting upload...",
+      fieldErrors: {},
+      serverError: null,
+      redirectTriggered: false,
+      redirectTarget: null,
+    });
+
+    logDebugEvent({
+      level: "info",
+      category: "upload",
+      message: "Submitted the upload form.",
+      source: "local_user",
+      data: {
+        titleInput,
+        audioRowCount: audioRows.length,
+        subtitleRowCount: subtitleRows.length,
+        estimatedTotalBytes,
+      },
+    });
+
+    try {
+      const response = await submitUploadRequest(formData, {
+        onProcessing: () => {
+          setUploadState((currentState) => ({
+            ...currentState,
+            status: "processing",
+            progressPercent: 100,
+            uploadedBytes:
+              currentState.totalBytes > 0
+                ? currentState.totalBytes
+                : currentState.uploadedBytes,
+            message: "Upload finished. Processing media files on the server...",
+            fieldErrors: {},
+            serverError: null,
+          }));
+          logDebugEvent({
+            level: "info",
+            category: "upload",
+            message: "Upload transfer finished. Waiting for server-side processing.",
+            source: "local_user",
+          });
+        },
+        onProgress: ({ loaded, total }) => {
+          const nextTotal = total > 0 ? total : estimatedTotalBytes;
+          const nextProgressPercent =
+            nextTotal > 0
+              ? Math.max(0, Math.min(100, Math.round((loaded / nextTotal) * 100)))
+              : 0;
+
+          setUploadState((currentState) => ({
+            ...currentState,
+            status: "uploading",
+            progressPercent: nextProgressPercent,
+            uploadedBytes: loaded,
+            totalBytes: nextTotal,
+            message: `Uploading media files... ${nextProgressPercent}%`,
+            fieldErrors: {},
+            serverError: null,
+          }));
+        },
+      });
+
+      setUploadState((currentState) => ({
+        ...currentState,
+        status: "success",
+        progressPercent: 100,
+        uploadedBytes:
+          currentState.totalBytes > 0
+            ? currentState.totalBytes
+            : currentState.uploadedBytes,
+        message: response.message,
+        fieldErrors: {},
+        serverError: null,
+        redirectTriggered: true,
+        redirectTarget: response.redirectTo,
+      }));
+
+      logDebugEvent({
+        level: "info",
+        category: "upload",
+        message: "Upload completed successfully. Redirecting to the media details page.",
+        source: "local_user",
+        data: {
+          mediaId: response.mediaId,
+          redirectTo: response.redirectTo,
+        },
+      });
+
+      startTransition(() => {
+        router.push(response.redirectTo);
+      });
+    } catch (error) {
+      const uploadError =
+        error && typeof error === "object" && "message" in error
+          ? (error as UploadRequestError)
+          : null;
+      const nextFieldErrors = uploadError?.payload?.fieldErrors ?? {};
+      const nextServerError =
+        Object.keys(nextFieldErrors).length > 0
+          ? null
+          : uploadError?.message ?? "The upload could not be completed.";
+
+      setUploadState((currentState) => ({
+        ...currentState,
+        status: "error",
+        message: uploadError?.message ?? "The upload could not be completed.",
+        fieldErrors: nextFieldErrors,
+        serverError: nextServerError,
+        redirectTriggered: false,
+        redirectTarget: null,
+      }));
+    }
+  }
+
   return (
     <section className="rounded-[2rem] border border-line bg-panel p-8 shadow-[0_20px_60px_rgba(42,31,22,0.08)]">
       <p className="text-sm font-semibold uppercase tracking-[0.3em] text-muted">
@@ -303,34 +599,43 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
       <p className="mt-3 max-w-2xl text-sm leading-6 text-muted">
         Files are stored locally in the project&apos;s development storage
         directory. Prisma keeps the media asset plus each uploaded audio and
-        subtitle language track as separate records.
+        subtitle track as separate records.
       </p>
 
+      {showProgressCard ? (
+        <div className="mt-6 rounded-3xl border border-[#c9d5f0] bg-[#f1f6ff] px-5 py-5 text-sm leading-6 text-[#244f8f]">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="font-semibold">{uploadState.message}</p>
+            <p className="text-base font-semibold">
+              {uploadState.progressPercent}%
+            </p>
+          </div>
+          <div className="mt-4 h-3 overflow-hidden rounded-full bg-white/80">
+            <div
+              className="h-full rounded-full bg-[#244f8f] transition-[width] duration-200"
+              style={{ width: `${uploadState.progressPercent}%` }}
+            />
+          </div>
+          {uploadState.totalBytes > 0 ? (
+            <p className="mt-3 text-xs leading-6 text-[#486595]">
+              {formatByteCount(uploadState.uploadedBytes)} /{" "}
+              {formatByteCount(uploadState.totalBytes)}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
       <form
-        action={formAction}
-        onSubmit={() => {
-          logDebugEvent({
-            level: "info",
-            category: "upload",
-            message: "Submitted the upload form.",
-            source: "local_user",
-            data: {
-              titleInput,
-              audioRowCount: audioRows.length,
-              subtitleRowCount: subtitleRows.length,
-            },
-          });
-        }}
+        onSubmit={(event) => void handleSubmit(event)}
         data-debug-upload-form="true"
         className="mt-8 space-y-6"
       >
-        {state.status === "error" ? (
+        {uploadState.status === "error" ? (
           <div className="rounded-3xl border border-[#d7b7a6] bg-[#fff3ec] px-5 py-4 text-sm leading-6 text-[#7f4022]">
-            <p className="font-semibold">{state.message}</p>
-            <p className="mt-2">
-              If the request included files, reselect them before submitting
-              again.
-            </p>
+            <p className="font-semibold">{uploadState.message}</p>
+            {uploadState.serverError ? (
+              <p className="mt-2">{uploadState.serverError}</p>
+            ) : null}
           </div>
         ) : null}
 
@@ -347,11 +652,12 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
             type="file"
             accept={config.videoAccept}
             required
-            className="mt-4 block w-full rounded-2xl border border-dashed border-line bg-panel px-4 py-4 text-sm"
+            disabled={isBusy}
+            className="mt-4 block w-full rounded-2xl border border-dashed border-line bg-panel px-4 py-4 text-sm disabled:cursor-not-allowed disabled:text-muted"
           />
-          {state.fieldErrors.videoFile ? (
+          {uploadState.fieldErrors.videoFile ? (
             <p className="mt-3 text-sm font-semibold text-[#7f4022]">
-              {state.fieldErrors.videoFile}
+              {uploadState.fieldErrors.videoFile}
             </p>
           ) : null}
         </div>
@@ -364,8 +670,13 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
           accept={config.audioAccept}
           supportedExtensions={acceptedAudioExtensions}
           defaultIndex={defaultAudioIndex}
+          disabled={isBusy}
           onDefaultIndexChange={setDefaultAudioIndex}
           onAddRow={() => {
+            if (isBusy) {
+              return;
+            }
+
             setAudioRows((rows) => [...rows, createTrackRow()]);
             logDebugEvent({
               level: "info",
@@ -375,7 +686,7 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
             });
           }}
           onRemoveRow={removeAudioRow}
-          fieldError={state.fieldErrors.audioTracks}
+          fieldError={uploadState.fieldErrors.audioTracks}
         />
 
         <TrackSection
@@ -386,8 +697,13 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
           accept={config.subtitleAccept}
           supportedExtensions={acceptedSubtitleExtensions}
           defaultIndex={defaultSubtitleIndex}
+          disabled={isBusy}
           onDefaultIndexChange={setDefaultSubtitleIndex}
           onAddRow={() => {
+            if (isBusy) {
+              return;
+            }
+
             setSubtitleRows((rows) => [...rows, createTrackRow()]);
             logDebugEvent({
               level: "info",
@@ -397,7 +713,7 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
             });
           }}
           onRemoveRow={removeSubtitleRow}
-          fieldError={state.fieldErrors.subtitleTracks}
+          fieldError={uploadState.fieldErrors.subtitleTracks}
         />
 
         <div className="rounded-3xl border border-line bg-white/75 p-5">
@@ -411,15 +727,16 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
             value={titleInput}
             onChange={(event) => setTitleInput(event.target.value)}
             placeholder="Leave blank to derive the title from the MP4 filename"
-            className="mt-4 min-h-12 w-full rounded-2xl border border-line bg-panel px-4 outline-none transition focus:border-accent"
+            disabled={isBusy}
+            className="mt-4 min-h-12 w-full rounded-2xl border border-line bg-panel px-4 outline-none transition focus:border-accent disabled:cursor-not-allowed disabled:text-muted"
           />
           <p className="mt-3 text-sm leading-6 text-muted">
             If left blank, the title is generated from the uploaded MP4
             filename.
           </p>
-          {state.fieldErrors.title ? (
+          {uploadState.fieldErrors.title ? (
             <p className="mt-3 text-sm font-semibold text-[#7f4022]">
-              {state.fieldErrors.title}
+              {uploadState.fieldErrors.title}
             </p>
           ) : null}
         </div>
@@ -442,7 +759,7 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
           </ul>
         </div>
 
-        <UploadSubmitButton />
+        <UploadSubmitButton disabled={isBusy} label={submitButtonLabel} />
       </form>
     </section>
   );

@@ -1,8 +1,5 @@
 import { resolveCastPublicBaseUrl } from "@/lib/public-origin";
-import {
-  CastMediaResolverError,
-  resolveCastMediaForRoom,
-} from "@/server/cast/cast-media-resolver";
+import { resolveCastMediaForRoom } from "@/server/cast/cast-media-resolver";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,30 +35,28 @@ export async function GET(
       headers: buildJsonHeaders(),
     });
   } catch (error) {
-    if (error instanceof CastMediaResolverError) {
-      return Response.json(
-        {
-          code: error.code,
-          details: error.details ?? null,
-          error: error.message,
-        },
-        {
-          headers: buildJsonHeaders(),
-          status: error.status,
-        },
-      );
-    }
-
     return Response.json(
       {
-        code: "cast_resolve_failed",
-        details:
-          error instanceof Error
-            ? {
-                message: error.message,
-              }
-            : null,
-        error: "The Cast media payload could not be resolved.",
+        ok: false,
+        errorCode: "cast_resolve_failed",
+        message: "The Cast media payload could not be resolved.",
+        castMode: "resolver_error",
+        warnings: [],
+        diagnostics: {
+          requestedAudioTrackId: audioTrackId,
+          requestedSubtitleTrackId: subtitleTrackId,
+          effectiveAudioTrackId: null,
+          effectiveSubtitleTrackId: null,
+          subtitlesIncluded: false,
+          variantCacheKey: null,
+          variantId: null,
+          variantStatus: "failed",
+          ffmpegStatus: "failed",
+          ffmpegAvailable: null,
+          ffmpegBinary: null,
+          ffmpegFailureReason:
+            error instanceof Error ? error.message : "Unknown resolver failure.",
+        },
       },
       {
         headers: buildJsonHeaders(),

@@ -4,7 +4,12 @@ import { useEffect, useState } from "react";
 import { logDebugEvent, setDebugRuntimeState } from "@/lib/debug-store";
 import { isCastableAbsoluteUrl } from "@/lib/public-origin";
 import { resolveSynchronizedPlaybackTime } from "@/lib/playback";
-import type { CastResolvedMediaPayload } from "@/types/cast";
+import type {
+  CastResolvedMediaFailurePayload,
+  CastResolvedMediaResponse,
+  CastResolvedMediaSuccessPayload,
+  CastResolverWarning,
+} from "@/types/cast";
 import type { PlaybackStateSnapshot } from "@/types/playback";
 import type { RoomMediaSummary } from "@/types/room-sync";
 
@@ -52,11 +57,16 @@ type CastLoadRequestDiagnostics = {
   selectedAudioTrackId: string | null;
   selectedSubtitleTrackId: string | null;
   activeTrackIds: number[];
-  castMode: CastResolvedMediaPayload["castMode"];
+  castMode: CastResolvedMediaSuccessPayload["castMode"];
   selectionSignature: string;
+  castFallbackApplied: boolean;
+  castFallbackReason: string | null;
+  resolverWarnings: CastResolverWarning[];
   variantCacheKey: string | null;
   variantId: string | null;
   variantStatus: string | null;
+  ffmpegAvailable: boolean | null;
+  ffmpegBinary: string | null;
   ffmpegGenerationStatus: string | null;
   ffmpegFailureReason: string | null;
 };
@@ -236,6 +246,7 @@ type CastErrorCode =
   | "context_init_failed"
   | "session_request_failed"
   | "session_end_failed"
+  | "media_resolve_failed"
   | "media_load_failed";
 
 class ChromecastError extends Error {
@@ -263,7 +274,7 @@ let castRuntimeSnapshot: Record<string, unknown> = {};
 const castSessionLoadRecords = new WeakMap<object, CastSessionLoadRecord>();
 const castSessionIdentities = new WeakMap<object, CastSessionIdentity>();
 const chromecastRuntimeListeners = new Set<ChromecastRuntimeListener>();
-const castResolvedMediaCache = new Map<string, CastResolvedMediaPayload>();
+const castResolvedMediaCache = new Map<string, CastResolvedMediaSuccessPayload>();
 let castSessionSequence = 0;
 
 function getCastSdkWindow() {
@@ -340,22 +351,95 @@ function buildCastResolveUrl(
   return url.toString();
 }
 
-function updateCastResolvedMediaRuntimeState(payload: CastResolvedMediaPayload) {
+function getPrimaryCastResolverWarning(warnings: CastResolverWarning[]) {
+  return warnings[0] ?? null;
+}
+
+function readCastResolverWarnings(value: unknown): CastResolverWarning[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter(
+    (warning): warning is CastResolverWarning =>
+      Boolean(warning) &&
+      typeof warning === "object" &&
+      typeof warning.code === "string" &&
+      typeof warning.message === "string",
+  );
+}
+
+function updateCastResolvedMediaRuntimeState(
+  payload: CastResolvedMediaSuccessPayload,
+) {
+  const primaryWarning = getPrimaryCastResolverWarning(payload.warnings);
+  const castFallbackApplied =
+    payload.castMode === "fallback_base_video_no_external_audio";
+
   updateChromecastRuntimeState({
+    castResolverOk: true,
+    castResolverWarnings: payload.warnings,
+    castResolverErrorCode: null,
+    castResolverErrorMessage: null,
+    castFallbackApplied,
+    castFallbackReason: castFallbackApplied ? primaryWarning?.message ?? null : null,
     resolvedCastMode: payload.castMode,
     resolvedContentUrl: payload.contentUrl,
     resolvedContentType: payload.contentType,
     resolvedSelectionSignature: payload.selectionSignature,
     resolvedAudioTrackId: payload.selectedAudioTrackId,
     resolvedSubtitleTrackId: payload.selectedSubtitleTrackId,
+    resolvedEffectiveAudioTrackId: payload.diagnostics.effectiveAudioTrackId,
+    resolvedEffectiveSubtitleTrackId: payload.diagnostics.effectiveSubtitleTrackId,
     resolvedSubtitleTrackCount: payload.textTracks.length,
     resolvedActiveTrackIds: payload.activeTrackIds,
     subtitlesIncludedInLoadRequest: payload.textTracks.length > 0,
     castVariantCacheKey: payload.diagnostics.variantCacheKey,
     castVariantId: payload.diagnostics.variantId,
     castVariantStatus: payload.diagnostics.variantStatus,
+    ffmpegAvailable: payload.diagnostics.ffmpegAvailable,
+    ffmpegBinary: payload.diagnostics.ffmpegBinary,
     ffmpegGenerationStatus: payload.diagnostics.ffmpegStatus,
     ffmpegFailureReason: payload.diagnostics.ffmpegFailureReason,
+  });
+}
+
+function updateCastResolverFailureRuntimeState(
+  payload: CastResolvedMediaFailurePayload,
+  fallbackSelection: {
+    selectedAudioTrackId: string | null;
+    selectedSubtitleTrackId: string | null;
+  },
+) {
+  updateChromecastRuntimeState({
+    castResolverOk: false,
+    castResolverWarnings: payload.warnings,
+    castResolverErrorCode: payload.errorCode,
+    castResolverErrorMessage: payload.message,
+    castFallbackApplied: false,
+    castFallbackReason: null,
+    resolvedCastMode: payload.castMode,
+    resolvedContentUrl: null,
+    resolvedContentType: null,
+    resolvedSelectionSignature: null,
+    resolvedAudioTrackId: fallbackSelection.selectedAudioTrackId,
+    resolvedSubtitleTrackId: fallbackSelection.selectedSubtitleTrackId,
+    resolvedEffectiveAudioTrackId: payload.diagnostics.effectiveAudioTrackId,
+    resolvedEffectiveSubtitleTrackId: payload.diagnostics.effectiveSubtitleTrackId,
+    resolvedSubtitleTrackCount: 0,
+    resolvedActiveTrackIds: [],
+    subtitlesIncludedInLoadRequest: payload.diagnostics.subtitlesIncluded,
+    castVariantCacheKey: payload.diagnostics.variantCacheKey,
+    castVariantId: payload.diagnostics.variantId,
+    castVariantStatus: payload.diagnostics.variantStatus,
+    ffmpegAvailable: payload.diagnostics.ffmpegAvailable,
+    ffmpegBinary: payload.diagnostics.ffmpegBinary,
+    ffmpegGenerationStatus: payload.diagnostics.ffmpegStatus,
+    ffmpegFailureReason: payload.diagnostics.ffmpegFailureReason,
+    mediaLoadStatus: "resolver_blocked",
+    mediaLoadSucceeded: false,
+    mediaLoadBlocked: true,
+    mediaLoadLikelyFailureReason: payload.message,
   });
 }
 
@@ -394,46 +478,57 @@ async function resolveCastMediaPayload(
     },
   );
   const responsePayload = (await response.json().catch(() => null)) as
-    | CastResolvedMediaPayload
-    | {
-        code?: string;
-        details?: unknown;
-        error?: string;
-      }
+    | CastResolvedMediaResponse
     | null;
 
-  if (!response.ok || !responsePayload || !("contentUrl" in responsePayload)) {
-    const failureMessage =
-      responsePayload &&
-      typeof responsePayload === "object" &&
-      "error" in responsePayload &&
-      typeof responsePayload.error === "string"
-        ? responsePayload.error
-        : "The Cast media payload could not be resolved for this room.";
-    const failureCode =
-      responsePayload &&
-      typeof responsePayload === "object" &&
-      "code" in responsePayload &&
-      typeof responsePayload.code === "string"
-        ? responsePayload.code
-        : "failed";
+  if (!responsePayload || typeof responsePayload !== "object" || !("ok" in responsePayload)) {
+    const failureMessage = "The Cast media payload could not be resolved for this room.";
 
     updateChromecastRuntimeState({
-      resolvedCastMode: null,
+      castResolverOk: false,
+      castResolverWarnings: [],
+      castResolverErrorCode: "cast_resolve_failed",
+      castResolverErrorMessage: failureMessage,
+      castFallbackApplied: false,
+      castFallbackReason: null,
+      resolvedCastMode: "resolver_error",
       resolvedContentUrl: null,
       resolvedContentType: null,
       resolvedSelectionSignature: null,
       resolvedAudioTrackId: normalizedAudioTrackId,
       resolvedSubtitleTrackId: normalizedSubtitleTrackId,
+      resolvedEffectiveAudioTrackId: null,
+      resolvedEffectiveSubtitleTrackId: null,
       subtitlesIncludedInLoadRequest: false,
       castVariantCacheKey: null,
       castVariantId: null,
-      castVariantStatus: failureCode,
+      castVariantStatus: "failed",
+      ffmpegAvailable: null,
+      ffmpegBinary: null,
       ffmpegGenerationStatus: "failed",
       ffmpegFailureReason: failureMessage,
+      mediaLoadStatus: "resolver_failed",
+      mediaLoadSucceeded: false,
+      mediaLoadBlocked: true,
+      mediaLoadLikelyFailureReason: failureMessage,
     });
 
-    throw new ChromecastError("media_load_failed", failureMessage, {
+    throw new ChromecastError("media_resolve_failed", failureMessage, {
+      roomId,
+      selectedAudioTrackId: normalizedAudioTrackId,
+      selectedSubtitleTrackId: normalizedSubtitleTrackId,
+      responsePayload,
+      status: response.status,
+    });
+  }
+
+  if (!responsePayload.ok) {
+    updateCastResolverFailureRuntimeState(responsePayload, {
+      selectedAudioTrackId: normalizedAudioTrackId,
+      selectedSubtitleTrackId: normalizedSubtitleTrackId,
+    });
+
+    throw new ChromecastError("media_resolve_failed", responsePayload.message, {
       roomId,
       selectedAudioTrackId: normalizedAudioTrackId,
       selectedSubtitleTrackId: normalizedSubtitleTrackId,
@@ -621,6 +716,26 @@ function buildChromecastPresentationState(
       : null;
   const activeMediaSessionConfirmedForCurrentSession =
     runtimeSnapshot.activeMediaSessionConfirmedForCurrentSession === true;
+  const castResolverOk =
+    runtimeSnapshot.castResolverOk === true
+      ? true
+      : runtimeSnapshot.castResolverOk === false
+        ? false
+        : null;
+  const castResolverErrorCode =
+    typeof runtimeSnapshot.castResolverErrorCode === "string"
+      ? runtimeSnapshot.castResolverErrorCode
+      : null;
+  const castResolverErrorMessage =
+    typeof runtimeSnapshot.castResolverErrorMessage === "string"
+      ? runtimeSnapshot.castResolverErrorMessage
+      : null;
+  const castResolverWarnings = readCastResolverWarnings(
+    runtimeSnapshot.castResolverWarnings,
+  );
+  const primaryResolverWarning = getPrimaryCastResolverWarning(
+    castResolverWarnings,
+  );
   const hasActiveSessionFailure =
     Boolean(currentCastSessionId && currentCastSessionErrorCode) &&
     !activeMediaSessionConfirmedForCurrentSession;
@@ -636,14 +751,36 @@ function buildChromecastPresentationState(
     };
   }
 
+  if (castResolverOk === false && !activeMediaSessionConfirmedForCurrentSession) {
+    return {
+      status: "error" as const,
+      issue:
+        castResolverErrorMessage ??
+        "Chromecast media preparation is blocked for the current room selection.",
+      issueCode: castResolverErrorCode ?? "media_resolve_failed",
+      canRequestSession: currentCastSessionId == null,
+    };
+  }
+
+  if (castResolverOk === false && activeMediaSessionConfirmedForCurrentSession) {
+    return {
+      status: "connected" as const,
+      issue:
+        castResolverErrorMessage ??
+        "Chromecast kept the current media because the requested room selection could not be prepared.",
+      issueCode: castResolverErrorCode ?? "media_resolve_failed",
+      canRequestSession: false,
+    };
+  }
+
   if (
     castState === getCastSdkWindow().cast?.framework?.CastState.CONNECTED &&
     activeMediaSessionConfirmedForCurrentSession
   ) {
     return {
       status: "connected" as const,
-      issue: null,
-      issueCode: null,
+      issue: primaryResolverWarning?.message ?? null,
+      issueCode: primaryResolverWarning?.code ?? null,
       canRequestSession: false,
     };
   }
@@ -683,7 +820,7 @@ function getCastSessionLoadRecord(session: CastSessionInstance) {
 }
 
 function resolveUsableCastMediaSession(
-  resolvedMedia: CastResolvedMediaPayload,
+  resolvedMedia: CastResolvedMediaSuccessPayload,
   loadRecord: CastSessionLoadRecord | null,
 ) {
   const liveMediaSession = getCurrentCastMediaSession();
@@ -780,10 +917,12 @@ function buildChromecastHealthSnapshot(runtimeSnapshot: Record<string, unknown>)
       mediaSessionReturned &&
       activeMediaSessionConfirmedForCurrentSession,
   );
+  const activeControllableMediaSession =
+    runtimeSnapshot.activeControllableMediaSession === true &&
+    activeMediaSessionConfirmedForCurrentSession;
   const mirrorCommandsEnabled =
     castStatus === "connected" &&
-    currentRoomMediaLoadedOnChromecast &&
-    !mediaLoadBlocked &&
+    activeControllableMediaSession &&
     !currentCastSessionErrorCode;
   const castSubtitleTrackMode =
     typeof runtimeSnapshot.castSubtitleTrackMode === "string"
@@ -812,13 +951,50 @@ function buildChromecastHealthSnapshot(runtimeSnapshot: Record<string, unknown>)
       : currentRoomMediaLoadedOnChromecast
         ? "loaded_idle"
         : "none";
-  const activeControllableMediaSession =
-    runtimeSnapshot.activeControllableMediaSession === true &&
-    activeMediaSessionConfirmedForCurrentSession;
+  const castResolverOk =
+    runtimeSnapshot.castResolverOk === true
+      ? true
+      : runtimeSnapshot.castResolverOk === false
+        ? false
+        : null;
+  const castResolverWarnings = readCastResolverWarnings(
+    runtimeSnapshot.castResolverWarnings,
+  );
+  const primaryResolverWarning = getPrimaryCastResolverWarning(
+    castResolverWarnings,
+  );
+  const castResolverErrorMessage =
+    typeof runtimeSnapshot.castResolverErrorMessage === "string"
+      ? runtimeSnapshot.castResolverErrorMessage
+      : null;
+  const castFallbackApplied = runtimeSnapshot.castFallbackApplied === true;
+  const castFallbackReason =
+    typeof runtimeSnapshot.castFallbackReason === "string"
+      ? runtimeSnapshot.castFallbackReason
+      : null;
+  const ffmpegAvailable =
+    typeof runtimeSnapshot.ffmpegAvailable === "boolean"
+      ? runtimeSnapshot.ffmpegAvailable
+      : null;
+  const ffmpegBinary =
+    typeof runtimeSnapshot.ffmpegBinary === "string"
+      ? runtimeSnapshot.ffmpegBinary
+      : null;
+  const ffmpegFailureReason =
+    typeof runtimeSnapshot.ffmpegFailureReason === "string"
+      ? runtimeSnapshot.ffmpegFailureReason
+      : null;
+  const resolvedCastMode =
+    typeof runtimeSnapshot.resolvedCastMode === "string"
+      ? runtimeSnapshot.resolvedCastMode
+      : null;
 
   let healthStatus = "idle";
 
-  if (currentCastSessionErrorCode && !activeMediaSessionConfirmedForCurrentSession) {
+  if (
+    (currentCastSessionErrorCode && !activeMediaSessionConfirmedForCurrentSession) ||
+    (castResolverOk === false && !activeMediaSessionConfirmedForCurrentSession)
+  ) {
     healthStatus = "error";
   } else if (mirrorCommandsEnabled) {
     healthStatus = "healthy";
@@ -855,6 +1031,14 @@ function buildChromecastHealthSnapshot(runtimeSnapshot: Record<string, unknown>)
     mediaLoadBlocked,
     mediaSessionReturned,
     activeMediaSessionConfirmedForCurrentSession,
+    castResolverOk,
+    castResolverWarnings,
+    castFallbackApplied,
+    castFallbackReason,
+    resolvedCastMode,
+    ffmpegAvailable,
+    ffmpegBinary,
+    ffmpegFailureReason,
     currentRoomMediaContentId,
     activeMediaSessionContentId,
     currentRoomMediaLoadedOnChromecast,
@@ -879,8 +1063,15 @@ function buildChromecastHealthSnapshot(runtimeSnapshot: Record<string, unknown>)
         : "No subtitle text tracks were present in the resolved Cast media payload.",
     currentIssue:
       mirrorCommandsEnabled
-        ? null
-        : currentCastSessionErrorMessage ?? likelyFailureReason ?? null,
+        ? castResolverErrorMessage ??
+          primaryResolverWarning?.message ??
+          null
+        : currentCastSessionErrorMessage ??
+          castResolverErrorMessage ??
+          likelyFailureReason ??
+          castFallbackReason ??
+          primaryResolverWarning?.message ??
+          null,
   };
 }
 
@@ -1316,7 +1507,7 @@ function castCommandAsPromise(
 }
 
 function buildCastLoadRequest(
-  resolvedMedia: CastResolvedMediaPayload,
+  resolvedMedia: CastResolvedMediaSuccessPayload,
   playback: PlaybackStateSnapshot,
 ) {
   const chromeCastMedia = getCastSdkWindow().chrome?.cast?.media;
@@ -1346,6 +1537,11 @@ function buildCastLoadRequest(
     castMode: resolvedMedia.castMode,
     selectedAudioTrackId: resolvedMedia.selectedAudioTrackId,
     selectedSubtitleTrackId: resolvedMedia.selectedSubtitleTrackId,
+    effectiveAudioTrackId: resolvedMedia.diagnostics.effectiveAudioTrackId,
+    effectiveSubtitleTrackId: resolvedMedia.diagnostics.effectiveSubtitleTrackId,
+    castFallbackApplied:
+      resolvedMedia.castMode === "fallback_base_video_no_external_audio",
+    castResolverWarnings: resolvedMedia.warnings,
     variantCacheKey: resolvedMedia.diagnostics.variantCacheKey,
     variantId: resolvedMedia.diagnostics.variantId,
   };
@@ -1400,9 +1596,16 @@ function buildCastLoadRequest(
     activeTrackIds,
     castMode: resolvedMedia.castMode,
     selectionSignature: resolvedMedia.selectionSignature,
+    castFallbackApplied:
+      resolvedMedia.castMode === "fallback_base_video_no_external_audio",
+    castFallbackReason:
+      getPrimaryCastResolverWarning(resolvedMedia.warnings)?.message ?? null,
+    resolverWarnings: resolvedMedia.warnings,
     variantCacheKey: resolvedMedia.diagnostics.variantCacheKey,
     variantId: resolvedMedia.diagnostics.variantId,
     variantStatus: resolvedMedia.diagnostics.variantStatus,
+    ffmpegAvailable: resolvedMedia.diagnostics.ffmpegAvailable,
+    ffmpegBinary: resolvedMedia.diagnostics.ffmpegBinary,
     ffmpegGenerationStatus: resolvedMedia.diagnostics.ffmpegStatus,
     ffmpegFailureReason: resolvedMedia.diagnostics.ffmpegFailureReason,
   };
@@ -1415,7 +1618,7 @@ function buildCastLoadRequest(
 
 function isSameCastMediaSession(
   mediaSession: CastMediaSession | null,
-  resolvedMedia: CastResolvedMediaPayload,
+  resolvedMedia: CastResolvedMediaSuccessPayload,
   loadRecord: CastSessionLoadRecord | null,
 ) {
   const sessionContentId = mediaSession?.media?.contentId ?? null;
@@ -1444,7 +1647,7 @@ function isSameCastMediaSession(
 }
 
 function canMirrorChromecastPlayback(
-  resolvedMedia: CastResolvedMediaPayload,
+  resolvedMedia: CastResolvedMediaSuccessPayload,
   mediaSession: CastMediaSession | null,
   loadRecord: CastSessionLoadRecord | null,
 ) {
@@ -1459,11 +1662,9 @@ function canMirrorChromecastPlayback(
 }
 
 async function ensureRoomMediaLoadedOnChromecast(
-  roomId: string,
   media: RoomMediaSummary,
   playback: PlaybackStateSnapshot,
-  selectedAudioTrackId: string | null,
-  selectedSubtitleTrackId: string | null,
+  resolvedMedia: CastResolvedMediaSuccessPayload,
 ) {
   const currentSession = getCurrentCastSession();
   const sessionIdentity = reconcileCurrentCastSessionScope(currentSession);
@@ -1480,13 +1681,6 @@ async function ensureRoomMediaLoadedOnChromecast(
   if (!currentSession || !loadRecord) {
     return null;
   }
-
-  const resolvedMedia = await resolveCastMediaPayload(
-    roomId,
-    media,
-    selectedAudioTrackId,
-    selectedSubtitleTrackId,
-  );
   const existingMediaSession = resolveUsableCastMediaSession(resolvedMedia, loadRecord);
 
   updateChromecastRuntimeState({
@@ -2040,6 +2234,27 @@ export async function requestChromecastSession() {
   }
 }
 
+export async function prepareChromecastMediaForSession(
+  roomId: string,
+  media: RoomMediaSummary | null,
+  selectedAudioTrackId: string | null,
+  selectedSubtitleTrackId: string | null,
+) {
+  if (!media) {
+    throw new ChromecastError(
+      "media_resolve_failed",
+      "There is no room media available to prepare for Chromecast.",
+    );
+  }
+
+  return resolveCastMediaPayload(
+    roomId,
+    media,
+    selectedAudioTrackId,
+    selectedSubtitleTrackId,
+  );
+}
+
 export async function endChromecastSession() {
   logDebugEvent({
     level: "info",
@@ -2093,50 +2308,87 @@ export async function syncRoomPlaybackToChromecast(
     return;
   }
 
-  const resolvedMedia = await resolveCastMediaPayload(
-    roomId,
-    media,
-    selectedAudioTrackId,
-    selectedSubtitleTrackId,
-  );
   const currentSession = getCurrentCastSession();
   const loadRecord = currentSession ? getCastSessionLoadRecord(currentSession) : null;
-  const existingMediaSession = currentSession
-    ? resolveUsableCastMediaSession(resolvedMedia, loadRecord)
-    : { mediaSession: null, source: "none" as const };
-  const hadUsableMediaSession = Boolean(existingMediaSession.mediaSession);
-  const mediaSession = await ensureRoomMediaLoadedOnChromecast(
-    roomId,
-    media,
-    playback,
-    selectedAudioTrackId,
-    selectedSubtitleTrackId,
-  );
+  let resolvedMedia: CastResolvedMediaSuccessPayload | null = null;
+  let hadUsableMediaSession = false;
+  let mediaSession: CastMediaSession | null = null;
+  let resolverBlockedExistingMediaSession = false;
 
-  if (!mediaSession) {
-    return;
+  try {
+    resolvedMedia = await resolveCastMediaPayload(
+      roomId,
+      media,
+      selectedAudioTrackId,
+      selectedSubtitleTrackId,
+    );
+    const existingMediaSession = currentSession
+      ? resolveUsableCastMediaSession(resolvedMedia, loadRecord)
+      : { mediaSession: null, source: "none" as const };
+
+    hadUsableMediaSession = Boolean(existingMediaSession.mediaSession);
+    mediaSession = await ensureRoomMediaLoadedOnChromecast(
+      media,
+      playback,
+      resolvedMedia,
+    );
+
+    if (!mediaSession) {
+      return;
+    }
+
+    if (!canMirrorChromecastPlayback(resolvedMedia, mediaSession, loadRecord)) {
+      updateChromecastRuntimeState({
+        activeControllableMediaSession: false,
+        lastCastMirrorDecision: "skipped_not_ready",
+      });
+      return;
+    }
+  } catch (error) {
+    const fallbackMediaSession =
+      getCurrentCastMediaSession() ?? loadRecord?.activeMediaSession ?? null;
+    const canContinueWithCurrentMedia =
+      castRuntimeSnapshot.castStatus === "connected" &&
+      castRuntimeSnapshot.currentCastSessionErrorCode == null &&
+      castRuntimeSnapshot.activeMediaSessionConfirmedForCurrentSession === true &&
+      fallbackMediaSession != null;
+
+    if (!canContinueWithCurrentMedia) {
+      throw error;
+    }
+
+    resolverBlockedExistingMediaSession = true;
+    hadUsableMediaSession = true;
+    mediaSession = fallbackMediaSession;
+    updateChromecastRuntimeState({
+      activeControllableMediaSession: true,
+      usedExistingMediaSessionForMirror: true,
+      reloadedMediaInsteadOfControlling: false,
+      lastCastMirrorDecision: "used_existing_media_session_after_resolver_block",
+    });
   }
 
-  if (!canMirrorChromecastPlayback(resolvedMedia, mediaSession, loadRecord)) {
-    updateChromecastRuntimeState({
-      activeControllableMediaSession: false,
-      lastCastMirrorDecision: "skipped_not_ready",
-    });
+  if (!mediaSession) {
     return;
   }
 
   if (
     loadRecord &&
     hadUsableMediaSession &&
-    loadRecord.lastLoadedContentUrl === resolvedMedia.contentUrl &&
-    loadRecord.lastLoadedSelectionSignature === resolvedMedia.selectionSignature &&
+    (resolverBlockedExistingMediaSession ||
+      (resolvedMedia != null &&
+        loadRecord.lastLoadedContentUrl === resolvedMedia.contentUrl &&
+        loadRecord.lastLoadedSelectionSignature ===
+          resolvedMedia.selectionSignature)) &&
     loadRecord.lastMirroredPlaybackVersion === playback.version
   ) {
     updateChromecastRuntimeState({
       activeControllableMediaSession: true,
       usedExistingMediaSessionForMirror: true,
       reloadedMediaInsteadOfControlling: false,
-      lastCastMirrorDecision: "skipped_duplicate_playback_version",
+      lastCastMirrorDecision: resolverBlockedExistingMediaSession
+        ? "skipped_duplicate_playback_version_after_resolver_block"
+        : "skipped_duplicate_playback_version",
     });
     return;
   }
@@ -2156,9 +2408,11 @@ export async function syncRoomPlaybackToChromecast(
     castRuntimeSnapshot.playCommandSentAfterLoad === true;
   let lastRemotePlaybackCommand: "play" | "pause" | "stop" | null = null;
   let lastRemoteSeekCommand: number | null = null;
-  let lastCastMirrorDecision = hadUsableMediaSession
-    ? "used_existing_media_session"
-    : "applying_initial_state_after_load";
+  let lastCastMirrorDecision = resolverBlockedExistingMediaSession
+    ? "used_existing_media_session_after_resolver_block"
+    : hadUsableMediaSession
+      ? "used_existing_media_session"
+      : "applying_initial_state_after_load";
   let remotePlaybackState = "loaded_idle";
 
   if (playback.status === "stopped") {
@@ -2172,11 +2426,18 @@ export async function syncRoomPlaybackToChromecast(
     }
 
     updateChromecastRuntimeState({
-      mediaContentId: mediaSession.media?.contentId ?? resolvedMedia.contentUrl,
+      mediaContentId:
+        mediaSession.media?.contentId ?? resolvedMedia?.contentUrl ?? null,
       lastCastMediaCommand: lastRemotePlaybackCommand ?? "loadMedia",
       lastCastMirrorDecision,
-      mediaLoadStatus: "loaded",
+      mediaLoadStatus: resolverBlockedExistingMediaSession
+        ? "blocked_using_existing_media"
+        : "loaded",
       mediaLoadSucceeded: true,
+      mediaLoadBlocked: resolverBlockedExistingMediaSession,
+      mediaLoadLikelyFailureReason: resolverBlockedExistingMediaSession
+        ? castRuntimeSnapshot.mediaLoadLikelyFailureReason ?? null
+        : null,
       activeControllableMediaSession: true,
       initialCastStateAppliedAfterLoad:
         sessionAlreadyAppliedInitialState || initialCastStateAppliedAfterLoad,
@@ -2193,7 +2454,9 @@ export async function syncRoomPlaybackToChromecast(
     logDebugEvent({
       level: "info",
       category: "cast",
-      message: hadUsableMediaSession
+      message: resolverBlockedExistingMediaSession
+        ? "Kept mirroring shared playback on the existing Chromecast media because the requested Cast variant could not be prepared."
+        : hadUsableMediaSession
         ? "Mirrored the shared stop command to Chromecast."
         : "Cast media loaded and kept idle at the room start position.",
       source: "cast",
@@ -2244,13 +2507,20 @@ export async function syncRoomPlaybackToChromecast(
   }
 
   updateChromecastRuntimeState({
-    mediaContentId: mediaSession.media?.contentId ?? resolvedMedia.contentUrl,
+    mediaContentId:
+      mediaSession.media?.contentId ?? resolvedMedia?.contentUrl ?? null,
     lastCastMediaCommand:
       lastRemotePlaybackCommand ?? (lastRemoteSeekCommand != null ? "seek" : "loadMedia"),
     lastCastSeekTime: lastRemoteSeekCommand,
     lastCastMirrorDecision,
-    mediaLoadStatus: "loaded",
+    mediaLoadStatus: resolverBlockedExistingMediaSession
+      ? "blocked_using_existing_media"
+      : "loaded",
     mediaLoadSucceeded: true,
+    mediaLoadBlocked: resolverBlockedExistingMediaSession,
+    mediaLoadLikelyFailureReason: resolverBlockedExistingMediaSession
+      ? castRuntimeSnapshot.mediaLoadLikelyFailureReason ?? null
+      : null,
     activeControllableMediaSession: true,
     initialCastStateAppliedAfterLoad:
       sessionAlreadyAppliedInitialState || initialCastStateAppliedAfterLoad,
@@ -2271,9 +2541,11 @@ export async function syncRoomPlaybackToChromecast(
   logDebugEvent({
     level: "info",
     category: "cast",
-    message: initialCastStateAppliedAfterLoad
-      ? `Applied the initial shared ${playback.status} state to Chromecast after media load.`
-      : `Mirrored shared ${playback.status} playback to Chromecast.`,
+    message: resolverBlockedExistingMediaSession
+      ? `Kept the existing Chromecast media in sync while the requested ${selectedAudioTrackId ? "audio" : "media"} selection stayed blocked.`
+      : initialCastStateAppliedAfterLoad
+        ? `Applied the initial shared ${playback.status} state to Chromecast after media load.`
+        : `Mirrored shared ${playback.status} playback to Chromecast.`,
     source: "cast",
     data: {
       status: playback.status,
