@@ -10,7 +10,7 @@ import type {
   CastResolvedMediaSuccessPayload,
   CastResolverWarning,
 } from "@/types/cast";
-import type { PlaybackStateSnapshot } from "@/types/playback";
+import type { PlaybackStateSnapshot, PlaybackStatus } from "@/types/playback";
 import type { RoomMediaSummary } from "@/types/room-sync";
 
 const castSdkUrl =
@@ -112,6 +112,24 @@ type CastContextInstance = {
   setOptions(options: Record<string, unknown>): void;
 };
 
+type RemotePlayerInstance = {
+  currentTime?: number;
+  duration?: number;
+  isMediaLoaded?: boolean;
+  isPaused?: boolean;
+  playerState?: string;
+  playbackRate?: number;
+  mediaInfo?: {
+    contentId?: string | null;
+    customData?: Record<string, unknown> | null;
+  } | null;
+};
+
+type RemotePlayerControllerInstance = {
+  addEventListener?(type: string, listener: (event: unknown) => void): void;
+  removeEventListener?(type: string, listener: (event: unknown) => void): void;
+};
+
 type CastSdkWindow = Window & {
   cast?: {
     framework?: {
@@ -120,6 +138,17 @@ type CastSdkWindow = Window & {
       };
       CastContext: {
         getInstance(): CastContextInstance;
+      };
+      RemotePlayer?: new () => RemotePlayerInstance;
+      RemotePlayerController?: new (
+        player: RemotePlayerInstance,
+      ) => RemotePlayerControllerInstance;
+      RemotePlayerEventType?: {
+        CURRENT_TIME_CHANGED?: string;
+        IS_MEDIA_LOADED_CHANGED?: string;
+        IS_PAUSED_CHANGED?: string;
+        MEDIA_INFO_CHANGED?: string;
+        PLAYER_STATE_CHANGED?: string;
       };
       CastContextEventType: {
         CAST_STATE_CHANGED: string;
@@ -195,16 +224,20 @@ type CastSdkWindow = Window & {
 
 type CastMediaSession = {
   activeTrackIds?: number[] | null;
+  currentTime?: number | null;
   editTracksInfo(
     request: unknown,
     successCallback: () => void,
     errorCallback: (error: unknown) => void,
   ): void;
   getEstimatedTime?(): number;
+  idleReason?: string | null;
   media?: {
     contentId?: string | null;
     customData?: Record<string, unknown> | null;
   } | null;
+  playbackRate?: number | null;
+  playerState?: string | null;
   pause(
     request: unknown,
     successCallback: () => void,
@@ -230,6 +263,46 @@ type CastMediaSession = {
 type CastSessionEvent = {
   sessionState?: string;
   errorCode?: string;
+};
+
+type CastRemoteRoomCommandType = "play" | "pause" | "seek" | "stop";
+
+export type ChromecastRemotePlaybackEvent = {
+  type: CastRemoteRoomCommandType;
+  status: PlaybackStatus;
+  currentTime: number;
+  playbackRate: number;
+  observedAt: string;
+  sessionId: string | null;
+  contentId: string | null;
+  selectionSignature: string | null;
+  source: "cast_remote";
+};
+
+type ChromecastRemotePlaybackListener = (
+  event: ChromecastRemotePlaybackEvent,
+) => void | Promise<void>;
+
+type RecentLocalCastCommand = {
+  type: CastRemoteRoomCommandType;
+  status: PlaybackStatus;
+  currentTime: number;
+  playbackRate: number;
+  selectionSignature: string | null;
+  createdAt: number;
+  signature: string;
+};
+
+type CastRemoteObserverState = {
+  controllerCleanup: (() => void) | null;
+  lastEmittedSignature: string | null;
+  lastObservedCurrentTime: number | null;
+  lastObservedSessionId: string | null;
+  lastObservedSignature: string | null;
+  lastObservedStatus: PlaybackStatus | null;
+  pollTimerId: number | null;
+  remotePlayer: RemotePlayerInstance | null;
+  remotePlayerController: RemotePlayerControllerInstance | null;
 };
 
 type CastEnvironmentSnapshot = {
@@ -274,8 +347,25 @@ let castRuntimeSnapshot: Record<string, unknown> = {};
 const castSessionLoadRecords = new WeakMap<object, CastSessionLoadRecord>();
 const castSessionIdentities = new WeakMap<object, CastSessionIdentity>();
 const chromecastRuntimeListeners = new Set<ChromecastRuntimeListener>();
+const chromecastRemotePlaybackListeners =
+  new Set<ChromecastRemotePlaybackListener>();
 const castResolvedMediaCache = new Map<string, CastResolvedMediaSuccessPayload>();
 let castSessionSequence = 0;
+const remotePlaybackPollIntervalMs = 750;
+const remotePlaybackSeekThresholdSeconds = 1.25;
+const localCastCommandSuppressionWindowMs = 2500;
+const recentLocalCastCommands: RecentLocalCastCommand[] = [];
+const castRemoteObserverState: CastRemoteObserverState = {
+  controllerCleanup: null,
+  lastEmittedSignature: null,
+  lastObservedCurrentTime: null,
+  lastObservedSessionId: null,
+  lastObservedSignature: null,
+  lastObservedStatus: null,
+  pollTimerId: null,
+  remotePlayer: null,
+  remotePlayerController: null,
+};
 
 function getCastSdkWindow() {
   return window as CastSdkWindow;
@@ -369,33 +459,156 @@ function readCastResolverWarnings(value: unknown): CastResolverWarning[] {
   );
 }
 
+function roundPlaybackTimeForSignature(value: number) {
+  return Math.round(Math.max(0, value) * 4) / 4;
+}
+
+function normalizeObservedPlaybackRate(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return 1;
+  }
+
+  return Math.round(value * 100) / 100;
+}
+
+function buildPlaybackStateSignature(input: {
+  status: PlaybackStatus;
+  currentTime: number;
+  playbackRate: number;
+  selectionSignature: string | null;
+}) {
+  return JSON.stringify({
+    status: input.status,
+    currentTime: roundPlaybackTimeForSignature(input.currentTime),
+    playbackRate: normalizeObservedPlaybackRate(input.playbackRate),
+    selectionSignature: input.selectionSignature,
+  });
+}
+
+function pruneRecentLocalCastCommands(now = Date.now()) {
+  while (recentLocalCastCommands.length > 0) {
+    const oldestCommand = recentLocalCastCommands[0];
+
+    if (now - oldestCommand.createdAt <= localCastCommandSuppressionWindowMs) {
+      break;
+    }
+
+    recentLocalCastCommands.shift();
+  }
+}
+
+function rememberLocalCastCommand(command: {
+  type: CastRemoteRoomCommandType;
+  status: PlaybackStatus;
+  currentTime: number;
+  playbackRate: number;
+  selectionSignature: string | null;
+}) {
+  const nextEntry: RecentLocalCastCommand = {
+    ...command,
+    createdAt: Date.now(),
+    signature: buildPlaybackStateSignature({
+      status: command.status,
+      currentTime: command.currentTime,
+      playbackRate: command.playbackRate,
+      selectionSignature: command.selectionSignature,
+    }),
+  };
+
+  pruneRecentLocalCastCommands(nextEntry.createdAt);
+  recentLocalCastCommands.push(nextEntry);
+
+  if (recentLocalCastCommands.length > 12) {
+    recentLocalCastCommands.splice(0, recentLocalCastCommands.length - 12);
+  }
+
+  updateChromecastRuntimeState({
+    lastCastLocalCommandSignature: nextEntry.signature,
+    lastCastLocalCommandType: nextEntry.type,
+    lastCastLocalCommandAt: new Date(nextEntry.createdAt).toISOString(),
+  });
+}
+
+function findMatchingRecentLocalCastCommand(observation: {
+  status: PlaybackStatus;
+  currentTime: number;
+  playbackRate: number;
+  selectionSignature: string | null;
+}) {
+  const now = Date.now();
+  pruneRecentLocalCastCommands(now);
+
+  for (let index = recentLocalCastCommands.length - 1; index >= 0; index -= 1) {
+    const command = recentLocalCastCommands[index];
+
+    if (now - command.createdAt > localCastCommandSuppressionWindowMs) {
+      continue;
+    }
+
+    if (command.status !== observation.status) {
+      continue;
+    }
+
+    if (
+      Math.abs(
+        normalizeObservedPlaybackRate(command.playbackRate) -
+          normalizeObservedPlaybackRate(observation.playbackRate),
+      ) > 0.05
+    ) {
+      continue;
+    }
+
+    if (
+      Math.abs(
+        roundPlaybackTimeForSignature(command.currentTime) -
+          roundPlaybackTimeForSignature(observation.currentTime),
+      ) > remotePlaybackSeekThresholdSeconds
+    ) {
+      continue;
+    }
+
+    if (
+      command.selectionSignature &&
+      observation.selectionSignature &&
+      command.selectionSignature !== observation.selectionSignature
+    ) {
+      continue;
+    }
+
+    return command;
+  }
+
+  return null;
+}
+
 function updateCastResolvedMediaRuntimeState(
   payload: CastResolvedMediaSuccessPayload,
 ) {
   const primaryWarning = getPrimaryCastResolverWarning(payload.warnings);
-  const castFallbackApplied =
-    payload.castMode === "fallback_base_video_no_external_audio";
 
   updateChromecastRuntimeState({
     castResolverOk: true,
     castResolverWarnings: payload.warnings,
     castResolverErrorCode: null,
     castResolverErrorMessage: null,
-    castFallbackApplied,
-    castFallbackReason: castFallbackApplied ? primaryWarning?.message ?? null : null,
+    castFallbackApplied: payload.castFallbackApplied,
+    castFallbackReason:
+      payload.castFallbackReason ??
+      (payload.castFallbackApplied ? primaryWarning?.message ?? null : null),
     resolvedCastMode: payload.castMode,
     resolvedContentUrl: payload.contentUrl,
     resolvedContentType: payload.contentType,
     resolvedSelectionSignature: payload.selectionSignature,
     resolvedAudioTrackId: payload.selectedAudioTrackId,
     resolvedSubtitleTrackId: payload.selectedSubtitleTrackId,
-    resolvedEffectiveAudioTrackId: payload.diagnostics.effectiveAudioTrackId,
-    resolvedEffectiveSubtitleTrackId: payload.diagnostics.effectiveSubtitleTrackId,
+    resolvedEffectiveAudioTrackId: payload.resolvedEffectiveAudioTrackId,
+    resolvedEffectiveSubtitleTrackId: payload.resolvedEffectiveSubtitleTrackId,
     resolvedSubtitleTrackCount: payload.textTracks.length,
     resolvedActiveTrackIds: payload.activeTrackIds,
     subtitlesIncludedInLoadRequest: payload.textTracks.length > 0,
     castVariantCacheKey: payload.diagnostics.variantCacheKey,
     castVariantId: payload.diagnostics.variantId,
+    castVariantStoragePath: payload.diagnostics.variantStoragePath,
     castVariantStatus: payload.diagnostics.variantStatus,
     ffmpegAvailable: payload.diagnostics.ffmpegAvailable,
     ffmpegBinary: payload.diagnostics.ffmpegBinary,
@@ -416,21 +629,24 @@ function updateCastResolverFailureRuntimeState(
     castResolverWarnings: payload.warnings,
     castResolverErrorCode: payload.errorCode,
     castResolverErrorMessage: payload.message,
-    castFallbackApplied: false,
-    castFallbackReason: null,
+    castFallbackApplied: payload.castFallbackApplied,
+    castFallbackReason: payload.castFallbackReason,
     resolvedCastMode: payload.castMode,
     resolvedContentUrl: null,
     resolvedContentType: null,
     resolvedSelectionSignature: null,
-    resolvedAudioTrackId: fallbackSelection.selectedAudioTrackId,
-    resolvedSubtitleTrackId: fallbackSelection.selectedSubtitleTrackId,
-    resolvedEffectiveAudioTrackId: payload.diagnostics.effectiveAudioTrackId,
-    resolvedEffectiveSubtitleTrackId: payload.diagnostics.effectiveSubtitleTrackId,
+    resolvedAudioTrackId:
+      payload.selectedAudioTrackId ?? fallbackSelection.selectedAudioTrackId,
+    resolvedSubtitleTrackId:
+      payload.selectedSubtitleTrackId ?? fallbackSelection.selectedSubtitleTrackId,
+    resolvedEffectiveAudioTrackId: payload.resolvedEffectiveAudioTrackId,
+    resolvedEffectiveSubtitleTrackId: payload.resolvedEffectiveSubtitleTrackId,
     resolvedSubtitleTrackCount: 0,
     resolvedActiveTrackIds: [],
     subtitlesIncludedInLoadRequest: payload.diagnostics.subtitlesIncluded,
     castVariantCacheKey: payload.diagnostics.variantCacheKey,
     castVariantId: payload.diagnostics.variantId,
+    castVariantStoragePath: payload.diagnostics.variantStoragePath,
     castVariantStatus: payload.diagnostics.variantStatus,
     ffmpegAvailable: payload.diagnostics.ffmpegAvailable,
     ffmpegBinary: payload.diagnostics.ffmpegBinary,
@@ -502,6 +718,7 @@ async function resolveCastMediaPayload(
       subtitlesIncludedInLoadRequest: false,
       castVariantCacheKey: null,
       castVariantId: null,
+      castVariantStoragePath: null,
       castVariantStatus: "failed",
       ffmpegAvailable: null,
       ffmpegBinary: null,
@@ -617,6 +834,21 @@ function resetCurrentCastSessionRuntimeState(
     mediaLoadResultErrorCode: null,
     lastCastMirrorDecision: null,
     resolvedSelectionSignature: null,
+    remotePlayerObserved: false,
+    remotePlayerPollingEnabled: false,
+    remotePlayerObservationReason: null,
+    remotePlayerObservationSessionId: null,
+    lastObservedRemoteCurrentTime: null,
+    lastObservedRemotePlayerState: null,
+    lastObservedRemoteIsPaused: null,
+    lastObservedRemoteStatus: null,
+    lastRemoteOriginatedRoomCommand: null,
+    lastAppliedRemoteStateSignature: null,
+    lastSuppressedRemoteStateSignature: null,
+    lastSuppressedRemoteStateReason: null,
+    lastCastLocalCommandSignature: null,
+    lastCastLocalCommandType: null,
+    lastCastLocalCommandAt: null,
     ...overrides,
   });
 }
@@ -695,6 +927,477 @@ function clearCurrentCastSessionError() {
     canRequestSession: nextPresentation.canRequestSession,
     lastError: null,
   });
+}
+
+function resolveTrackedCastContentId() {
+  const candidateFields = [
+    "activeMediaSessionContentId",
+    "mediaSessionContentId",
+    "mediaContentId",
+    "lastRequestedMediaContentId",
+    "resolvedContentUrl",
+  ] as const;
+
+  for (const field of candidateFields) {
+    if (typeof castRuntimeSnapshot[field] === "string") {
+      return castRuntimeSnapshot[field] as string;
+    }
+  }
+
+  return null;
+}
+
+function resolveTrackedCastSelectionSignature() {
+  const candidateFields = [
+    "activeMediaSessionSelectionSignature",
+    "lastRequestedSelectionSignature",
+    "resolvedSelectionSignature",
+  ] as const;
+
+  for (const field of candidateFields) {
+    if (typeof castRuntimeSnapshot[field] === "string") {
+      return castRuntimeSnapshot[field] as string;
+    }
+  }
+
+  return null;
+}
+
+function resolveObservedRemotePlayerState(
+  remotePlayer: RemotePlayerInstance | null,
+  mediaSession: CastMediaSession | null,
+) {
+  return (
+    (typeof remotePlayer?.playerState === "string" && remotePlayer.playerState) ||
+    (typeof mediaSession?.playerState === "string" && mediaSession.playerState) ||
+    null
+  );
+}
+
+function resolveObservedRemoteCurrentTime(
+  remotePlayer: RemotePlayerInstance | null,
+  mediaSession: CastMediaSession | null,
+) {
+  if (
+    typeof remotePlayer?.currentTime === "number" &&
+    Number.isFinite(remotePlayer.currentTime)
+  ) {
+    return Math.max(0, remotePlayer.currentTime);
+  }
+
+  const estimatedTime = mediaSession?.getEstimatedTime?.();
+
+  if (typeof estimatedTime === "number" && Number.isFinite(estimatedTime)) {
+    return Math.max(0, estimatedTime);
+  }
+
+  if (
+    typeof mediaSession?.currentTime === "number" &&
+    Number.isFinite(mediaSession.currentTime)
+  ) {
+    return Math.max(0, mediaSession.currentTime);
+  }
+
+  return 0;
+}
+
+function resolveObservedRemotePlaybackRate(
+  remotePlayer: RemotePlayerInstance | null,
+  mediaSession: CastMediaSession | null,
+) {
+  if (
+    typeof remotePlayer?.playbackRate === "number" &&
+    Number.isFinite(remotePlayer.playbackRate)
+  ) {
+    return normalizeObservedPlaybackRate(remotePlayer.playbackRate);
+  }
+
+  if (
+    typeof mediaSession?.playbackRate === "number" &&
+    Number.isFinite(mediaSession.playbackRate)
+  ) {
+    return normalizeObservedPlaybackRate(mediaSession.playbackRate);
+  }
+
+  return 1;
+}
+
+function resolveObservedRemoteStatus(input: {
+  remotePlayer: RemotePlayerInstance | null;
+  mediaSession: CastMediaSession | null;
+  playerState: string | null;
+  isPaused: boolean | null;
+}): PlaybackStatus | null {
+  const normalizedPlayerState = input.playerState?.toUpperCase() ?? null;
+  const isMediaLoaded =
+    typeof input.remotePlayer?.isMediaLoaded === "boolean"
+      ? input.remotePlayer.isMediaLoaded
+      : Boolean(input.mediaSession?.media?.contentId);
+
+  if (!isMediaLoaded && !input.mediaSession?.media?.contentId) {
+    return null;
+  }
+
+  if (normalizedPlayerState === "PLAYING") {
+    return "playing";
+  }
+
+  if (normalizedPlayerState === "PAUSED") {
+    return "paused";
+  }
+
+  if (normalizedPlayerState === "BUFFERING") {
+    return input.isPaused === true ? "paused" : "playing";
+  }
+
+  if (normalizedPlayerState === "IDLE") {
+    return "stopped";
+  }
+
+  if (input.isPaused === false) {
+    return "playing";
+  }
+
+  if (input.isPaused === true) {
+    return "paused";
+  }
+
+  return isMediaLoaded ? "paused" : null;
+}
+
+function resolveRemotePlaybackCommandType(input: {
+  nextStatus: PlaybackStatus;
+  nextCurrentTime: number;
+  previousStatus: PlaybackStatus | null;
+  previousCurrentTime: number | null;
+}) {
+  if (!input.previousStatus) {
+    return null;
+  }
+
+  if (input.nextStatus !== input.previousStatus) {
+    switch (input.nextStatus) {
+      case "playing":
+        return "play" as const;
+      case "paused":
+        return "pause" as const;
+      case "stopped":
+        return "stop" as const;
+    }
+  }
+
+  if (
+    input.previousCurrentTime != null &&
+    Math.abs(input.nextCurrentTime - input.previousCurrentTime) >=
+      remotePlaybackSeekThresholdSeconds
+  ) {
+    return "seek" as const;
+  }
+
+  return null;
+}
+
+function stopChromecastRemotePlaybackObservation(reason: string) {
+  if (castRemoteObserverState.controllerCleanup) {
+    castRemoteObserverState.controllerCleanup();
+    castRemoteObserverState.controllerCleanup = null;
+  }
+
+  if (castRemoteObserverState.pollTimerId != null) {
+    window.clearInterval(castRemoteObserverState.pollTimerId);
+    castRemoteObserverState.pollTimerId = null;
+  }
+
+  castRemoteObserverState.remotePlayer = null;
+  castRemoteObserverState.remotePlayerController = null;
+  castRemoteObserverState.lastEmittedSignature = null;
+  castRemoteObserverState.lastObservedCurrentTime = null;
+  castRemoteObserverState.lastObservedSessionId = null;
+  castRemoteObserverState.lastObservedSignature = null;
+  castRemoteObserverState.lastObservedStatus = null;
+
+  updateChromecastRuntimeState({
+    remotePlayerObserved: false,
+    remotePlayerPollingEnabled: false,
+    remotePlayerObservationReason: reason,
+    lastObservedRemoteCurrentTime: null,
+    lastObservedRemotePlayerState: null,
+    lastObservedRemoteIsPaused: null,
+    lastAppliedRemoteStateSignature: null,
+  });
+}
+
+function notifyChromecastRemotePlaybackListeners(
+  event: ChromecastRemotePlaybackEvent,
+) {
+  chromecastRemotePlaybackListeners.forEach((listener) => {
+    Promise.resolve(listener(event)).catch((error) => {
+      logDebugEvent({
+        level: "error",
+        category: "cast",
+        message:
+          "A Chromecast remote playback listener failed while propagating a remote state change.",
+        source: "cast_remote",
+        data: error,
+      });
+    });
+  });
+}
+
+function observeChromecastRemotePlaybackState(reason: string) {
+  const currentSession = getCurrentCastSession();
+  const sessionIdentity = currentSession
+    ? getOrCreateCastSessionIdentity(currentSession)
+    : null;
+
+  if (!currentSession || !sessionIdentity) {
+    stopChromecastRemotePlaybackObservation(reason);
+    return;
+  }
+
+  const mediaSession =
+    getCurrentCastMediaSession() ??
+    getCastSessionLoadRecord(currentSession).activeMediaSession ??
+    null;
+  const remotePlayer = castRemoteObserverState.remotePlayer;
+  const trackedContentId = resolveTrackedCastContentId();
+  const trackedSelectionSignature = resolveTrackedCastSelectionSignature();
+  const contentId =
+    mediaSession?.media?.contentId ??
+    remotePlayer?.mediaInfo?.contentId ??
+    null;
+  const selectionSignature =
+    extractSelectionSignatureFromMediaSession(mediaSession) ??
+    (typeof remotePlayer?.mediaInfo?.customData?.selectionSignature === "string"
+      ? remotePlayer.mediaInfo.customData.selectionSignature
+      : null) ??
+    trackedSelectionSignature;
+  const playerState = resolveObservedRemotePlayerState(remotePlayer, mediaSession);
+  const currentTime = resolveObservedRemoteCurrentTime(remotePlayer, mediaSession);
+  const playbackRate = resolveObservedRemotePlaybackRate(
+    remotePlayer,
+    mediaSession,
+  );
+  const isPaused =
+    typeof remotePlayer?.isPaused === "boolean"
+      ? remotePlayer.isPaused
+      : playerState === "PAUSED"
+        ? true
+        : playerState === "PLAYING"
+          ? false
+          : null;
+  const status = resolveObservedRemoteStatus({
+    remotePlayer,
+    mediaSession,
+    playerState,
+    isPaused,
+  });
+
+  updateChromecastRuntimeState({
+    remotePlayerObserved:
+      remotePlayer != null || castRemoteObserverState.remotePlayerController != null,
+    remotePlayerObservationReason: reason,
+    remotePlayerObservationSessionId: sessionIdentity.id,
+    lastObservedRemoteCurrentTime: currentTime,
+    lastObservedRemotePlayerState: playerState,
+    lastObservedRemoteIsPaused: isPaused,
+    lastObservedRemoteStatus: status,
+  });
+
+  if (!status || !contentId) {
+    return;
+  }
+
+  if (trackedContentId && trackedContentId !== contentId) {
+    return;
+  }
+
+  if (
+    trackedSelectionSignature &&
+    selectionSignature &&
+    trackedSelectionSignature !== selectionSignature
+  ) {
+    return;
+  }
+
+  const nextSignature = buildPlaybackStateSignature({
+    status,
+    currentTime,
+    playbackRate,
+    selectionSignature,
+  });
+  const sessionChanged =
+    castRemoteObserverState.lastObservedSessionId !== sessionIdentity.id;
+  const commandType = resolveRemotePlaybackCommandType({
+    nextStatus: status,
+    nextCurrentTime: currentTime,
+    previousStatus: sessionChanged
+      ? null
+      : castRemoteObserverState.lastObservedStatus,
+    previousCurrentTime: sessionChanged
+      ? null
+      : castRemoteObserverState.lastObservedCurrentTime,
+  });
+
+  castRemoteObserverState.lastObservedSessionId = sessionIdentity.id;
+  castRemoteObserverState.lastObservedSignature = nextSignature;
+  castRemoteObserverState.lastObservedStatus = status;
+  castRemoteObserverState.lastObservedCurrentTime = currentTime;
+
+  if (!commandType) {
+    return;
+  }
+
+  if (castRemoteObserverState.lastEmittedSignature === nextSignature) {
+    logDebugEvent({
+      level: "info",
+      category: "cast",
+      message:
+        "Suppressed a duplicate Chromecast remote playback event that matched the last applied remote state.",
+      source: "cast_remote",
+      data: {
+        commandType,
+        currentTime,
+        selectionSignature,
+        signature: nextSignature,
+        status,
+      },
+    });
+    return;
+  }
+
+  const matchingLocalCommand = findMatchingRecentLocalCastCommand({
+    status,
+    currentTime,
+    playbackRate,
+    selectionSignature,
+  });
+
+  if (matchingLocalCommand) {
+    castRemoteObserverState.lastEmittedSignature = nextSignature;
+    updateChromecastRuntimeState({
+      lastAppliedRemoteStateSignature: nextSignature,
+      lastSuppressedRemoteStateSignature: nextSignature,
+      lastSuppressedRemoteStateReason: "recent_local_cast_command",
+    });
+    logDebugEvent({
+      level: "info",
+      category: "cast",
+      message:
+        "Suppressed a Chromecast remote event because it matched a recently mirrored local Cast command.",
+      source: "cast_local_command",
+      data: {
+        commandType,
+        currentTime,
+        matchingLocalCommand,
+        selectionSignature,
+        signature: nextSignature,
+        status,
+      },
+    });
+    return;
+  }
+
+  const observedAt = new Date().toISOString();
+  const event: ChromecastRemotePlaybackEvent = {
+    type: commandType,
+    status,
+    currentTime: Math.round(currentTime * 1000) / 1000,
+    playbackRate,
+    observedAt,
+    sessionId: sessionIdentity.id,
+    contentId,
+    selectionSignature,
+    source: "cast_remote",
+  };
+
+  castRemoteObserverState.lastEmittedSignature = nextSignature;
+  updateChromecastRuntimeState({
+    lastAppliedRemoteStateSignature: nextSignature,
+    lastRemoteOriginatedRoomCommand: event,
+  });
+  logDebugEvent({
+    level: "info",
+    category: "cast",
+    message: `Detected Chromecast remote ${commandType}.`,
+    source: "cast_remote",
+    data: event,
+  });
+  notifyChromecastRemotePlaybackListeners(event);
+}
+
+function ensureChromecastRemotePlaybackObservation(reason: string) {
+  const currentSession = getCurrentCastSession();
+  const sessionIdentity = currentSession
+    ? getOrCreateCastSessionIdentity(currentSession)
+    : null;
+
+  if (!sessionIdentity) {
+    stopChromecastRemotePlaybackObservation(reason);
+    return;
+  }
+
+  if (
+    castRemoteObserverState.lastObservedSessionId === sessionIdentity.id &&
+    castRemoteObserverState.pollTimerId != null
+  ) {
+    observeChromecastRemotePlaybackState(`${reason}:refresh`);
+    return;
+  }
+
+  stopChromecastRemotePlaybackObservation(`${reason}:restart`);
+
+  const castFramework = getCastSdkWindow().cast?.framework;
+  const remotePlayer = castFramework?.RemotePlayer
+    ? new castFramework.RemotePlayer()
+    : null;
+  const remotePlayerController =
+    remotePlayer && castFramework?.RemotePlayerController
+      ? new castFramework.RemotePlayerController(remotePlayer)
+      : null;
+  const remotePlayerEventTypes = [
+    castFramework?.RemotePlayerEventType?.CURRENT_TIME_CHANGED,
+    castFramework?.RemotePlayerEventType?.IS_MEDIA_LOADED_CHANGED,
+    castFramework?.RemotePlayerEventType?.IS_PAUSED_CHANGED,
+    castFramework?.RemotePlayerEventType?.MEDIA_INFO_CHANGED,
+    castFramework?.RemotePlayerEventType?.PLAYER_STATE_CHANGED,
+  ].filter((value): value is string => typeof value === "string");
+
+  castRemoteObserverState.remotePlayer = remotePlayer;
+  castRemoteObserverState.remotePlayerController = remotePlayerController;
+  castRemoteObserverState.lastObservedSessionId = sessionIdentity.id;
+
+  if (remotePlayerController && remotePlayerEventTypes.length > 0) {
+    const handleRemotePlayerEvent = () => {
+      observeChromecastRemotePlaybackState("remote_player_event");
+    };
+
+    remotePlayerEventTypes.forEach((eventType) => {
+      remotePlayerController.addEventListener?.(eventType, handleRemotePlayerEvent);
+    });
+
+    castRemoteObserverState.controllerCleanup = () => {
+      remotePlayerEventTypes.forEach((eventType) => {
+        remotePlayerController.removeEventListener?.(
+          eventType,
+          handleRemotePlayerEvent,
+        );
+      });
+    };
+  }
+
+  castRemoteObserverState.pollTimerId = window.setInterval(() => {
+    observeChromecastRemotePlaybackState("poll");
+  }, remotePlaybackPollIntervalMs);
+
+  updateChromecastRuntimeState({
+    remotePlayerObserved:
+      remotePlayer != null || remotePlayerController != null,
+    remotePlayerPollingEnabled: true,
+    remotePlayerObservationReason: reason,
+    remotePlayerObservationSessionId: sessionIdentity.id,
+  });
+  observeChromecastRemotePlaybackState(`${reason}:initial`);
 }
 
 function buildChromecastPresentationState(
@@ -795,6 +1498,15 @@ export function subscribeToChromecastRuntime(
   listener(castRuntimeSnapshot);
   return () => {
     chromecastRuntimeListeners.delete(listener);
+  };
+}
+
+export function subscribeToChromecastRemotePlayback(
+  listener: ChromecastRemotePlaybackListener,
+) {
+  chromecastRemotePlaybackListeners.add(listener);
+  return () => {
+    chromecastRemotePlaybackListeners.delete(listener);
   };
 }
 
@@ -988,6 +1700,42 @@ function buildChromecastHealthSnapshot(runtimeSnapshot: Record<string, unknown>)
     typeof runtimeSnapshot.resolvedCastMode === "string"
       ? runtimeSnapshot.resolvedCastMode
       : null;
+  const resolvedEffectiveAudioTrackId =
+    typeof runtimeSnapshot.resolvedEffectiveAudioTrackId === "string"
+      ? runtimeSnapshot.resolvedEffectiveAudioTrackId
+      : null;
+  const resolvedEffectiveSubtitleTrackId =
+    typeof runtimeSnapshot.resolvedEffectiveSubtitleTrackId === "string"
+      ? runtimeSnapshot.resolvedEffectiveSubtitleTrackId
+      : null;
+  const castVariantStoragePath =
+    typeof runtimeSnapshot.castVariantStoragePath === "string"
+      ? runtimeSnapshot.castVariantStoragePath
+      : null;
+  const remotePlayerObserved = runtimeSnapshot.remotePlayerObserved === true;
+  const remotePlayerPollingEnabled =
+    runtimeSnapshot.remotePlayerPollingEnabled === true;
+  const lastObservedRemoteCurrentTime =
+    typeof runtimeSnapshot.lastObservedRemoteCurrentTime === "number"
+      ? runtimeSnapshot.lastObservedRemoteCurrentTime
+      : null;
+  const lastObservedRemotePlayerState =
+    typeof runtimeSnapshot.lastObservedRemotePlayerState === "string"
+      ? runtimeSnapshot.lastObservedRemotePlayerState
+      : null;
+  const lastObservedRemoteIsPaused =
+    typeof runtimeSnapshot.lastObservedRemoteIsPaused === "boolean"
+      ? runtimeSnapshot.lastObservedRemoteIsPaused
+      : null;
+  const lastRemoteOriginatedRoomCommand =
+    runtimeSnapshot.lastRemoteOriginatedRoomCommand &&
+    typeof runtimeSnapshot.lastRemoteOriginatedRoomCommand === "object"
+      ? runtimeSnapshot.lastRemoteOriginatedRoomCommand
+      : null;
+  const lastAppliedRemoteStateSignature =
+    typeof runtimeSnapshot.lastAppliedRemoteStateSignature === "string"
+      ? runtimeSnapshot.lastAppliedRemoteStateSignature
+      : null;
 
   let healthStatus = "idle";
 
@@ -1036,9 +1784,19 @@ function buildChromecastHealthSnapshot(runtimeSnapshot: Record<string, unknown>)
     castFallbackApplied,
     castFallbackReason,
     resolvedCastMode,
+    resolvedEffectiveAudioTrackId,
+    resolvedEffectiveSubtitleTrackId,
+    castVariantStoragePath,
     ffmpegAvailable,
     ffmpegBinary,
     ffmpegFailureReason,
+    remotePlayerObserved,
+    remotePlayerPollingEnabled,
+    lastObservedRemoteCurrentTime,
+    lastObservedRemotePlayerState,
+    lastObservedRemoteIsPaused,
+    lastRemoteOriginatedRoomCommand,
+    lastAppliedRemoteStateSignature,
     currentRoomMediaContentId,
     activeMediaSessionContentId,
     currentRoomMediaLoadedOnChromecast,
@@ -1537,10 +2295,9 @@ function buildCastLoadRequest(
     castMode: resolvedMedia.castMode,
     selectedAudioTrackId: resolvedMedia.selectedAudioTrackId,
     selectedSubtitleTrackId: resolvedMedia.selectedSubtitleTrackId,
-    effectiveAudioTrackId: resolvedMedia.diagnostics.effectiveAudioTrackId,
-    effectiveSubtitleTrackId: resolvedMedia.diagnostics.effectiveSubtitleTrackId,
-    castFallbackApplied:
-      resolvedMedia.castMode === "fallback_base_video_no_external_audio",
+    effectiveAudioTrackId: resolvedMedia.resolvedEffectiveAudioTrackId,
+    effectiveSubtitleTrackId: resolvedMedia.resolvedEffectiveSubtitleTrackId,
+    castFallbackApplied: resolvedMedia.castFallbackApplied,
     castResolverWarnings: resolvedMedia.warnings,
     variantCacheKey: resolvedMedia.diagnostics.variantCacheKey,
     variantId: resolvedMedia.diagnostics.variantId,
@@ -1596,10 +2353,11 @@ function buildCastLoadRequest(
     activeTrackIds,
     castMode: resolvedMedia.castMode,
     selectionSignature: resolvedMedia.selectionSignature,
-    castFallbackApplied:
-      resolvedMedia.castMode === "fallback_base_video_no_external_audio",
+    castFallbackApplied: resolvedMedia.castFallbackApplied,
     castFallbackReason:
-      getPrimaryCastResolverWarning(resolvedMedia.warnings)?.message ?? null,
+      resolvedMedia.castFallbackReason ??
+      getPrimaryCastResolverWarning(resolvedMedia.warnings)?.message ??
+      null,
     resolverWarnings: resolvedMedia.warnings,
     variantCacheKey: resolvedMedia.diagnostics.variantCacheKey,
     variantId: resolvedMedia.diagnostics.variantId,
@@ -1719,6 +2477,7 @@ async function ensureRoomMediaLoadedOnChromecast(
       lastCastMediaCommand: "loadMedia:already_loaded",
       lastSuccessfulCastSessionId: sessionIdentity?.id ?? null,
     });
+    ensureChromecastRemotePlaybackObservation("media_already_loaded");
     clearCurrentCastSessionError();
     return existingMediaSession.mediaSession;
   }
@@ -1985,6 +2744,7 @@ async function ensureRoomMediaLoadedOnChromecast(
       lastSuccessfulCastSessionId: sessionIdentity?.id ?? null,
       remotePlaybackState: "loaded_idle",
     });
+    ensureChromecastRemotePlaybackObservation("media_loaded");
 
     return nextMediaSession;
   })();
@@ -2270,6 +3030,8 @@ export async function endChromecastSession() {
     castSessionLoadRecords.delete(currentSession as object);
   }
 
+  stopChromecastRemotePlaybackObservation("session_ending");
+
   resetCurrentCastSessionRuntimeState(null, {
     lastCastMediaCommand: "endSession",
     mediaLoadStatus: "session_ending",
@@ -2420,6 +3182,13 @@ export async function syncRoomPlaybackToChromecast(
       await castCommandAsPromise((resolve, reject) => {
         mediaSession.stop(new chromeCastMedia.StopRequest(), resolve, reject);
       });
+      rememberLocalCastCommand({
+        type: "stop",
+        status: "stopped",
+        currentTime: 0,
+        playbackRate: playback.playbackRate,
+        selectionSignature: resolvedMedia?.selectionSignature ?? null,
+      });
       lastRemotePlaybackCommand = "stop";
       lastCastMirrorDecision = "mirrored_stop";
       remotePlaybackState = "stopped";
@@ -2459,7 +3228,7 @@ export async function syncRoomPlaybackToChromecast(
         : hadUsableMediaSession
         ? "Mirrored the shared stop command to Chromecast."
         : "Cast media loaded and kept idle at the room start position.",
-      source: "cast",
+      source: "cast_local_command",
       data: {
         currentTime: 0,
         initialCastStateAppliedAfterLoad,
@@ -2480,6 +3249,13 @@ export async function syncRoomPlaybackToChromecast(
     await castCommandAsPromise((resolve, reject) => {
       mediaSession.seek(seekRequest, resolve, reject);
     });
+    rememberLocalCastCommand({
+      type: "seek",
+      status: playback.status,
+      currentTime: nextCurrentTime,
+      playbackRate: playback.playbackRate,
+      selectionSignature: resolvedMedia?.selectionSignature ?? null,
+    });
     lastRemoteSeekCommand = nextCurrentTime;
     lastCastMirrorDecision = hadUsableMediaSession
       ? "mirrored_seek"
@@ -2490,6 +3266,13 @@ export async function syncRoomPlaybackToChromecast(
     await castCommandAsPromise((resolve, reject) => {
       mediaSession.play(new chromeCastMedia.PlayRequest(), resolve, reject);
     });
+    rememberLocalCastCommand({
+      type: "play",
+      status: "playing",
+      currentTime: nextCurrentTime,
+      playbackRate: playback.playbackRate,
+      selectionSignature: resolvedMedia?.selectionSignature ?? null,
+    });
     lastRemotePlaybackCommand = "play";
     lastCastMirrorDecision = hadUsableMediaSession
       ? "mirrored_play"
@@ -2498,6 +3281,13 @@ export async function syncRoomPlaybackToChromecast(
   } else {
     await castCommandAsPromise((resolve, reject) => {
       mediaSession.pause(new chromeCastMedia.PauseRequest(), resolve, reject);
+    });
+    rememberLocalCastCommand({
+      type: "pause",
+      status: "paused",
+      currentTime: nextCurrentTime,
+      playbackRate: playback.playbackRate,
+      selectionSignature: resolvedMedia?.selectionSignature ?? null,
     });
     lastRemotePlaybackCommand = "pause";
     lastCastMirrorDecision = hadUsableMediaSession
@@ -2546,7 +3336,7 @@ export async function syncRoomPlaybackToChromecast(
       : initialCastStateAppliedAfterLoad
         ? `Applied the initial shared ${playback.status} state to Chromecast after media load.`
         : `Mirrored shared ${playback.status} playback to Chromecast.`,
-    source: "cast",
+    source: "cast_local_command",
     data: {
       status: playback.status,
       currentTime: nextCurrentTime,
@@ -2594,16 +3384,21 @@ export function useChromecastAvailability() {
       setCanRequestSession(nextPresentation.canRequestSession);
     };
 
-    const syncCastContextState = (
-      castContext: CastContextInstance,
-      sessionEvent?: CastSessionEvent,
-    ) => {
-      const currentSession = castContext.getCurrentSession();
-      const sessionIdentity = reconcileCurrentCastSessionScope(currentSession);
-      const castState = castContext.getCastState();
-      const nextState = buildChromecastPresentationState(
-        castRuntimeSnapshot,
-        castState,
+        const syncCastContextState = (
+          castContext: CastContextInstance,
+          sessionEvent?: CastSessionEvent,
+        ) => {
+          const currentSession = castContext.getCurrentSession();
+          const sessionIdentity = reconcileCurrentCastSessionScope(currentSession);
+          if (currentSession) {
+            ensureChromecastRemotePlaybackObservation("cast_context_state");
+          } else {
+            stopChromecastRemotePlaybackObservation("cast_context_state:no_session");
+          }
+          const castState = castContext.getCastState();
+          const nextState = buildChromecastPresentationState(
+            castRuntimeSnapshot,
+            castState,
       );
 
       updateChromecastRuntimeState({
@@ -2681,6 +3476,7 @@ export function useChromecastAvailability() {
 
           if (normalizedEvent?.sessionState?.includes("FAILED")) {
             const message = buildSessionStartFailedMessage();
+            stopChromecastRemotePlaybackObservation("session_failed");
             markCurrentCastSessionError("session_request_failed", message, {
               sessionState: normalizedEvent.sessionState,
               sessionErrorCode: normalizedEvent.errorCode ?? null,
@@ -2699,6 +3495,9 @@ export function useChromecastAvailability() {
               normalizedEvent?.sessionState === "SESSION_RESUMED"
             ) {
               reconcileCurrentCastSessionScope(castContext.getCurrentSession());
+            }
+            if (normalizedEvent?.sessionState === "SESSION_ENDED") {
+              stopChromecastRemotePlaybackObservation("session_ended");
             }
             syncCastContextState(castContext, normalizedEvent);
           }
@@ -2775,6 +3574,7 @@ export function useChromecastAvailability() {
       isActive = false;
       removeListeners?.();
       removeRuntimeListener?.();
+      stopChromecastRemotePlaybackObservation("availability_hook_cleanup");
     };
   }, []);
 

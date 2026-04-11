@@ -56,6 +56,7 @@ export type CastResolvedMediaDiagnostics = {
   subtitlesIncluded: boolean;
   variantCacheKey: string | null;
   variantId: string | null;
+  variantStoragePath: string | null;
   variantStatus: CastVariantStatus;
   ffmpegStatus: CastFfmpegStatus;
   ffmpegAvailable: boolean | null;
@@ -74,7 +75,11 @@ export type CastResolvedMediaSuccessPayload = {
   activeTrackIds: number[];
   selectedAudioTrackId: string | null;
   selectedSubtitleTrackId: string | null;
+  resolvedEffectiveAudioTrackId: string | null;
+  resolvedEffectiveSubtitleTrackId: string | null;
   castMode: CastSuccessMode;
+  castFallbackApplied: boolean;
+  castFallbackReason: string | null;
   warnings: CastResolverWarning[];
   selectionSignature: string;
   diagnostics: CastResolvedMediaDiagnostics;
@@ -85,6 +90,12 @@ export type CastResolvedMediaFailurePayload = {
   errorCode: string;
   message: string;
   castMode: CastFailureMode;
+  selectedAudioTrackId: string | null;
+  selectedSubtitleTrackId: string | null;
+  resolvedEffectiveAudioTrackId: string | null;
+  resolvedEffectiveSubtitleTrackId: string | null;
+  castFallbackApplied: boolean;
+  castFallbackReason: string | null;
   warnings: CastResolverWarning[];
   diagnostics: CastResolvedMediaDiagnostics;
 };

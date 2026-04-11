@@ -20,6 +20,8 @@ type DebugActionSource =
   | "local_user"
   | "socket"
   | "socket_echo"
+  | "cast_remote"
+  | "cast_local_command"
   | "cast"
   | "hydration"
   | "system"

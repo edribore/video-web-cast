@@ -24,7 +24,14 @@ export type EnsureCastVariantInput = {
   videoStoragePath: string;
 };
 
+type CastVariantSourceFingerprint = {
+  byteLength: number;
+  modifiedAtMs: number;
+  signature: string;
+};
+
 export type CastVariantResult = {
+  audioFingerprint: string;
   cacheKey: string;
   contentType: string;
   ffmpegDiagnostics: CastFfmpegRunDiagnostics | null;
@@ -33,19 +40,26 @@ export type CastVariantResult = {
   storagePath: string;
   variantId: string;
   variantStatus: "created" | "reused";
+  videoFingerprint: string;
 };
 
 const inflightVariantPromises = new Map<string, Promise<CastVariantResult>>();
 const castVariantPipelineVersion = "muxed-mp4-v1";
 
-function createVariantCacheKey(input: EnsureCastVariantInput) {
+function createVariantCacheKey(input: {
+  audioFingerprint: CastVariantSourceFingerprint;
+  input: EnsureCastVariantInput;
+  videoFingerprint: CastVariantSourceFingerprint;
+}) {
   return JSON.stringify({
     pipeline: castVariantPipelineVersion,
-    mediaAssetId: input.mediaAssetId,
-    videoStoragePath: input.videoStoragePath,
-    mimeType: input.mimeType,
-    audioTrackId: input.audioTrack.id,
-    audioTrackPath: input.audioTrack.normalizedPath,
+    mediaAssetId: input.input.mediaAssetId,
+    videoStoragePath: input.input.videoStoragePath,
+    videoFingerprint: input.videoFingerprint.signature,
+    mimeType: input.input.mimeType,
+    audioTrackId: input.input.audioTrack.id,
+    audioTrackPath: input.input.audioTrack.normalizedPath,
+    audioFingerprint: input.audioFingerprint.signature,
   });
 }
 
@@ -70,10 +84,34 @@ async function isReusableVariant(absoluteOutputPath: string) {
   }
 }
 
+async function readSourceFingerprint(
+  absolutePath: string,
+): Promise<CastVariantSourceFingerprint> {
+  const fileStats = await stat(absolutePath);
+
+  return {
+    byteLength: fileStats.size,
+    modifiedAtMs: Math.round(fileStats.mtimeMs),
+    signature: `${fileStats.size}:${Math.round(fileStats.mtimeMs)}`,
+  };
+}
+
 export async function ensureCastVariant(
   input: EnsureCastVariantInput,
 ): Promise<CastVariantResult> {
-  const cacheKey = createVariantCacheKey(input);
+  const absoluteVideoInputPath = resolveStoredUploadPath(input.videoStoragePath);
+  const absoluteAudioInputPath = resolveStoredUploadPath(
+    input.audioTrack.normalizedPath,
+  );
+  const [videoFingerprint, audioFingerprint] = await Promise.all([
+    readSourceFingerprint(absoluteVideoInputPath),
+    readSourceFingerprint(absoluteAudioInputPath),
+  ]);
+  const cacheKey = createVariantCacheKey({
+    input,
+    videoFingerprint,
+    audioFingerprint,
+  });
   const existingInflight = inflightVariantPromises.get(cacheKey);
 
   if (existingInflight) {
@@ -91,6 +129,7 @@ export async function ensureCastVariant(
 
   if (await isReusableVariant(absoluteOutputPath)) {
     return {
+      audioFingerprint: audioFingerprint.signature,
       cacheKey,
       contentType: "video/mp4",
       ffmpegDiagnostics: null,
@@ -99,14 +138,11 @@ export async function ensureCastVariant(
       storagePath,
       variantId,
       variantStatus: "reused",
+      videoFingerprint: videoFingerprint.signature,
     };
   }
 
   const inflightPromise: Promise<CastVariantResult> = (async (): Promise<CastVariantResult> => {
-    const absoluteVideoInputPath = resolveStoredUploadPath(input.videoStoragePath);
-    const absoluteAudioInputPath = resolveStoredUploadPath(
-      input.audioTrack.normalizedPath,
-    );
     const outputDirectory = path.dirname(absoluteOutputPath);
     const temporaryOutputPath = path.join(
       outputDirectory,
@@ -127,6 +163,7 @@ export async function ensureCastVariant(
       if (await isReusableVariant(absoluteOutputPath)) {
         await rm(temporaryOutputPath, { force: true });
         return {
+          audioFingerprint: audioFingerprint.signature,
           cacheKey,
           contentType: "video/mp4",
           ffmpegDiagnostics,
@@ -135,6 +172,7 @@ export async function ensureCastVariant(
           storagePath,
           variantId,
           variantStatus: "reused",
+          videoFingerprint: videoFingerprint.signature,
         };
       }
 
@@ -148,8 +186,12 @@ export async function ensureCastVariant(
             pipeline: castVariantPipelineVersion,
             variantId,
             videoStoragePath: input.videoStoragePath,
+            videoFingerprint,
             audioTrackId: input.audioTrack.id,
             audioTrackPath: input.audioTrack.normalizedPath,
+            audioFingerprint,
+            outputStoragePath: storagePath,
+            ffmpegBinary: ffmpegDiagnostics.ffmpegBinary,
           },
           null,
           2,
@@ -158,6 +200,7 @@ export async function ensureCastVariant(
       );
 
       return {
+        audioFingerprint: audioFingerprint.signature,
         cacheKey,
         contentType: "video/mp4",
         ffmpegDiagnostics,
@@ -166,6 +209,7 @@ export async function ensureCastVariant(
         storagePath,
         variantId,
         variantStatus: "created",
+        videoFingerprint: videoFingerprint.signature,
       };
     } catch (error) {
       await rm(temporaryOutputPath, { force: true });

@@ -89,6 +89,12 @@ function createFailurePayload(input: {
   diagnostics: CastResolvedMediaDiagnostics;
   errorCode: string;
   message: string;
+  selectedAudioTrackId?: string | null;
+  selectedSubtitleTrackId?: string | null;
+  resolvedEffectiveAudioTrackId?: string | null;
+  resolvedEffectiveSubtitleTrackId?: string | null;
+  castFallbackApplied?: boolean;
+  castFallbackReason?: string | null;
   castMode?: CastResolvedMediaFailurePayload["castMode"];
   warnings?: CastResolverWarning[];
 }): CastResolvedMediaFailurePayload {
@@ -97,6 +103,13 @@ function createFailurePayload(input: {
     errorCode: input.errorCode,
     message: input.message,
     castMode: input.castMode ?? "resolver_error",
+    selectedAudioTrackId: input.selectedAudioTrackId ?? null,
+    selectedSubtitleTrackId: input.selectedSubtitleTrackId ?? null,
+    resolvedEffectiveAudioTrackId: input.resolvedEffectiveAudioTrackId ?? null,
+    resolvedEffectiveSubtitleTrackId:
+      input.resolvedEffectiveSubtitleTrackId ?? null,
+    castFallbackApplied: input.castFallbackApplied ?? false,
+    castFallbackReason: input.castFallbackReason ?? null,
     warnings: input.warnings ?? [],
     diagnostics: input.diagnostics,
   };
@@ -131,6 +144,10 @@ function buildSuccessPayload(input: {
     "effectiveAudioTrackId" | "effectiveSubtitleTrackId" | "subtitlesIncluded"
   >;
 }): CastResolvedMediaSuccessPayload {
+  const primaryWarning = (input.warnings ?? [])[0] ?? null;
+  const castFallbackApplied =
+    input.castMode === "fallback_base_video_no_external_audio";
+
   return {
     ok: true,
     contentUrl: input.contentUrl,
@@ -142,7 +159,13 @@ function buildSuccessPayload(input: {
     activeTrackIds: input.activeTrackIds,
     selectedAudioTrackId: input.selectedAudioTrackId,
     selectedSubtitleTrackId: input.selectedSubtitleTrackId,
+    resolvedEffectiveAudioTrackId: input.effectiveAudioTrackId,
+    resolvedEffectiveSubtitleTrackId: input.effectiveSubtitleTrackId,
     castMode: input.castMode,
+    castFallbackApplied,
+    castFallbackReason: castFallbackApplied
+      ? primaryWarning?.message ?? null
+      : null,
     warnings: input.warnings ?? [],
     selectionSignature: buildSelectionSignature({
       contentType: input.contentType,
@@ -187,6 +210,10 @@ function createMissingFfmpegFailurePayload(input: {
     message:
       "The selected external audio track cannot be cast because ffmpeg is unavailable on the server.",
     castMode: "blocked_missing_ffmpeg",
+    selectedAudioTrackId: input.requestedAudioTrackId,
+    selectedSubtitleTrackId: input.requestedSubtitleTrackId,
+    resolvedEffectiveAudioTrackId: null,
+    resolvedEffectiveSubtitleTrackId: input.effectiveSubtitleTrackId,
     diagnostics: createDiagnostics({
       requestedAudioTrackId: input.requestedAudioTrackId,
       requestedSubtitleTrackId: input.requestedSubtitleTrackId,
@@ -195,6 +222,7 @@ function createMissingFfmpegFailurePayload(input: {
       subtitlesIncluded: input.effectiveSubtitleTrackId != null,
       variantCacheKey: null,
       variantId: null,
+      variantStoragePath: null,
       variantStatus: "blocked_ffmpeg_unavailable",
       ffmpegStatus: "unavailable",
       ffmpegAvailable: false,
@@ -216,6 +244,7 @@ function createBaseResolverDiagnostics(input: {
     subtitlesIncluded: false,
     variantCacheKey: null,
     variantId: null,
+    variantStoragePath: null,
     variantStatus: "not_needed" as const,
     ffmpegStatus: "not_needed" as const,
     ffmpegAvailable: null,
@@ -278,6 +307,8 @@ export async function resolveCastMediaForRoom(
     return createFailurePayload({
       errorCode: "room_not_found",
       message: "The requested room could not be found.",
+      selectedAudioTrackId: normalizedAudioTrackId,
+      selectedSubtitleTrackId: normalizedSubtitleTrackId,
       diagnostics: baseDiagnostics,
     });
   }
@@ -287,6 +318,8 @@ export async function resolveCastMediaForRoom(
       errorCode: "cast_base_url_unavailable",
       message:
         "This room does not currently have a Cast-safe public base URL. Configure CAST_BASE_URL or PUBLIC_BASE_URL with a reachable non-loopback origin.",
+      selectedAudioTrackId: normalizedAudioTrackId,
+      selectedSubtitleTrackId: normalizedSubtitleTrackId,
       diagnostics: baseDiagnostics,
     });
   }
@@ -300,6 +333,8 @@ export async function resolveCastMediaForRoom(
     return createFailurePayload({
       errorCode: "invalid_audio_track",
       message: "The requested audio track does not belong to this room media asset.",
+      selectedAudioTrackId: normalizedAudioTrackId,
+      selectedSubtitleTrackId: normalizedSubtitleTrackId,
       diagnostics: baseDiagnostics,
     });
   }
@@ -314,6 +349,8 @@ export async function resolveCastMediaForRoom(
       errorCode: "invalid_subtitle_track",
       message:
         "The requested subtitle track does not belong to this room media asset.",
+      selectedAudioTrackId: normalizedAudioTrackId,
+      selectedSubtitleTrackId: normalizedSubtitleTrackId,
       diagnostics: baseDiagnostics,
     });
   }
@@ -332,6 +369,8 @@ export async function resolveCastMediaForRoom(
     return createFailurePayload({
       errorCode: "cast_content_url_unavailable",
       message: "The room video does not have a Cast-safe absolute URL.",
+      selectedAudioTrackId: normalizedAudioTrackId,
+      selectedSubtitleTrackId: normalizedSubtitleTrackId,
       diagnostics: baseDiagnostics,
     });
   }
@@ -355,12 +394,12 @@ export async function resolveCastMediaForRoom(
   const ffmpegAvailability = await getFfmpegAvailability();
   const sharedAudioDiagnostics = {
     ...baseDiagnostics,
-    ffmpegAvailable: ffmpegAvailability.available,
-    ffmpegBinary: ffmpegAvailability.binary,
-    ffmpegFailureReason: ffmpegAvailability.failureReason,
+    ffmpegAvailable: ffmpegAvailability.ffmpegAvailable,
+    ffmpegBinary: ffmpegAvailability.ffmpegBinary,
+    ffmpegFailureReason: ffmpegAvailability.ffmpegFailureReason,
   };
 
-  if (!ffmpegAvailability.available) {
+  if (!ffmpegAvailability.ffmpegAvailable) {
     const resolverSettings = getResolverFfmpegSettings();
 
     if (resolverSettings.allowBaseVideoFallbackWhenMissing) {
@@ -389,8 +428,8 @@ export async function resolveCastMediaForRoom(
         requestedAudioTrackId: selectedAudioTrack.id,
         requestedSubtitleTrackId: selectedSubtitleTrack?.id ?? null,
         effectiveSubtitleTrackId: textTrackPayload.selectedSubtitleTrackId,
-        ffmpegBinary: ffmpegAvailability.binary,
-        ffmpegFailureReason: ffmpegAvailability.failureReason,
+        ffmpegBinary: ffmpegAvailability.ffmpegBinary,
+        ffmpegFailureReason: ffmpegAvailability.ffmpegFailureReason,
       });
     }
   }
@@ -412,6 +451,10 @@ export async function resolveCastMediaForRoom(
         errorCode: "cast_variant_url_unavailable",
         message:
           "The generated Cast media variant does not have a Cast-safe absolute URL.",
+        selectedAudioTrackId: selectedAudioTrack.id,
+        selectedSubtitleTrackId: selectedSubtitleTrack?.id ?? null,
+        resolvedEffectiveAudioTrackId: selectedAudioTrack.id,
+        resolvedEffectiveSubtitleTrackId: textTrackPayload.selectedSubtitleTrackId,
         diagnostics: createDiagnostics({
           ...sharedAudioDiagnostics,
           effectiveAudioTrackId: selectedAudioTrack.id,
@@ -419,6 +462,7 @@ export async function resolveCastMediaForRoom(
           subtitlesIncluded: textTrackPayload.textTracks.length > 0,
           variantCacheKey: variant.cacheKey,
           variantId: variant.variantId,
+          variantStoragePath: variant.storagePath,
           variantStatus: variant.variantStatus,
           ffmpegStatus: variant.ffmpegStatus,
         }),
@@ -440,6 +484,7 @@ export async function resolveCastMediaForRoom(
         ...sharedAudioDiagnostics,
         variantCacheKey: variant.cacheKey,
         variantId: variant.variantId,
+        variantStoragePath: variant.storagePath,
         variantStatus: variant.variantStatus,
         ffmpegStatus: variant.ffmpegStatus,
       },
@@ -470,6 +515,7 @@ export async function resolveCastMediaForRoom(
             variantStatus: "skipped_ffmpeg_unavailable",
             ffmpegStatus: "unavailable",
             ffmpegAvailable: false,
+            variantStoragePath: null,
             ffmpegFailureReason: failureReason,
           },
         });
@@ -479,7 +525,7 @@ export async function resolveCastMediaForRoom(
         requestedAudioTrackId: selectedAudioTrack.id,
         requestedSubtitleTrackId: selectedSubtitleTrack?.id ?? null,
         effectiveSubtitleTrackId: textTrackPayload.selectedSubtitleTrackId,
-        ffmpegBinary: ffmpegAvailability.binary,
+        ffmpegBinary: ffmpegAvailability.ffmpegBinary,
         ffmpegFailureReason: failureReason,
       });
     }
@@ -487,6 +533,10 @@ export async function resolveCastMediaForRoom(
     return createFailurePayload({
       errorCode: "cast_variant_generation_failed",
       message: "The Cast audio/video variant could not be generated.",
+      selectedAudioTrackId: selectedAudioTrack.id,
+      selectedSubtitleTrackId: selectedSubtitleTrack?.id ?? null,
+      resolvedEffectiveAudioTrackId: selectedAudioTrack.id,
+      resolvedEffectiveSubtitleTrackId: textTrackPayload.selectedSubtitleTrackId,
       diagnostics: createDiagnostics({
         ...sharedAudioDiagnostics,
         effectiveAudioTrackId: selectedAudioTrack.id,
@@ -506,6 +556,7 @@ export async function resolveCastMediaForRoom(
           typeof error.variantId === "string"
             ? error.variantId
             : null,
+        variantStoragePath: null,
         variantStatus: "failed",
         ffmpegStatus: "failed",
         ffmpegFailureReason:

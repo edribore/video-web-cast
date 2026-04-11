@@ -11,8 +11,11 @@ import {
 } from "react";
 import {
   prepareChromecastMediaForSession,
+  subscribeToChromecastRemotePlayback,
+  subscribeToChromecastRuntime,
   syncRoomPlaybackToChromecast,
   useChromecastAvailability,
+  type ChromecastRemotePlaybackEvent,
   type ChromecastAvailabilityStatus,
 } from "@/lib/chromecast";
 import {
@@ -51,6 +54,8 @@ type RoomActionSource =
   | "local_user"
   | "socket"
   | "socket_echo"
+  | "cast_remote"
+  | "cast_local_command"
   | "hydration"
   | "cast"
   | "system";
@@ -228,9 +233,12 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     () => createInitialLocalAudioState(snapshot),
   );
   const [pendingCommandCount, setPendingCommandCount] = useState(0);
+  const [castRuntimeState, setCastRuntimeState] = useState<Record<string, unknown>>(
+    {},
+  );
   const playerRef = useRef<RoomVideoPlayerHandle>(null);
   const socketRef = useRef<Socket | null>(null);
-  const pendingClientEventIdsRef = useRef<Set<string>>(new Set());
+  const pendingClientEventIdsRef = useRef<Map<string, RoomActionSource>>(new Map());
   const authoritativePlaybackRef = useRef(snapshot.playback);
   const participantPreferencesRef = useRef(participantPreferences);
   const castStatusRef = useRef<ChromecastAvailabilityStatus>("unavailable");
@@ -285,6 +293,35 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     audioTracks.find(
       (track) => track.id === effectiveSelectedAudioTrackId,
     ) ?? null;
+  const castFallbackApplied = castRuntimeState.castFallbackApplied === true;
+  const castFallbackReason =
+    typeof castRuntimeState.castFallbackReason === "string"
+      ? castRuntimeState.castFallbackReason
+      : null;
+  const resolvedEffectiveCastAudioTrackId =
+    typeof castRuntimeState.resolvedEffectiveAudioTrackId === "string"
+      ? castRuntimeState.resolvedEffectiveAudioTrackId
+      : null;
+  const resolvedEffectiveCastSubtitleTrackId =
+    typeof castRuntimeState.resolvedEffectiveSubtitleTrackId === "string"
+      ? castRuntimeState.resolvedEffectiveSubtitleTrackId
+      : null;
+  const castRemotePlayerObserved = castRuntimeState.remotePlayerObserved === true;
+  const effectiveCastAudioTrack =
+    audioTracks.find((track) => track.id === resolvedEffectiveCastAudioTrackId) ?? null;
+  const castAudioFallbackVisible =
+    isCastActive &&
+    participantPreferences.selectedAudioTrackId != null &&
+    castFallbackApplied;
+  const castAudioStatusMessage = !isCastActive
+    ? null
+    : effectiveCastAudioTrack
+      ? `Chromecast audio is using ${effectiveCastAudioTrack.label}.`
+      : participantPreferences.selectedAudioTrackId
+        ? castFallbackApplied
+          ? "Chromecast is using the base video audio instead of the selected external audio."
+          : "Chromecast audio is using the resolved base video audio."
+        : "Chromecast audio is using the base video audio.";
 
   useDebugFeatureFlags({
     localPlaybackEnabled: true,
@@ -313,7 +350,13 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       issueCode: castIssueCode,
       active: isCastActive,
       canRequestSession,
+      fallbackApplied: castFallbackApplied,
+      fallbackReason: castFallbackReason,
+      resolvedEffectiveAudioTrackId: resolvedEffectiveCastAudioTrackId,
+      resolvedEffectiveSubtitleTrackId: resolvedEffectiveCastSubtitleTrackId,
+      remotePlayerObserved: castRemotePlayerObserved,
     },
+    castRuntimeState,
     localAudio: localAudioState,
     media: snapshot.media,
     videoUrl: snapshot.media?.videoUrl ?? null,
@@ -359,6 +402,57 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     },
   );
 
+  function emitSharedRoomCommand(
+    command: {
+      type: SharedRoomControlType;
+      status: PlaybackStatus;
+      currentTime: number;
+      playbackRate: number;
+    },
+    source: RoomActionSource,
+  ) {
+    dispatch({ type: "last_action_source", source });
+    setDebugLastActionSource(source);
+
+    const socket = socketRef.current;
+
+    if (!socket?.connected) {
+      const message = "Room sync is offline, so this change stayed local.";
+      dispatch({ type: "sync_issue", message });
+      logDebugEvent({
+        level: "warn",
+        category: "socket",
+        message,
+        source,
+      });
+      return false;
+    }
+
+    const clientEventId = createSafeId("room-command");
+    pendingClientEventIdsRef.current.set(clientEventId, source);
+    setPendingCommandCount(pendingClientEventIdsRef.current.size);
+    socket.emit("room:command", {
+      roomId: snapshot.roomId,
+      actorSessionId: participantSessionId,
+      clientEventId,
+      type: command.type,
+      status: command.status,
+      currentTime: command.currentTime,
+      playbackRate: command.playbackRate,
+    });
+    logDebugEvent({
+      level: "info",
+      category: "sync",
+      message:
+        source === "cast_remote"
+          ? `Emitted shared ${command.type} from Chromecast remote input.`
+          : `Emitted shared ${command.type}.`,
+      source,
+      data: { clientEventId, currentTime: command.currentTime },
+    });
+    return true;
+  }
+
   async function dispatchSharedCommand(
     type: SharedRoomControlType,
     runPlayerAction: (
@@ -374,8 +468,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     try {
       const playerSnapshot = await runPlayerAction(player);
       dispatch({ type: "video_observed", snapshot: playerSnapshot });
-      dispatch({ type: "last_action_source", source: "local_user" });
-      setDebugLastActionSource("local_user");
 
       const socket = socketRef.current;
       logDebugEvent({
@@ -387,36 +479,27 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       });
 
       if (!socket?.connected) {
-        const message = "Room sync is offline, so this change stayed local.";
-        dispatch({ type: "sync_issue", message });
-        logDebugEvent({
-          level: "warn",
-          category: "socket",
-          message,
-          source: "local_user",
-        });
+        emitSharedRoomCommand(
+          {
+            type,
+            status: playerSnapshot.status,
+            currentTime: playerSnapshot.currentTime,
+            playbackRate: playerSnapshot.playbackRate,
+          },
+          "local_user",
+        );
         return;
       }
 
-      const clientEventId = createSafeId("room-command");
-      pendingClientEventIdsRef.current.add(clientEventId);
-      setPendingCommandCount(pendingClientEventIdsRef.current.size);
-      socket.emit("room:command", {
-        roomId: snapshot.roomId,
-        actorSessionId: participantSessionId,
-        clientEventId,
-        type,
-        status: playerSnapshot.status,
-        currentTime: playerSnapshot.currentTime,
-        playbackRate: playerSnapshot.playbackRate,
-      });
-      logDebugEvent({
-        level: "info",
-        category: "sync",
-        message: `Emitted shared ${type}.`,
-        source: "local_user",
-        data: { clientEventId, currentTime: playerSnapshot.currentTime },
-      });
+      emitSharedRoomCommand(
+        {
+          type,
+          status: playerSnapshot.status,
+          currentTime: playerSnapshot.currentTime,
+          playbackRate: playerSnapshot.playbackRate,
+        },
+        "local_user",
+      );
     } catch (error) {
       const message = "This browser could not apply the requested playback change.";
       dispatch({ type: "sync_issue", message });
@@ -430,6 +513,32 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     }
   }
 
+  const handleCastRemotePlayback = useEffectEvent(
+    async (event: ChromecastRemotePlaybackEvent) => {
+      if (castStatusRef.current !== "connected") {
+        return;
+      }
+
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: `Forwarding Chromecast remote ${event.type} into shared room sync.`,
+        source: "cast_remote",
+        data: event,
+      });
+
+      emitSharedRoomCommand(
+        {
+          type: event.type,
+          status: event.status,
+          currentTime: event.currentTime,
+          playbackRate: event.playbackRate,
+        },
+        "cast_remote",
+      );
+    },
+  );
+
   useEffect(() => {
     participantPreferencesRef.current = participantPreferences;
   }, [participantPreferences]);
@@ -437,6 +546,18 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   useEffect(() => {
     castStatusRef.current = castStatus;
   }, [castStatus]);
+
+  useEffect(() => {
+    return subscribeToChromecastRuntime((snapshot) => {
+      setCastRuntimeState(snapshot);
+    });
+  }, []);
+
+  useEffect(() => {
+    return subscribeToChromecastRemotePlayback((event) => {
+      void handleCastRemotePlayback(event);
+    });
+  }, []);
 
   useEffect(() => {
     void applyAuthoritativePlayback(snapshot.playback, "hydration");
@@ -495,11 +616,17 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     });
 
     socket.on("room:playback-sync", async (payload: RoomSocketPlaybackSyncPayload) => {
+      const pendingSource = payload.sourceClientEventId
+        ? pendingClientEventIdsRef.current.get(payload.sourceClientEventId) ?? null
+        : null;
       const source =
-        payload.sourceClientEventId &&
-        pendingClientEventIdsRef.current.has(payload.sourceClientEventId)
-          ? "socket_echo"
-          : "socket";
+        pendingSource === "cast_remote"
+          ? "cast_remote"
+          : pendingSource === "cast_local_command"
+            ? "cast_local_command"
+            : pendingSource
+              ? "socket_echo"
+              : "socket";
 
       if (payload.sourceClientEventId) {
         pendingClientEventIdsRef.current.delete(payload.sourceClientEventId);
@@ -752,6 +879,13 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           </div>
         ) : null}
 
+        {castAudioFallbackVisible ? (
+          <div className="mt-6 rounded-3xl border border-[#d7b7a6] bg-[#fff3ec] px-5 py-4 text-sm leading-6 text-[#7f4022]">
+            {castFallbackReason ??
+              "Chromecast is using the base video audio because the selected external audio could not be prepared for Cast."}
+          </div>
+        ) : null}
+
         {!snapshot.media?.castVideoUrl ? (
           <div className="mt-6 rounded-3xl border border-line bg-white/70 px-5 py-4 text-sm leading-6 text-muted">
             Cast needs a reachable media origin. Set `PUBLIC_BASE_URL` or `CAST_BASE_URL` to an HTTPS tunnel such as ngrok for the most reliable sender setup.
@@ -794,9 +928,16 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
               </p>
             </div>
             {isCastActive ? (
-              <p className="mt-3 text-xs font-semibold uppercase tracking-[0.2em] text-accent-strong">
-                Cast active
-              </p>
+              <div className="mt-3 space-y-1">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-accent-strong">
+                  Cast active
+                </p>
+                <p className="text-xs leading-6 text-muted">
+                  {castRemotePlayerObserved
+                    ? "Chromecast remote playback observation is active."
+                    : "Chromecast remote playback observation is waiting for an active media session."}
+                </p>
+              </div>
             ) : null}
           </div>
           <div className="space-y-4">
@@ -857,6 +998,15 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                     : "Alternate audio files are stored for this room, but none are playable in this browser session."}
                 </p>
               ) : null}
+              {castAudioStatusMessage ? (
+                <p
+                  className={`mt-2 text-xs leading-6 ${
+                    castAudioFallbackVisible ? "text-[#8a342f]" : "text-muted"
+                  }`}
+                >
+                  {castAudioStatusMessage}
+                </p>
+              ) : null}
               {localAudioState.issue ? (
                 <p className="mt-2 text-xs leading-6 text-[#8a342f]">
                   {localAudioState.issue}
@@ -895,6 +1045,17 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                   </option>
                 ))}
               </select>
+              {isCastActive ? (
+                <p className="mt-2 text-xs leading-6 text-muted">
+                  Chromecast subtitles are using{" "}
+                  {resolvedEffectiveCastSubtitleTrackId
+                    ? snapshot.media?.subtitleTracks.find(
+                        (track) => track.id === resolvedEffectiveCastSubtitleTrackId,
+                      )?.label ?? "the selected subtitle track"
+                    : "no subtitle track"}
+                  .
+                </p>
+              ) : null}
             </div>
           </div>
         </div>

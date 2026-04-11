@@ -1,7 +1,7 @@
 import "server-only";
 
 import { spawn } from "node:child_process";
-import { resolveConfiguredFfmpegBinary } from "@/server/cast/ffmpeg-availability";
+import { getFfmpegAvailability } from "@/server/cast/ffmpeg-availability";
 
 const ffmpegLogTailLength = 4000;
 
@@ -54,7 +54,8 @@ function buildCommandString(binary: string, args: string[]) {
 export async function muxCastVariantToMp4(
   input: CastFfmpegMuxInput,
 ): Promise<CastFfmpegRunDiagnostics> {
-  const ffmpegBinary = resolveConfiguredFfmpegBinary();
+  const ffmpegAvailability = await getFfmpegAvailability();
+  const ffmpegBinary = ffmpegAvailability.ffmpegBinary ?? "ffmpeg";
   const args = [
     "-y",
     "-nostdin",
@@ -86,6 +87,20 @@ export async function muxCastVariantToMp4(
     input.outputPath,
   ];
   const command = buildCommandString(ffmpegBinary, args);
+
+  if (!ffmpegAvailability.ffmpegAvailable || !ffmpegAvailability.ffmpegBinary) {
+    throw new CastFfmpegError(
+      ffmpegAvailability.ffmpegFailureReason ??
+        "Cast audio muxing requires ffmpeg to be installed and reachable by the server.",
+      {
+        ffmpegBinary,
+        command,
+        exitCode: null,
+        stderrTail: ffmpegAvailability.ffmpegFailureReason,
+        stdoutTail: null,
+      },
+    );
+  }
 
   return new Promise<CastFfmpegRunDiagnostics>((resolve, reject) => {
     const child = spawn(ffmpegBinary, args, {
