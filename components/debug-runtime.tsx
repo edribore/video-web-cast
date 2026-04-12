@@ -417,7 +417,7 @@ function downloadJsonFile(contents: string) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
-  anchor.download = `video-web-cast-debug-${Date.now()}.json`;
+  anchor.download = `syncpass-debug-${Date.now()}.json`;
   anchor.click();
   URL.revokeObjectURL(url);
 }

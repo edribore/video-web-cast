@@ -208,7 +208,7 @@ function sanitizeDebugValue(
 
 function createInitialDebugState(): DebugStoreState {
   return {
-    appName: "video-web-cast",
+    appName: "SyncPass",
     environment: "development",
     initializedAt: new Date().toISOString(),
     entries: [],

@@ -18,8 +18,12 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "video-web-cast",
-  description: "Synchronized watch-party MVP scaffold",
+  title: {
+    default: "SyncPass",
+    template: "%s | SyncPass",
+  },
+  description:
+    "SyncPass is a curated synchronized movie-night platform with shared rooms, local playback, and Chromecast companion control.",
 };
 
 export default function RootLayout({
@@ -37,7 +41,7 @@ export default function RootLayout({
     >
       <body className="min-h-full font-sans text-foreground">
         <DebugRuntimeProvider
-          appName="video-web-cast"
+          appName="SyncPass"
           environment={process.env.NODE_ENV ?? "development"}
           configuredPublicBaseUrl={configuredPublicBaseUrl}
           configuredCastBaseUrl={configuredCastBaseUrl}

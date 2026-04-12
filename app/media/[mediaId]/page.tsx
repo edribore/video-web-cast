@@ -5,7 +5,7 @@ import { notFound } from "next/navigation";
 import { createRoomForMediaAction } from "@/app/media/actions";
 import { DebugPageState } from "@/components/debug-runtime";
 import { PageShell } from "@/components/page-shell";
-import { homeHref, uploadHref } from "@/lib/routes";
+import { adminHref, homeHref, uploadHref } from "@/lib/routes";
 import { getMediaAssetDetails } from "@/server/media-library";
 
 type MediaDetailsPageProps = {
@@ -26,9 +26,9 @@ export default async function MediaDetailsPage({
 
   return (
     <PageShell
-      eyebrow="Upload complete"
+      eyebrow="Media asset"
       title={mediaAsset.title}
-      description="The uploaded video, audio, and subtitle metadata were stored successfully. Use this page as the handoff point into room creation."
+      description="This media package is ready for SyncPass catalog assignment, room creation, and participant-specific audio/subtitle selection."
     >
       <DebugPageState
         scope="page/media"
@@ -56,7 +56,7 @@ export default async function MediaDetailsPage({
               isDefault: track.isDefault,
             })),
           },
-          actions: ["Create a room", "Upload another media asset", "Back to home"],
+          actions: ["Create direct room", "Back to admin", "Public home"],
         }}
       />
       <section className="grid gap-6 xl:grid-cols-[1.05fr_0.95fr_0.95fr]">
@@ -87,20 +87,26 @@ export default async function MediaDetailsPage({
                 type="submit"
                 className="rounded-full bg-accent px-5 py-3 text-sm font-semibold text-white transition hover:bg-accent-strong"
               >
-                Create a room
+                Create direct room
               </button>
             </form>
+            <Link
+              href={adminHref()}
+              className="rounded-full border border-line px-5 py-3 text-sm font-semibold transition hover:border-accent hover:text-accent-strong"
+            >
+              Back to admin
+            </Link>
             <Link
               href={uploadHref()}
               className="rounded-full border border-line px-5 py-3 text-sm font-semibold transition hover:border-accent hover:text-accent-strong"
             >
-              Upload another media asset
+              Upload another asset
             </Link>
             <Link
               href={homeHref()}
               className="rounded-full border border-line px-5 py-3 text-sm font-semibold transition hover:border-accent hover:text-accent-strong"
             >
-              Back to home
+              Public home
             </Link>
           </div>
         </div>

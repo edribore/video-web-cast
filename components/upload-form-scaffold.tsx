@@ -338,7 +338,7 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
         ? "Processing..."
         : uploadState.status === "success"
           ? "Redirecting..."
-          : "Upload media";
+          : "Upload media asset";
   const showProgressCard =
     uploadState.status === "uploading" ||
     uploadState.status === "processing" ||
@@ -591,7 +591,7 @@ export function UploadFormScaffold({ config }: UploadFormScaffoldProps) {
   return (
     <section className="rounded-[2rem] border border-line bg-panel p-8 shadow-[0_20px_60px_rgba(42,31,22,0.08)]">
       <p className="text-sm font-semibold uppercase tracking-[0.3em] text-muted">
-        Upload media
+        Upload media asset
       </p>
       <h2 className="mt-3 text-2xl font-semibold tracking-tight">
         Store one MP4 with optional audio and subtitle tracks

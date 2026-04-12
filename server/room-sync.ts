@@ -12,6 +12,48 @@ import { getPrismaClient } from "@/server/prisma";
 import { getRoomRealtimeSnapshot } from "@/server/room-realtime";
 import type { RoomScaffoldSnapshot } from "@/types/room-sync";
 
+function buildLanguageAvailabilityLabel(room: {
+  catalogMovie: {
+    mediaAsset: {
+      audioTracks: Array<{ language: string }>;
+      subtitleTracks: Array<{ language: string; isRenderable: boolean }>;
+    } | null;
+  } | null;
+}) {
+  const mediaAsset = room.catalogMovie?.mediaAsset;
+
+  if (!mediaAsset) {
+    return null;
+  }
+
+  const audioLanguages = Array.from(
+    new Set(
+      mediaAsset.audioTracks
+        .map((track) => track.language.toUpperCase())
+        .filter((language) => language !== "UND"),
+    ),
+  );
+  const subtitleLanguages = Array.from(
+    new Set(
+      mediaAsset.subtitleTracks
+        .filter((track) => track.isRenderable)
+        .map((track) => track.language.toUpperCase())
+        .filter((language) => language !== "UND"),
+    ),
+  );
+  const segments: string[] = [];
+
+  if (audioLanguages.length > 0) {
+    segments.push(`Audio ${audioLanguages.join(", ")}`);
+  }
+
+  if (subtitleLanguages.length > 0) {
+    segments.push(`Subs ${subtitleLanguages.join(", ")}`);
+  }
+
+  return segments.length > 0 ? segments.join(" · ") : null;
+}
+
 export async function getRoomScaffoldSnapshot(
   roomId: string,
   publicBaseUrl: string | null,
@@ -25,6 +67,31 @@ export async function getRoomScaffoldSnapshot(
         publicId: roomId,
       },
       include: {
+        catalogMovie: {
+          select: {
+            id: true,
+            slug: true,
+            title: true,
+            synopsis: true,
+            posterPath: true,
+            releaseLabel: true,
+            mediaAsset: {
+              select: {
+                audioTracks: {
+                  select: {
+                    language: true,
+                  },
+                },
+                subtitleTracks: {
+                  select: {
+                    language: true,
+                    isRenderable: true,
+                  },
+                },
+              },
+            },
+          },
+        },
         mediaAsset: {
           select: {
             id: true,
@@ -99,6 +166,19 @@ export async function getRoomScaffoldSnapshot(
         })),
       }
     : null;
+  const movie = room?.catalogMovie
+    ? {
+        id: room.catalogMovie.id,
+        slug: room.catalogMovie.slug,
+        title: room.catalogMovie.title,
+        synopsis: room.catalogMovie.synopsis,
+        posterUrl: room.catalogMovie.posterPath
+          ? storedUploadHref(room.catalogMovie.posterPath)
+          : null,
+        releaseLabel: room.catalogMovie.releaseLabel,
+        languageAvailabilityLabel: buildLanguageAvailabilityLabel(room),
+      }
+    : null;
 
   const snapshot: RoomScaffoldSnapshot = {
     roomId,
@@ -113,6 +193,7 @@ export async function getRoomScaffoldSnapshot(
     },
     playback: realtimeSnapshot?.playback ?? createInitialPlaybackState(),
     lastEvent: realtimeSnapshot?.lastEvent ?? null,
+    movie,
     media,
   };
 

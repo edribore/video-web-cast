@@ -99,6 +99,16 @@ export type RoomMediaSummary = {
   subtitleTracks: RoomSubtitleTrackSummary[];
 };
 
+export type RoomCatalogMovieSummary = {
+  id: string;
+  slug: string;
+  title: string;
+  synopsis: string;
+  posterUrl: string | null;
+  releaseLabel: string | null;
+  languageAvailabilityLabel: string | null;
+};
+
 export type RoomOriginSummary = {
   appOrigin: string | null;
   mediaOrigin: string | null;
@@ -114,5 +124,6 @@ export type RoomScaffoldSnapshot = {
   origins: RoomOriginSummary;
   playback: PlaybackStateSnapshot;
   lastEvent: RoomSyncEvent | null;
+  movie: RoomCatalogMovieSummary | null;
   media: RoomMediaSummary | null;
 };

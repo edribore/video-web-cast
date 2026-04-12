@@ -328,7 +328,7 @@ export function validateUploadSubmission(
     return {
       success: false,
       state: createValidationState(titleInput, "The selected video must be an MP4 file.", {
-        videoFile: "Only MP4 video files are supported for this MVP.",
+        videoFile: "Only MP4 video files are supported for the current SyncPass ingest flow.",
       }),
     };
   }
@@ -455,6 +455,29 @@ export async function getMediaAssetDetails(mediaId: string) {
       },
       subtitleTracks: {
         orderBy: [{ isDefault: "desc" }, { createdAt: "asc" }],
+      },
+    },
+  });
+}
+
+export async function listMediaAssetsForSelection(limit = 60) {
+  const prisma = getPrismaClient();
+
+  return prisma.mediaAsset.findMany({
+    orderBy: {
+      createdAt: "desc",
+    },
+    take: limit,
+    select: {
+      id: true,
+      title: true,
+      originalFilename: true,
+      createdAt: true,
+      _count: {
+        select: {
+          audioTracks: true,
+          subtitleTracks: true,
+        },
       },
     },
   });

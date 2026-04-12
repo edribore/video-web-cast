@@ -68,9 +68,30 @@ model MediaAsset {
 
   audioTracks    AudioTrack[]
   subtitleTracks SubtitleTrack[]
+  catalogMovies  CatalogMovie[]
   rooms          Room[]
 
   @@index([createdAt])
+}
+
+model CatalogMovie {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  title       String
+  synopsis    String
+  posterPath  String?
+  releaseLabel String?
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  mediaAssetId String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  mediaAsset MediaAsset? @relation(fields: [mediaAssetId], references: [id], onDelete: SetNull)
+  rooms      Room[]
+
+  @@index([isActive, sortOrder])
+  @@index([mediaAssetId])
 }
 
 model AudioTrack {
@@ -114,14 +135,17 @@ model Room {
   id           String   @id @default(cuid())
   publicId     String   @unique @default(cuid())
   mediaAssetId String
+  catalogMovieId String?
   name         String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  catalogMovie  CatalogMovie?      @relation(fields: [catalogMovieId], references: [id], onDelete: SetNull)
   mediaAsset    MediaAsset         @relation(fields: [mediaAssetId], references: [id], onDelete: Restrict)
   playbackState RoomPlaybackState?
   events        RoomEvent[]
 
+  @@index([catalogMovieId, createdAt])
   @@index([mediaAssetId, createdAt])
 }
 

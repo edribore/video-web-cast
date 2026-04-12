@@ -5,6 +5,14 @@ export function homeHref() {
   return "/";
 }
 
+export function adminHref() {
+  return "/admin";
+}
+
+export function movieHref(slug: string) {
+  return `/movies/${encodeURIComponent(slug)}`;
+}
+
 export function uploadHref() {
   return "/upload";
 }

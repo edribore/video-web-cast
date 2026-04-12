@@ -28,8 +28,11 @@ export default async function RoomPage({ params }: RoomPageProps) {
   return (
     <PageShell
       eyebrow="Watch room"
-      title={`Room ${roomSnapshot.roomId}`}
-      description="This room keeps shared playback timing server-authoritative while audio and subtitle choices stay per participant. Chromecast mirrors the same room timeline and uses the current participant track selection when a Cast session is active."
+      title={roomSnapshot.movie?.title ?? roomSnapshot.media?.title ?? `Room ${roomSnapshot.roomId}`}
+      description={
+        roomSnapshot.movie?.synopsis ??
+        "This SyncPass room keeps shared playback timing server-authoritative while local and Chromecast playback switch between a single active destination."
+      }
     >
       <DebugPageState scope="page/room" data={roomSnapshot} />
       <RoomPlayerScaffold snapshot={roomSnapshot} />

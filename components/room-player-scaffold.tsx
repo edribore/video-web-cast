@@ -23,8 +23,13 @@ import {
   isPlayableAudioTrackSupport,
   type AudioTrackPlaybackSupport,
 } from "@/lib/audio-track-playback";
+import { CatalogMoviePoster } from "@/components/catalog-movie-poster";
 import { createSafeId } from "@/lib/create-safe-id";
-import { formatPlaybackSeconds, syncObservedPlayback } from "@/lib/playback";
+import {
+  formatPlaybackSeconds,
+  resolveSynchronizedPlaybackTime,
+  syncObservedPlayback,
+} from "@/lib/playback";
 import { getOrCreateParticipantSessionId } from "@/lib/participant-session";
 import { logDebugEvent, setDebugLastActionSource } from "@/lib/debug-store";
 import { useDebugFeatureFlags, useDebugRuntimeState } from "@/components/debug-runtime";
@@ -50,6 +55,7 @@ import {
 
 type RoomPlayerScaffoldProps = { snapshot: RoomScaffoldSnapshot };
 type RoomConnectionStatus = "connecting" | "connected" | "disconnected";
+type PlaybackTarget = "local" | "cast";
 type RoomActionSource =
   | "local_user"
   | "socket"
@@ -81,6 +87,130 @@ type RoomPlayerAction =
   | { type: "last_action_source"; source: RoomActionSource | null };
 
 const EMPTY_AUDIO_TRACKS: RoomAudioTrackSummary[] = [];
+
+function buildSyntheticPlaybackSnapshot(
+  playback: PlaybackStateSnapshot,
+  type: SharedRoomControlType,
+  deltaSeconds = 0,
+) {
+  const resolvedCurrentTime = resolveSynchronizedPlaybackTime(playback);
+
+  switch (type) {
+    case "play":
+      return {
+        status: "playing" as const,
+        currentTime: resolvedCurrentTime,
+        playbackRate: playback.playbackRate,
+      };
+    case "pause":
+      return {
+        status: "paused" as const,
+        currentTime: resolvedCurrentTime,
+        playbackRate: playback.playbackRate,
+      };
+    case "stop":
+      return {
+        status: "stopped" as const,
+        currentTime: 0,
+        playbackRate: playback.playbackRate,
+      };
+    case "seek":
+      return {
+        status: playback.status,
+        currentTime: Math.max(0, resolvedCurrentTime + deltaSeconds),
+        playbackRate: playback.playbackRate,
+      };
+  }
+}
+
+function SocialCallPanel({
+  playbackTarget,
+  roomTitle,
+}: {
+  playbackTarget: PlaybackTarget;
+  roomTitle: string;
+}) {
+  return (
+    <section className="rounded-[1.8rem] border border-white/10 bg-[#17131a]/88 p-6 shadow-[0_18px_50px_rgba(0,0,0,0.2)]">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <p className="text-sm font-semibold uppercase tracking-[0.3em] text-[#8fa7c7]">
+            Video call
+          </p>
+          <h3 className="mt-2 text-xl font-semibold text-white">
+            Companion stage
+          </h3>
+        </div>
+        <span className="rounded-full bg-[#1b2838] px-3 py-1 text-xs font-semibold uppercase tracking-[0.24em] text-[#cde0ff]">
+          {playbackTarget === "cast" ? "TV mode" : "Local mode"}
+        </span>
+      </div>
+      <div className="mt-5 grid gap-4 sm:grid-cols-2">
+        <div className="rounded-[1.5rem] border border-white/10 bg-[linear-gradient(145deg,#2f3447,#161c28)] p-5">
+          <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#d7c19d]">
+            Host
+          </p>
+          <p className="mt-6 text-lg font-semibold text-white">Room control seat</p>
+          <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+            {roomTitle} stays synchronized here while the call layer remains
+            ready for the planned WebRTC surface.
+          </p>
+        </div>
+        <div className="rounded-[1.5rem] border border-white/10 bg-[linear-gradient(145deg,#403027,#1f1714)] p-5">
+          <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[#d7c19d]">
+            Guest
+          </p>
+          <p className="mt-6 text-lg font-semibold text-white">Reaction feed</p>
+          <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+            This pane is reserved for face cams and reactions while playback
+            stays anchored to a single destination.
+          </p>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SocialChatPanel({
+  roomId,
+  lastEventType,
+}: {
+  roomId: string;
+  lastEventType: string | null;
+}) {
+  return (
+    <section className="rounded-[1.8rem] border border-white/10 bg-[#17131a]/88 p-6 shadow-[0_18px_50px_rgba(0,0,0,0.2)]">
+      <p className="text-sm font-semibold uppercase tracking-[0.3em] text-[#8fa7c7]">
+        Chat
+      </p>
+      <h3 className="mt-2 text-xl font-semibold text-white">
+        Watch-room conversation
+      </h3>
+      <div className="mt-5 space-y-3">
+        <div className="rounded-[1.4rem] border border-white/10 bg-black/20 px-4 py-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.24em] text-[#d7c19d]">
+            Host notes
+          </p>
+          <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+            Room <span className="font-mono text-white">{roomId}</span> is ready
+            for synchronized playback and companion-screen reactions.
+          </p>
+        </div>
+        <div className="rounded-[1.4rem] border border-white/10 bg-black/20 px-4 py-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.24em] text-[#d7c19d]">
+            Room activity
+          </p>
+          <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+            Latest shared event:{" "}
+            <span className="font-semibold text-white">
+              {lastEventType ?? "No shared action yet"}
+            </span>
+          </p>
+        </div>
+      </div>
+    </section>
+  );
+}
 
 function reducer(state: RoomPlayerState, action: RoomPlayerAction): RoomPlayerState {
   switch (action.type) {
@@ -252,6 +382,9 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     endChromecastSession,
   } = useChromecastAvailability();
   const castDisplayStatus: ChromecastAvailabilityStatus = castStatus;
+  const playbackTarget: PlaybackTarget = isCastActive ? "cast" : "local";
+  const roomDisplayTitle =
+    snapshot.movie?.title ?? snapshot.media?.title ?? "SyncPass room";
   const visibleCastIssue =
     castDisplayStatus === "loading" || castDisplayStatus === "available"
       ? null
@@ -322,6 +455,23 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           ? "Chromecast is using the base video audio instead of the selected external audio."
           : "Chromecast audio is using the resolved base video audio."
         : "Chromecast audio is using the base video audio.";
+  const displayedLocalAudioState =
+    playbackTarget === "cast"
+      ? {
+          ...localAudioState,
+          activeSource: "none" as const,
+          activeTrackId: null,
+          intendedAudibleSource: "none" as const,
+          embeddedAudioActive: false,
+          externalAudioActive: false,
+          externalAudioAttached: false,
+          externalAudioSynchronized: false,
+          suppressLocalAudioOutput: true,
+          videoMuted: true,
+          externalAudioMuted: true,
+          issue: null,
+        }
+      : localAudioState;
 
   useDebugFeatureFlags({
     localPlaybackEnabled: true,
@@ -334,6 +484,8 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
 
   useDebugRuntimeState("room/live", {
     roomId: snapshot.roomId,
+    playbackTarget,
+    movie: snapshot.movie,
     sharePath: snapshot.sharePath,
     shareUrl: snapshot.shareUrl,
     origins: snapshot.origins,
@@ -357,7 +509,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       remotePlayerObserved: castRemotePlayerObserved,
     },
     castRuntimeState,
-    localAudio: localAudioState,
+    localAudio: displayedLocalAudioState,
     media: snapshot.media,
     videoUrl: snapshot.media?.videoUrl ?? null,
     absoluteVideoUrl: snapshot.media?.absoluteVideoUrl ?? null,
@@ -455,18 +607,62 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
 
   async function dispatchSharedCommand(
     type: SharedRoomControlType,
-    runPlayerAction: (
-      player: RoomVideoPlayerHandle,
-    ) => Promise<RoomVideoPlayerSnapshot> | RoomVideoPlayerSnapshot,
+    options?: {
+      deltaSeconds?: number;
+    },
   ) {
     const player = playerRef.current;
+    const commandSource: RoomActionSource =
+      playbackTarget === "cast" ? "cast_local_command" : "local_user";
 
-    if (!player) {
+    if (!player || playbackTarget === "cast") {
+      const syntheticSnapshot = buildSyntheticPlaybackSnapshot(
+        authoritativePlaybackRef.current,
+        type,
+        options?.deltaSeconds ?? 0,
+      );
+
+      dispatch({
+        type: "last_action_source",
+        source: commandSource,
+      });
+      setDebugLastActionSource(commandSource);
+      logDebugEvent({
+        level: "info",
+        category: "playback",
+        message:
+          playbackTarget === "cast"
+            ? `Issued ${type} while Chromecast is the active playback destination.`
+            : `Issued ${type} from the shared room controls.`,
+        source: commandSource,
+        data: {
+          roomId: snapshot.roomId,
+          syntheticSnapshot,
+          playbackTarget,
+        },
+      });
+
+      emitSharedRoomCommand(
+        {
+          type,
+          status: syntheticSnapshot.status,
+          currentTime: syntheticSnapshot.currentTime,
+          playbackRate: syntheticSnapshot.playbackRate,
+        },
+        commandSource,
+      );
       return;
     }
 
     try {
-      const playerSnapshot = await runPlayerAction(player);
+      const playerSnapshot =
+        type === "play"
+          ? await player.play()
+          : type === "pause"
+            ? player.pause()
+            : type === "stop"
+              ? player.stop()
+              : player.seekBy(options?.deltaSeconds ?? 0);
       dispatch({ type: "video_observed", snapshot: playerSnapshot });
 
       const socket = socketRef.current;
@@ -474,7 +670,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
         level: "info",
         category: "playback",
         message: `Local ${type}.`,
-        source: "local_user",
+        source: commandSource,
         data: { roomId: snapshot.roomId, playerSnapshot },
       });
 
@@ -486,7 +682,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
             currentTime: playerSnapshot.currentTime,
             playbackRate: playerSnapshot.playbackRate,
           },
-          "local_user",
+          commandSource,
         );
         return;
       }
@@ -498,7 +694,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           currentTime: playerSnapshot.currentTime,
           playbackRate: playerSnapshot.playbackRate,
         },
-        "local_user",
+        commandSource,
       );
     } catch (error) {
       const message = "This browser could not apply the requested playback change.";
@@ -507,7 +703,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
         level: "error",
         category: "playback",
         message,
-        source: "local_user",
+        source: commandSource,
         data: error,
       });
     }
@@ -703,6 +899,14 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     snapshot.roomId,
   ]);
 
+  useEffect(() => {
+    if (playbackTarget !== "local") {
+      return;
+    }
+
+    void applyAuthoritativePlayback(authoritativePlaybackRef.current, "system");
+  }, [playbackTarget]);
+
   async function handleCastButton() {
     if (isCastActive) {
       await endChromecastSession();
@@ -743,24 +947,43 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     await requestChromecastSession();
   }
 
+  const resolvedEffectiveCastSubtitleTrack =
+    (snapshot.media?.subtitleTracks ?? []).find(
+      (track) => track.id === resolvedEffectiveCastSubtitleTrackId,
+    ) ?? null;
+  const localSelectedSubtitleTrack =
+    (snapshot.media?.subtitleTracks ?? []).find(
+      (track) => track.id === participantPreferences.selectedSubtitleTrackId,
+    ) ?? null;
+
   return (
     <div className="grid gap-6 xl:grid-cols-[1.45fr_0.85fr]">
       <section
         data-debug-room-sync="true"
-        className="rounded-[2rem] border border-line bg-panel p-8 shadow-[0_20px_60px_rgba(42,31,22,0.08)]"
+        className="rounded-[2rem] border border-white/10 bg-[#151117]/90 p-8 shadow-[0_24px_70px_rgba(0,0,0,0.28)]"
       >
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div>
-            <p className="text-sm font-semibold uppercase tracking-[0.3em] text-muted">
-              Synchronized playback
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="rounded-full bg-[#1d2a3a] px-4 py-2 text-xs font-semibold uppercase tracking-[0.24em] text-[#cde0ff]">
+                Playback {playbackTarget}
+              </span>
+              {snapshot.movie?.releaseLabel ? (
+                <span className="rounded-full bg-[#2a1d1a] px-4 py-2 text-xs font-semibold uppercase tracking-[0.24em] text-[#f2c99a]">
+                  {snapshot.movie.releaseLabel}
+                </span>
+              ) : null}
+            </div>
+            <p className="mt-4 text-sm font-semibold uppercase tracking-[0.3em] text-[#8fa7c7]">
+              SyncPass room
             </p>
-            <h2 className="mt-3 text-2xl font-semibold tracking-tight">
-              Shared room timeline, local language choices
+            <h2 className="mt-3 text-2xl font-semibold tracking-tight text-white">
+              {roomDisplayTitle}
             </h2>
-            <p className="mt-3 max-w-2xl text-sm leading-6 text-muted">
-              Play, pause, seek, and stop are shared across the room. Audio and
-              subtitle choices stay per-participant, and the current Cast session
-              uses the same selected tracks.
+            <p className="mt-3 max-w-2xl text-sm leading-6 text-[#c7c2ca]">
+              {playbackTarget === "local"
+                ? "The browser is the active playback destination. Shared room controls, alternate audio, subtitles, and sync all land directly on this local player."
+                : "Chromecast is the active playback destination. The browser is now the companion control surface for playback, call, and chat while the TV holds the media session."}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3 lg:justify-end">
@@ -787,7 +1010,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                 (!isCastActive && !canRequestSession)
               }
               data-debug-cast-button="true"
-              className="rounded-full border border-line bg-white/80 px-5 py-3 text-sm font-semibold transition hover:border-accent hover:text-accent-strong disabled:cursor-not-allowed disabled:border-line disabled:text-muted"
+              className="rounded-full border border-white/10 bg-black/20 px-5 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7] hover:text-[#dbe8ff] disabled:cursor-not-allowed disabled:border-white/10 disabled:text-[#8c8a91]"
             >
               {isCastActive
                 ? "End Cast"
@@ -800,119 +1023,167 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           </div>
         </div>
 
-        <div className="mt-8">
-          <RoomVideoPlayer
-            ref={playerRef}
-            roomId={snapshot.roomId}
-            title={snapshot.media?.title ?? "Uploaded media"}
-            videoUrl={snapshot.media?.videoUrl ?? null}
-            audioTracks={audioTracks}
-            audioTrackSupport={audioTrackSupport}
-            selectedAudioTrackId={effectiveSelectedAudioTrackId}
-            subtitleTracks={snapshot.media?.subtitleTracks ?? []}
-            selectedSubtitleTrackId={participantPreferences.selectedSubtitleTrackId}
-            playbackRate={state.playback.playbackRate}
-            suppressLocalAudioOutput={false}
-            onAudioStateChange={(nextLocalAudioState) =>
-              setLocalAudioState((currentLocalAudioState) =>
-                areLocalAudioStatesEqual(currentLocalAudioState, nextLocalAudioState)
-                  ? currentLocalAudioState
-                  : nextLocalAudioState,
-              )
-            }
-            onObservedStateChange={(playerSnapshot) =>
-              dispatch({ type: "video_observed", snapshot: playerSnapshot })
-            }
-            onSyncIssueChange={(message) =>
-              dispatch({ type: "sync_issue", message })
-            }
-          />
-        </div>
+        {playbackTarget === "local" ? (
+          <div className="mt-8">
+            <RoomVideoPlayer
+              ref={playerRef}
+              roomId={snapshot.roomId}
+              title={snapshot.media?.title ?? "Uploaded media"}
+              videoUrl={snapshot.media?.videoUrl ?? null}
+              audioTracks={audioTracks}
+              audioTrackSupport={audioTrackSupport}
+              selectedAudioTrackId={effectiveSelectedAudioTrackId}
+              subtitleTracks={snapshot.media?.subtitleTracks ?? []}
+              selectedSubtitleTrackId={participantPreferences.selectedSubtitleTrackId}
+              playbackRate={state.playback.playbackRate}
+              suppressLocalAudioOutput={false}
+              onAudioStateChange={(nextLocalAudioState) =>
+                setLocalAudioState((currentLocalAudioState) =>
+                  areLocalAudioStatesEqual(currentLocalAudioState, nextLocalAudioState)
+                    ? currentLocalAudioState
+                    : nextLocalAudioState,
+                )
+              }
+              onObservedStateChange={(playerSnapshot) =>
+                dispatch({ type: "video_observed", snapshot: playerSnapshot })
+              }
+              onSyncIssueChange={(message) =>
+                dispatch({ type: "sync_issue", message })
+              }
+            />
+          </div>
+        ) : (
+          <div className="mt-8 rounded-[1.8rem] border border-white/10 bg-black/20 p-5">
+            <div className="grid gap-5 md:grid-cols-[12rem_1fr]">
+              <CatalogMoviePoster
+                title={roomDisplayTitle}
+                posterUrl={snapshot.movie?.posterUrl ?? null}
+                className="aspect-[3/4] min-h-[16rem]"
+              />
+              <div className="space-y-4">
+                <div className="rounded-[1.4rem] border border-white/10 bg-[#111922] px-4 py-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#8fa7c7]">
+                    Cast companion mode
+                  </p>
+                  <p className="mt-2 text-base font-semibold text-white">
+                    The TV is the only active playback surface right now.
+                  </p>
+                  <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+                    Local video and audio are suppressed while Chromecast holds
+                    the room timeline.
+                  </p>
+                </div>
+                <div className="rounded-[1.4rem] border border-white/10 bg-[#111922] px-4 py-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#8fa7c7]">
+                    Effective Cast media
+                  </p>
+                  <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+                    {castAudioStatusMessage}
+                  </p>
+                  <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+                    Chromecast subtitles are using{" "}
+                    {resolvedEffectiveCastSubtitleTrack?.label ?? "no subtitle track"}.
+                  </p>
+                </div>
+                <div className="rounded-[1.4rem] border border-white/10 bg-[#111922] px-4 py-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#8fa7c7]">
+                    Remote sync
+                  </p>
+                  <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+                    {castRemotePlayerObserved
+                      ? "Chromecast remote play, pause, and seek changes are being mirrored back into the room."
+                      : "Waiting for the remote player observer to attach to the current Cast media session."}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div data-debug-playback-controls="true" className="mt-6 grid gap-3 sm:grid-cols-5">
           <button
             type="button"
-            onClick={() => void dispatchSharedCommand("play", (player) => player.play())}
-            className="rounded-3xl bg-accent px-4 py-3 text-sm font-semibold text-white transition hover:bg-accent-strong"
+            onClick={() => void dispatchSharedCommand("play")}
+            className="rounded-3xl bg-[#d07a3e] px-4 py-3 text-sm font-semibold text-white transition hover:bg-[#b76630]"
           >
             Play
           </button>
           <button
             type="button"
-            onClick={() => void dispatchSharedCommand("pause", (player) => player.pause())}
-            className="rounded-3xl border border-line bg-white/80 px-4 py-3 text-sm font-semibold transition hover:border-accent"
+            onClick={() => void dispatchSharedCommand("pause")}
+            className="rounded-3xl border border-white/10 bg-black/20 px-4 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7]"
           >
             Pause
           </button>
           <button
             type="button"
-            onClick={() => void dispatchSharedCommand("seek", (player) => player.seekBy(-10))}
-            className="rounded-3xl border border-line bg-white/80 px-4 py-3 text-sm font-semibold transition hover:border-accent"
+            onClick={() => void dispatchSharedCommand("seek", { deltaSeconds: -10 })}
+            className="rounded-3xl border border-white/10 bg-black/20 px-4 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7]"
           >
             Seek -10s
           </button>
           <button
             type="button"
-            onClick={() => void dispatchSharedCommand("seek", (player) => player.seekBy(10))}
-            className="rounded-3xl border border-line bg-white/80 px-4 py-3 text-sm font-semibold transition hover:border-accent"
+            onClick={() => void dispatchSharedCommand("seek", { deltaSeconds: 10 })}
+            className="rounded-3xl border border-white/10 bg-black/20 px-4 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7]"
           >
             Seek +10s
           </button>
           <button
             type="button"
-            onClick={() => void dispatchSharedCommand("stop", (player) => player.stop())}
-            className="rounded-3xl border border-line bg-white/80 px-4 py-3 text-sm font-semibold transition hover:border-accent"
+            onClick={() => void dispatchSharedCommand("stop")}
+            className="rounded-3xl border border-white/10 bg-black/20 px-4 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7]"
           >
             Stop
           </button>
         </div>
 
         {state.syncIssue ? (
-          <div className="mt-6 rounded-3xl border border-[#d7b7a6] bg-[#fff3ec] px-5 py-4 text-sm leading-6 text-[#7f4022]">
+          <div className="mt-6 rounded-3xl border border-[#6e2a2e]/35 bg-[#2d1417] px-5 py-4 text-sm leading-6 text-[#ffd6d5]">
             {state.syncIssue}
           </div>
         ) : null}
 
         {visibleCastIssue ? (
-          <div className="mt-6 rounded-3xl border border-[#c9d5f0] bg-[#f1f6ff] px-5 py-4 text-sm leading-6 text-[#244f8f]">
+          <div className="mt-6 rounded-3xl border border-[#27415f]/35 bg-[#111d2c] px-5 py-4 text-sm leading-6 text-[#d9e8ff]">
             {visibleCastIssue}
           </div>
         ) : null}
 
         {castAudioFallbackVisible ? (
-          <div className="mt-6 rounded-3xl border border-[#d7b7a6] bg-[#fff3ec] px-5 py-4 text-sm leading-6 text-[#7f4022]">
+          <div className="mt-6 rounded-3xl border border-[#6e2a2e]/35 bg-[#2d1417] px-5 py-4 text-sm leading-6 text-[#ffd6d5]">
             {castFallbackReason ??
               "Chromecast is using the base video audio because the selected external audio could not be prepared for Cast."}
           </div>
         ) : null}
 
         {!snapshot.media?.castVideoUrl ? (
-          <div className="mt-6 rounded-3xl border border-line bg-white/70 px-5 py-4 text-sm leading-6 text-muted">
+          <div className="mt-6 rounded-3xl border border-white/10 bg-black/20 px-5 py-4 text-sm leading-6 text-[#c7c2ca]">
             Cast needs a reachable media origin. Set `PUBLIC_BASE_URL` or `CAST_BASE_URL` to an HTTPS tunnel such as ngrok for the most reliable sender setup.
           </div>
         ) : null}
 
-        <div className="mt-6 grid gap-4 rounded-[2rem] border border-line bg-white/70 p-5 lg:grid-cols-[1.1fr_0.9fr]">
+        <div className="mt-6 grid gap-4 rounded-[2rem] border border-white/10 bg-black/20 p-5 lg:grid-cols-[1.1fr_0.9fr]">
           <div>
-            <p className="text-sm font-semibold uppercase tracking-[0.25em] text-muted">
+            <p className="text-sm font-semibold uppercase tracking-[0.25em] text-[#8fa7c7]">
               Share this room
             </p>
-            <div className="mt-3 rounded-2xl border border-line bg-panel px-4 py-3 font-mono text-sm">
+            <div className="mt-3 rounded-2xl border border-white/10 bg-[#120e13] px-4 py-3 font-mono text-sm text-white">
               {snapshot.shareUrl}
             </div>
-            <p className="mt-3 text-xs leading-6 text-muted">
+            <p className="mt-3 text-xs leading-6 text-[#c7c2ca]">
               Shared controls affect everyone. Language selectors stay per participant and drive this browser plus its active Cast session.
             </p>
-            <div className="mt-4 space-y-2 rounded-2xl border border-line bg-panel/80 px-4 py-3 text-xs leading-6 text-muted">
+            <div className="mt-4 space-y-2 rounded-2xl border border-white/10 bg-[#120e13] px-4 py-3 text-xs leading-6 text-[#b3afba]">
               <p>
-                App origin: <span className="font-mono">{appOriginSummary}</span>
+                App origin: <span className="font-mono text-white">{appOriginSummary}</span>
               </p>
               <p>
-                Media origin: <span className="font-mono">{mediaOriginSummary}</span>
+                Media origin: <span className="font-mono text-white">{mediaOriginSummary}</span>
               </p>
               <p>
                 Cast media origin:{" "}
-                <span className="font-mono">{castOriginSummary}</span>
+                <span className="font-mono text-white">{castOriginSummary}</span>
               </p>
               <p>
                 {castUsesSecurePublicOrigin
@@ -929,10 +1200,10 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
             </div>
             {isCastActive ? (
               <div className="mt-3 space-y-1">
-                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-accent-strong">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#d7c19d]">
                   Cast active
                 </p>
-                <p className="text-xs leading-6 text-muted">
+                <p className="text-xs leading-6 text-[#c7c2ca]">
                   {castRemotePlayerObserved
                     ? "Chromecast remote playback observation is active."
                     : "Chromecast remote playback observation is waiting for an active media session."}
@@ -942,7 +1213,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           </div>
           <div className="space-y-4">
             <div>
-              <label htmlFor="audio-select" className="text-sm font-semibold uppercase tracking-[0.25em] text-muted">
+              <label htmlFor="audio-select" className="text-sm font-semibold uppercase tracking-[0.25em] text-[#d7c19d]">
                 Audio track
               </label>
               <select
@@ -965,7 +1236,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                     data: { nextAudioTrackId },
                   });
                 }}
-                className="mt-3 min-h-12 w-full rounded-2xl border border-line bg-panel px-4 outline-none transition focus:border-accent disabled:text-muted"
+                className="mt-3 min-h-12 w-full rounded-2xl border border-white/10 bg-[#120e13] px-4 text-white outline-none transition focus:border-[#8fa7c7] disabled:text-[#8c8a91]"
               >
                 <option value="video">Embedded video audio</option>
                 {audioTracks.map((track) => {
@@ -984,37 +1255,30 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                   );
                 })}
               </select>
-              <p className="mt-3 text-xs leading-6 text-muted">
-                {localAudioState.activeSource === "external"
-                  ? `External audio track active${selectedExternalAudioTrack ? `: ${selectedExternalAudioTrack.label}.` : "."}`
-                  : localAudioState.activeSource === "embedded"
-                    ? "Embedded video audio active."
-                    : "No local audio source is active yet."}
+              <p className="mt-3 text-xs leading-6 text-[#c7c2ca]">
+                {playbackTarget === "cast"
+                  ? castAudioStatusMessage
+                  : displayedLocalAudioState.activeSource === "external"
+                    ? `External audio track active${selectedExternalAudioTrack ? `: ${selectedExternalAudioTrack.label}.` : "."}`
+                    : displayedLocalAudioState.activeSource === "embedded"
+                      ? "Embedded video audio active."
+                      : "No local audio source is active yet."}
               </p>
               {audioTracks.length > 0 ? (
-                <p className="mt-2 text-xs leading-6 text-muted">
+                <p className="mt-2 text-xs leading-6 text-[#9e9aa2]">
                   {playableAudioTracks.length > 0
                     ? `${playableAudioTracks.length} alternate audio track${playableAudioTracks.length === 1 ? "" : "s"} can play locally in this browser.${unavailableAudioTrackCount > 0 ? ` ${unavailableAudioTrackCount} stored track${unavailableAudioTrackCount === 1 ? "" : "s"} are unavailable.` : ""}`
                     : "Alternate audio files are stored for this room, but none are playable in this browser session."}
                 </p>
               ) : null}
-              {castAudioStatusMessage ? (
-                <p
-                  className={`mt-2 text-xs leading-6 ${
-                    castAudioFallbackVisible ? "text-[#8a342f]" : "text-muted"
-                  }`}
-                >
-                  {castAudioStatusMessage}
-                </p>
-              ) : null}
-              {localAudioState.issue ? (
-                <p className="mt-2 text-xs leading-6 text-[#8a342f]">
-                  {localAudioState.issue}
+              {displayedLocalAudioState.issue && playbackTarget === "local" ? (
+                <p className="mt-2 text-xs leading-6 text-[#ffd6d5]">
+                  {displayedLocalAudioState.issue}
                 </p>
               ) : null}
             </div>
             <div>
-              <label htmlFor="subtitle-select" className="text-sm font-semibold uppercase tracking-[0.25em] text-muted">
+              <label htmlFor="subtitle-select" className="text-sm font-semibold uppercase tracking-[0.25em] text-[#d7c19d]">
                 Subtitle track
               </label>
               <select
@@ -1035,7 +1299,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                     data: { nextSubtitleTrackId },
                   });
                 }}
-                className="mt-3 min-h-12 w-full rounded-2xl border border-line bg-panel px-4 outline-none transition focus:border-accent"
+                className="mt-3 min-h-12 w-full rounded-2xl border border-white/10 bg-[#120e13] px-4 text-white outline-none transition focus:border-[#8fa7c7]"
               >
                 <option value="none">No subtitles selected</option>
                 {(snapshot.media?.subtitleTracks ?? []).map((track) => (
@@ -1046,79 +1310,64 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                 ))}
               </select>
               {isCastActive ? (
-                <p className="mt-2 text-xs leading-6 text-muted">
+                <p className="mt-2 text-xs leading-6 text-[#c7c2ca]">
                   Chromecast subtitles are using{" "}
-                  {resolvedEffectiveCastSubtitleTrackId
-                    ? snapshot.media?.subtitleTracks.find(
-                        (track) => track.id === resolvedEffectiveCastSubtitleTrackId,
-                      )?.label ?? "the selected subtitle track"
-                    : "no subtitle track"}
-                  .
+                  {resolvedEffectiveCastSubtitleTrack?.label ?? "no subtitle track"}.
                 </p>
-              ) : null}
+              ) : (
+                <p className="mt-2 text-xs leading-6 text-[#c7c2ca]">
+                  Local subtitles are using {localSelectedSubtitleTrack?.label ?? "no subtitle track"}.
+                </p>
+              )}
             </div>
           </div>
         </div>
       </section>
 
       <aside className="space-y-6">
-        <section className="rounded-[2rem] border border-line bg-white/75 p-8 shadow-[0_20px_50px_rgba(42,31,22,0.06)]">
-          <p className="text-sm font-semibold uppercase tracking-[0.3em] text-muted">
-            Playback snapshot
+        <section className="rounded-[2rem] border border-white/10 bg-[#17131a]/88 p-8 shadow-[0_20px_50px_rgba(0,0,0,0.22)]">
+          <p className="text-sm font-semibold uppercase tracking-[0.3em] text-[#8fa7c7]">
+            Video call
           </p>
-          {snapshot.media ? (
-            <div className="mt-6 rounded-3xl border border-line/80 bg-panel px-4 py-4">
-              <p className="text-sm font-semibold">{snapshot.media.title}</p>
-              <p className="mt-1 text-sm leading-6 text-muted">
-                {snapshot.media.audioTrackCount} audio track
-                {snapshot.media.audioTrackCount === 1 ? "" : "s"} and{" "}
-                {snapshot.media.subtitleTrackCount} subtitle track
-                {snapshot.media.subtitleTrackCount === 1 ? "" : "s"} available
-              </p>
-            </div>
-          ) : null}
+          <SocialCallPanel playbackTarget={playbackTarget} roomTitle={roomDisplayTitle} />
           <dl className="mt-6 space-y-4">
-            <div className="flex items-center justify-between gap-4 rounded-3xl border border-line/80 bg-panel px-4 py-3">
-              <dt className="text-sm text-muted">Status</dt>
+            <div className="flex items-center justify-between gap-4 rounded-3xl border border-white/10 bg-black/20 px-4 py-3">
+              <dt className="text-sm text-[#c7c2ca]">Playback status</dt>
               <dd className={`rounded-full px-3 py-1 text-sm font-semibold capitalize ${getStatusTone(state.playback.status)}`}>
                 {state.playback.status}
               </dd>
             </div>
-            <div className="flex items-center justify-between gap-4 rounded-3xl border border-line/80 bg-panel px-4 py-3">
-              <dt className="text-sm text-muted">Current time</dt>
-              <dd className="text-sm font-semibold">{formatPlaybackSeconds(state.playback.currentTime)}</dd>
+            <div className="flex items-center justify-between gap-4 rounded-3xl border border-white/10 bg-black/20 px-4 py-3">
+              <dt className="text-sm text-[#c7c2ca]">Current time</dt>
+              <dd className="text-sm font-semibold text-white">{formatPlaybackSeconds(state.playback.currentTime)}</dd>
             </div>
-            <div className="flex items-center justify-between gap-4 rounded-3xl border border-line/80 bg-panel px-4 py-3">
-              <dt className="text-sm text-muted">Playback rate</dt>
-              <dd className="text-sm font-semibold">{state.playback.playbackRate.toFixed(2)}x</dd>
-            </div>
-            <div className="flex items-center justify-between gap-4 rounded-3xl border border-line/80 bg-panel px-4 py-3">
-              <dt className="text-sm text-muted">Version</dt>
-              <dd className="text-sm font-semibold">{state.playback.version}</dd>
-            </div>
-            <div className="flex items-center justify-between gap-4 rounded-3xl border border-line/80 bg-panel px-4 py-3">
-              <dt className="text-sm text-muted">Last source</dt>
-              <dd className="text-sm font-semibold">{state.lastActionSource ?? "unknown"}</dd>
+            <div className="flex items-center justify-between gap-4 rounded-3xl border border-white/10 bg-black/20 px-4 py-3">
+              <dt className="text-sm text-[#c7c2ca]">Playback rate</dt>
+              <dd className="text-sm font-semibold text-white">{state.playback.playbackRate.toFixed(2)}x</dd>
             </div>
           </dl>
         </section>
 
-        <section className="rounded-[2rem] border border-line bg-white/75 p-8 shadow-[0_20px_50px_rgba(42,31,22,0.06)]">
-          <p className="text-sm font-semibold uppercase tracking-[0.3em] text-muted">
-            Last room event
+        <section className="rounded-[2rem] border border-white/10 bg-[#17131a]/88 p-8 shadow-[0_20px_50px_rgba(0,0,0,0.22)]">
+          <p className="text-sm font-semibold uppercase tracking-[0.3em] text-[#8fa7c7]">
+            Chat
           </p>
+          <SocialChatPanel
+            roomId={snapshot.roomId}
+            lastEventType={state.lastEvent?.type ?? null}
+          />
           {state.lastEvent ? (
-            <div className="mt-6 rounded-3xl border border-line/80 bg-panel p-5">
-              <p className="text-base font-semibold capitalize">
+            <div className="mt-6 rounded-3xl border border-white/10 bg-black/20 p-5">
+              <p className="text-base font-semibold capitalize text-white">
                 {state.lastEvent.type.replace("_", " ")}
               </p>
-              <p className="mt-2 text-sm leading-6 text-muted">{state.lastEvent.occurredAt}</p>
-              <pre className="mt-3 overflow-x-auto font-mono text-xs leading-6 text-muted whitespace-pre-wrap">
+              <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">{state.lastEvent.occurredAt}</p>
+              <pre className="mt-3 overflow-x-auto whitespace-pre-wrap font-mono text-xs leading-6 text-[#a9a5ae]">
                 {JSON.stringify(state.lastEvent, null, 2)}
               </pre>
             </div>
           ) : (
-            <p className="mt-6 rounded-3xl border border-line/80 bg-panel p-5 text-sm leading-6 text-muted">
+            <p className="mt-6 rounded-3xl border border-white/10 bg-black/20 p-5 text-sm leading-6 text-[#c7c2ca]">
               No room events have been persisted yet.
             </p>
           )}
