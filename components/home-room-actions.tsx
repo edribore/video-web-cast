@@ -43,16 +43,27 @@ export function HomeRoomActions() {
   }
 
   return (
-    <div className="rounded-[2rem] border border-white/10 bg-[#17131a]/85 p-8 shadow-[0_22px_60px_rgba(0,0,0,0.24)]">
+    <div
+      id="join-room"
+      className="rounded-[2.2rem] border border-white/10 bg-[linear-gradient(180deg,rgba(16,19,28,0.96),rgba(11,14,21,0.96))] p-8 shadow-[0_24px_65px_rgba(0,0,0,0.28)]"
+    >
       <p className="text-sm font-semibold uppercase tracking-[0.35em] text-[#b99f78]">
-        Join an existing room
+        Already have an invite?
+      </p>
+      <h2 className="mt-3 text-3xl font-semibold tracking-tight text-white">
+        Step straight into a live screening.
+      </h2>
+      <p className="mt-3 text-sm leading-7 text-[#c7c2ca]">
+        Drop in with a room code or the final segment from a shared SyncPass
+        link. The browser will reconnect to the room timeline and its current
+        playback destination automatically.
       </p>
       <form
         onSubmit={handleJoinRoom}
-        className="mt-6 rounded-[1.6rem] border border-white/10 bg-black/20 p-5"
+        className="mt-6 rounded-[1.8rem] border border-white/10 bg-black/20 p-5"
       >
         <label htmlFor="room-id" className="text-sm font-semibold text-white">
-          Join an existing room
+          Room code
         </label>
         <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
           Enter a room ID or paste the final segment from a shared room URL.
@@ -79,17 +90,19 @@ export function HomeRoomActions() {
         </p>
       </form>
 
-      <div className="mt-6 rounded-[1.6rem] border border-white/10 bg-black/20 px-5 py-5">
-        <p className="text-sm font-semibold text-white">Admin tools</p>
-        <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
-          Uploads and catalog curation now live behind the admin workflow so the
-          public home stays focused on curated watch-room launches.
-        </p>
+      <div className="mt-6 flex items-center justify-between gap-4 rounded-[1.6rem] border border-white/10 bg-black/20 px-5 py-5">
+        <div>
+          <p className="text-sm font-semibold text-white">Need staff tools?</p>
+          <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+            Uploads, catalog curation, and asset inspection live behind the
+            admin workflow.
+          </p>
+        </div>
         <Link
           href={adminHref()}
-          className="mt-4 inline-flex rounded-full border border-white/10 px-5 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7] hover:text-[#dbe8ff]"
+          className="inline-flex rounded-full border border-[#2a3342] bg-[#10151d] px-4 py-3 text-sm font-semibold text-[#d6e6ff] transition hover:border-[#8fa7c7] hover:text-white"
         >
-          Open admin console
+          Staff
         </Link>
       </div>
     </div>

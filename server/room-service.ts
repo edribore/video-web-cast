@@ -11,12 +11,25 @@ export async function createRoomForMediaAsset(
   },
 ) {
   const prisma = getPrismaClient();
+  const mediaAsset = await prisma.mediaAsset.findUnique({
+    where: {
+      id: mediaAssetId,
+    },
+    select: {
+      id: true,
+      title: true,
+    },
+  });
+
+  if (!mediaAsset) {
+    throw new Error("The requested media asset could not be found.");
+  }
 
   return prisma.room.create({
     data: {
-      mediaAssetId,
+      mediaAssetId: mediaAsset.id,
       catalogMovieId: options?.catalogMovieId ?? null,
-      name: options?.roomName ?? null,
+      name: options?.roomName ?? mediaAsset.title,
       publicId: createPublicRoomId(),
       playbackState: {
         create: {},
@@ -26,6 +39,7 @@ export async function createRoomForMediaAsset(
       id: true,
       publicId: true,
       mediaAssetId: true,
+      catalogMovieId: true,
     },
   });
 }

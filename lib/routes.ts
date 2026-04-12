@@ -9,16 +9,32 @@ export function adminHref() {
   return "/admin";
 }
 
+export function adminCatalogHref() {
+  return "/admin/catalog";
+}
+
+export function adminMediaHref() {
+  return "/admin/media";
+}
+
+export function adminMediaDetailHref(mediaId: string) {
+  return `/admin/media/${encodeURIComponent(mediaId)}`;
+}
+
+export function adminUploadHref() {
+  return "/admin/upload";
+}
+
 export function movieHref(slug: string) {
   return `/movies/${encodeURIComponent(slug)}`;
 }
 
 export function uploadHref() {
-  return "/upload";
+  return adminUploadHref();
 }
 
 export function mediaHref(mediaId: string) {
-  return `/media/${encodeURIComponent(mediaId)}`;
+  return adminMediaDetailHref(mediaId);
 }
 
 export function storedUploadHref(storagePath: string) {

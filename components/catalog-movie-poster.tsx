@@ -58,7 +58,7 @@ export function CatalogMoviePoster({
 
   return (
     <div
-      className={`relative overflow-hidden rounded-[1.6rem] border border-white/10 bg-black shadow-[0_22px_50px_rgba(0,0,0,0.28)] ${className ?? ""}`}
+      className={`relative overflow-hidden rounded-[1.6rem] border border-white/10 bg-black shadow-[0_28px_70px_rgba(0,0,0,0.38)] ${className ?? ""}`}
     >
       {posterUrl ? (
         <Image
@@ -66,13 +66,13 @@ export function CatalogMoviePoster({
           alt={`${title} poster`}
           fill
           sizes="(max-width: 768px) 100vw, 320px"
-          className="object-cover"
+          className="object-cover transition duration-500 group-hover:scale-[1.03]"
         />
       ) : (
         <div
           className={`flex h-full w-full items-center justify-center bg-gradient-to-br ${posterToneClasses[tone]}`}
         >
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.35),transparent_35%),linear-gradient(180deg,transparent,rgba(0,0,0,0.48))]" />
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.35),transparent_35%),linear-gradient(180deg,transparent,rgba(0,0,0,0.58))]" />
           <div className="relative text-center text-white">
             <p className="text-[3.4rem] font-semibold tracking-[0.2em]">
               {buildTitleMonogram(title)}
@@ -83,7 +83,8 @@ export function CatalogMoviePoster({
           </div>
         </div>
       )}
-      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(180deg,rgba(0,0,0,0.04),rgba(0,0,0,0.55))]" />
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.18),transparent_30%),linear-gradient(180deg,rgba(0,0,0,0.02),rgba(0,0,0,0.68))]" />
+      <div className="pointer-events-none absolute inset-0 opacity-20 mix-blend-screen [background-image:linear-gradient(transparent,rgba(255,255,255,0.12),transparent)] [background-size:100%_35%] [background-position:0_12%] [background-repeat:no-repeat]" />
     </div>
   );
 }

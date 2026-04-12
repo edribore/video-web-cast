@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { adminHref, movieHref } from "@/lib/routes";
+import { adminCatalogHref, adminHref, movieHref } from "@/lib/routes";
 import {
   createCatalogMovieFromFormData,
   deleteCatalogMovieById,
@@ -19,6 +19,7 @@ function buildAdminStatusHref(status: "success" | "error", message: string) {
 function revalidateCatalogPaths(slugs: string[]) {
   revalidatePath("/");
   revalidatePath(adminHref());
+  revalidatePath(adminCatalogHref());
 
   slugs.forEach((slug) => {
     revalidatePath(movieHref(slug));

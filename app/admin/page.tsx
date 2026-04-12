@@ -7,7 +7,13 @@ import {
   deleteCatalogMovieAction,
   updateCatalogMovieAction,
 } from "@/app/admin/actions";
-import { adminHref, mediaHref, movieHref, uploadHref } from "@/lib/routes";
+import {
+  adminHref,
+  adminMediaHref,
+  mediaHref,
+  movieHref,
+  uploadHref,
+} from "@/lib/routes";
 import { listCatalogMoviesForAdmin } from "@/server/catalog-service";
 
 export const dynamic = "force-dynamic";
@@ -262,6 +268,12 @@ export default async function AdminPage({ searchParams }: AdminPageProps) {
                 className="rounded-full border border-white/10 px-5 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7] hover:text-[#dbe8ff]"
               >
                 Media ingest
+              </Link>
+              <Link
+                href={adminMediaHref()}
+                className="rounded-full border border-white/10 px-5 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7] hover:text-[#dbe8ff]"
+              >
+                Media library
               </Link>
               <Link
                 href={adminHref()}

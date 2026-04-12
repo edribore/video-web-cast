@@ -1,9 +1,9 @@
 import Link from "next/link";
-import { DebugPageState } from "@/components/debug-runtime";
 import { CatalogMoviePoster } from "@/components/catalog-movie-poster";
+import { CreateRoomButton } from "@/components/create-room-button";
+import { DebugPageState } from "@/components/debug-runtime";
 import { HomeRoomActions } from "@/components/home-room-actions";
-import { PageShell } from "@/components/page-shell";
-import { createRoomForCatalogMovieAction } from "@/app/movies/actions";
+import { PublicSiteShell } from "@/components/public-site-shell";
 import { movieHref } from "@/lib/routes";
 import { listFeaturedCatalogMovies } from "@/server/catalog-service";
 
@@ -46,16 +46,22 @@ function FeaturedMovieCard({
   movie: Awaited<ReturnType<typeof listFeaturedCatalogMovies>>[number];
   index: number;
 }) {
-  const createRoomAction = createRoomForCatalogMovieAction.bind(null, movie.id);
-
   return (
-    <article className="group rounded-[2rem] border border-white/10 bg-[#151117]/90 p-4 shadow-[0_24px_60px_rgba(0,0,0,0.22)] transition hover:-translate-y-1 hover:border-[#8fa7c7]/60">
+    <article className="group rounded-[2rem] border border-white/10 bg-[linear-gradient(180deg,rgba(19,20,28,0.98),rgba(11,12,18,0.98))] p-4 shadow-[0_24px_60px_rgba(0,0,0,0.28)] transition hover:-translate-y-1 hover:border-[#8fa7c7]/60">
       <Link href={movieHref(movie.slug)} className="block">
         <CatalogMoviePoster
           title={movie.title}
           posterUrl={movie.posterUrl}
           className="aspect-[3/4] min-h-[20rem]"
-          priorityTone={index % 4 === 0 ? "amber" : index % 4 === 1 ? "blue" : index % 4 === 2 ? "crimson" : "teal"}
+          priorityTone={
+            index % 4 === 0
+              ? "amber"
+              : index % 4 === 1
+                ? "blue"
+                : index % 4 === 2
+                  ? "crimson"
+                  : "teal"
+          }
         />
       </Link>
 
@@ -83,14 +89,13 @@ function FeaturedMovieCard({
         </p>
 
         <div className="mt-5 flex flex-wrap gap-3">
-          <form action={createRoomAction}>
-            <button
-              type="submit"
-              className="rounded-full bg-[#d07a3e] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#b76630]"
-            >
-              Create room
-            </button>
-          </form>
+          <CreateRoomButton
+            scope={`room/create-request/home-${movie.id}`}
+            catalogMovieId={movie.id}
+            mediaAssetId={movie.mediaAssetId}
+            movieTitle={movie.title}
+            label="Create room"
+          />
           <Link
             href={movieHref(movie.slug)}
             className="rounded-full border border-white/10 px-5 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7] hover:text-[#dbe8ff]"
@@ -105,12 +110,20 @@ function FeaturedMovieCard({
 
 function PlaceholderMovieCard({ index }: { index: number }) {
   return (
-    <article className="rounded-[2rem] border border-dashed border-white/10 bg-[#120f14]/70 p-4">
+    <article className="rounded-[2rem] border border-dashed border-white/10 bg-[#0f1117]/82 p-4">
       <CatalogMoviePoster
         title={`Slot ${index + 1}`}
         posterUrl={null}
         className="aspect-[3/4] min-h-[20rem]"
-        priorityTone={index % 4 === 0 ? "amber" : index % 4 === 1 ? "blue" : index % 4 === 2 ? "crimson" : "teal"}
+        priorityTone={
+          index % 4 === 0
+            ? "amber"
+            : index % 4 === 1
+              ? "blue"
+              : index % 4 === 2
+                ? "crimson"
+                : "teal"
+        }
       />
       <div className="mt-5">
         <p className="rounded-full bg-[#1c171d] px-3 py-1 text-[0.7rem] font-semibold uppercase tracking-[0.24em] text-[#9e9aa2]">
@@ -120,8 +133,8 @@ function PlaceholderMovieCard({ index }: { index: number }) {
           Curator slot open
         </h2>
         <p className="mt-3 text-sm leading-7 text-[#9e9aa2]">
-          An admin can connect another uploaded media asset to this slot to keep
-          the SyncPass lobby filled with 10 marquee-ready titles.
+          Another featured title can be connected here by the SyncPass staff
+          workflow without exposing raw upload management on the public home.
         </p>
       </div>
     </article>
@@ -131,13 +144,10 @@ function PlaceholderMovieCard({ index }: { index: number }) {
 export default async function HomePage() {
   const featuredMovies = await listFeaturedCatalogMovies();
   const displaySlots = buildDisplaySlots(featuredMovies);
+  const spotlightMovie = featuredMovies[0] ?? null;
 
   return (
-    <PageShell
-      eyebrow="Cinema lobby"
-      title="SyncPass"
-      description="Curated movie nights, synchronized rooms, and a companion-screen experience that stays in sync whether playback lives in the browser or on the TV."
-    >
+    <PublicSiteShell>
       <DebugPageState
         scope="page/home"
         data={{
@@ -148,61 +158,126 @@ export default async function HomePage() {
         }}
       />
 
-      <section className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
-        <div className="overflow-hidden rounded-[2.4rem] border border-white/10 bg-[linear-gradient(135deg,#160f17_0%,#261924_52%,#5b2f1f_100%)] p-8 shadow-[0_28px_80px_rgba(0,0,0,0.3)]">
-          <div className="max-w-3xl">
-            <p className="text-sm font-semibold uppercase tracking-[0.38em] text-[#d7c19d]">
-              Now showing
+      <section className="grid gap-8 xl:grid-cols-[1.16fr_0.84fr]">
+        <div className="overflow-hidden rounded-[2.8rem] border border-white/10 bg-[linear-gradient(135deg,rgba(29,15,22,0.98)_0%,rgba(12,13,21,0.98)_45%,rgba(71,39,28,0.98)_100%)] p-8 shadow-[0_30px_90px_rgba(0,0,0,0.34)] sm:p-10">
+          <div className="max-w-4xl">
+            <p className="text-sm font-semibold uppercase tracking-[0.42em] text-[#f3c38a]">
+              Tonight at SyncPass
             </p>
-            <h2 className="mt-4 text-4xl font-semibold tracking-tight text-white sm:text-6xl">
-              Bring the whole room into the same scene.
-            </h2>
-            <p className="mt-5 max-w-2xl text-base leading-8 text-[#e2d7da] sm:text-lg">
-              SyncPass turns a shared watch session into a real screening flow:
-              pick a featured film, launch a room, keep audio and subtitle
-              preferences per participant, and move playback to Chromecast
-              without losing synchronized control.
+            <h1 className="mt-5 text-5xl font-semibold tracking-tight text-white sm:text-7xl">
+              Movie night staged like opening night.
+            </h1>
+            <p className="mt-6 max-w-3xl text-base leading-8 text-[#e2d7da] sm:text-lg">
+              Walk into a curated lobby, pick a featured film, launch a room,
+              and keep everyone locked to the same scene whether playback stays
+              in the browser or moves to the TV.
             </p>
           </div>
 
-          <div className="mt-8 grid gap-4 md:grid-cols-3">
+          <div className="mt-8 flex flex-wrap gap-4">
+            {spotlightMovie ? (
+              <>
+                <CreateRoomButton
+                  scope={`room/create-request/hero-${spotlightMovie.id}`}
+                  catalogMovieId={spotlightMovie.id}
+                  mediaAssetId={spotlightMovie.mediaAssetId}
+                  movieTitle={spotlightMovie.title}
+                  label={`Create a room for ${spotlightMovie.title}`}
+                />
+                <Link
+                  href={movieHref(spotlightMovie.slug)}
+                  className="inline-flex min-h-12 items-center justify-center rounded-full border border-white/15 px-5 py-3 text-sm font-semibold text-white transition hover:border-[#89b2d8] hover:text-[#ddeeff]"
+                >
+                  View premiere details
+                </Link>
+              </>
+            ) : null}
+          </div>
+
+          <div className="mt-10 grid gap-4 md:grid-cols-3">
             <div className="rounded-[1.8rem] border border-white/10 bg-black/20 px-5 py-5">
               <p className="text-xs font-semibold uppercase tracking-[0.3em] text-[#8fa7c7]">
-                Featured board
+                Curated board
               </p>
-              <p className="mt-3 text-3xl font-semibold text-white">10</p>
+              <p className="mt-3 text-3xl font-semibold text-white">10 films</p>
               <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
-                marquee slots keep the home page curated instead of turning into
-                a raw upload utility.
+                The public lobby stays editorial and poster-first instead of
+                exposing raw media asset management.
               </p>
             </div>
             <div className="rounded-[1.8rem] border border-white/10 bg-black/20 px-5 py-5">
               <p className="text-xs font-semibold uppercase tracking-[0.3em] text-[#8fa7c7]">
-                Playback
+                Shared timeline
               </p>
-              <p className="mt-3 text-3xl font-semibold text-white">2 modes</p>
+              <p className="mt-3 text-3xl font-semibold text-white">One cut</p>
               <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
-                watch locally in-browser or move playback to the TV while the
-                browser stays a synchronized companion screen.
+                Playback, pause, and seek stay synchronized while each guest can
+                keep their own audio and subtitle preferences.
               </p>
             </div>
             <div className="rounded-[1.8rem] border border-white/10 bg-black/20 px-5 py-5">
               <p className="text-xs font-semibold uppercase tracking-[0.3em] text-[#8fa7c7]">
-                Language control
+                Companion screen
               </p>
-              <p className="mt-3 text-3xl font-semibold text-white">Per guest</p>
+              <p className="mt-3 text-3xl font-semibold text-white">Cast ready</p>
               <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
-                alternate audio and subtitle selections stay participant-local
-                while the shared room timeline remains authoritative.
+                Move the film to Chromecast and keep the browser as the room
+                control, call, and chat surface.
               </p>
             </div>
           </div>
         </div>
 
-        <HomeRoomActions />
+        <div className="grid gap-6">
+          {spotlightMovie ? (
+            <section className="group grid gap-5 rounded-[2.2rem] border border-white/10 bg-[linear-gradient(180deg,rgba(17,19,28,0.98),rgba(9,11,17,0.98))] p-5 shadow-[0_22px_60px_rgba(0,0,0,0.26)] sm:grid-cols-[0.82fr_1.18fr]">
+              <Link href={movieHref(spotlightMovie.slug)} className="block">
+                <CatalogMoviePoster
+                  title={spotlightMovie.title}
+                  posterUrl={spotlightMovie.posterUrl}
+                  className="aspect-[3/4] min-h-[19rem]"
+                  priorityTone="amber"
+                />
+              </Link>
+              <div className="flex flex-col">
+                <p className="text-xs font-semibold uppercase tracking-[0.34em] text-[#8fa7c7]">
+                  Spotlight screening
+                </p>
+                <h2 className="mt-3 text-3xl font-semibold tracking-tight text-white">
+                  {spotlightMovie.title}
+                </h2>
+                <p className="mt-4 text-sm leading-7 text-[#c7c2ca]">
+                  {spotlightMovie.synopsis}
+                </p>
+                <div className="mt-5 flex flex-wrap gap-2">
+                  {spotlightMovie.releaseLabel ? (
+                    <span className="rounded-full bg-[#1d2a3a] px-3 py-1 text-[0.72rem] font-semibold uppercase tracking-[0.24em] text-[#cde0ff]">
+                      {spotlightMovie.releaseLabel}
+                    </span>
+                  ) : null}
+                  {spotlightMovie.languageAvailabilityLabel ? (
+                    <span className="rounded-full bg-[#231a26] px-3 py-1 text-[0.72rem] font-semibold uppercase tracking-[0.24em] text-[#ddcfeb]">
+                      {spotlightMovie.languageAvailabilityLabel}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="mt-auto pt-6">
+                  <Link
+                    href={movieHref(spotlightMovie.slug)}
+                    className="inline-flex rounded-full border border-white/10 px-4 py-2 text-sm font-semibold text-white transition hover:border-[#89b2d8] hover:text-[#ddeeff]"
+                  >
+                    Explore the screening
+                  </Link>
+                </div>
+              </div>
+            </section>
+          ) : null}
+
+          <HomeRoomActions />
+        </div>
       </section>
 
-      <section className="space-y-6">
+      <section id="featured-premieres" className="space-y-6">
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
             <p className="text-sm font-semibold uppercase tracking-[0.35em] text-[#8fa7c7]">
@@ -227,11 +302,14 @@ export default async function HomePage() {
                 index={slot.index}
               />
             ) : (
-              <PlaceholderMovieCard key={`placeholder-${slot.index}`} index={slot.index} />
+              <PlaceholderMovieCard
+                key={`placeholder-${slot.index}`}
+                index={slot.index}
+              />
             ),
           )}
         </div>
       </section>
-    </PageShell>
+    </PublicSiteShell>
   );
 }
