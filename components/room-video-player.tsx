@@ -15,16 +15,19 @@ import {
 } from "@/lib/audio-track-playback";
 import {
   assessPlaybackProgressStall,
+  clampPlaybackRate,
   createInitialPlaybackState,
   getPlaybackReconciliationProfile,
   hasMeaningfulPlaybackProgress,
   isPlaybackActivelyRunning,
   playbackSynchronizationConfig,
+  resolveLocalPlaybackSyncMode,
   resolvePlaybackDriftCorrection,
   resolvePlaybackStartDelayMs,
   resolveSynchronizedPlaybackTime,
   updatePlaybackSuppressionState,
   isPlaybackSuppressionActive,
+  type LocalPlaybackSyncMode,
   type PlaybackLeadershipMode,
   type PlaybackReconciliationProfileKey,
   type PlaybackSuppressionCause,
@@ -42,6 +45,8 @@ export type RoomVideoPlayerSnapshot = {
   videoCurrentTime: number;
   audibleCurrentTime: number | null;
   avDriftSeconds: number | null;
+  primaryClockSource: "video" | "external_audio";
+  syncMode: LocalPlaybackSyncMode;
   playbackRate: number;
   status: PlaybackStatus;
 };
@@ -115,6 +120,20 @@ type ExternalAudioElementState = MediaElementState & {
   isSynchronized: boolean;
 };
 
+type RecoveryEventStormState = {
+  burstCount: number;
+  burstStartedAtMs: number;
+  lastEventAtMs: number;
+  lastEventType: string | null;
+  lastTargetTime: number | null;
+};
+
+function roundTargetTime(targetTime: number | null | undefined) {
+  return typeof targetTime === "number" && Number.isFinite(targetTime)
+    ? Math.round(targetTime * 1000) / 1000
+    : null;
+}
+
 function resolvePlaybackStatus(video: HTMLVideoElement): PlaybackStatus {
   if (!video.paused) {
     return "playing";
@@ -133,18 +152,53 @@ function normalizeSeekTarget(video: HTMLVideoElement, deltaSeconds: number) {
   return Math.max(0, Math.min(nextTime, duration));
 }
 
+function isExternalAudioClockHealthy(
+  externalAudio: HTMLAudioElement | null,
+  externalAudioIsActive: boolean,
+  externalAudioIssue: string | null,
+) {
+  return (
+    externalAudioIsActive &&
+    Boolean(externalAudio?.currentSrc) &&
+    (externalAudio?.readyState ?? 0) >= 2 &&
+    externalAudioIssue == null
+  );
+}
+
+function resolvePrimaryClockSource(input: {
+  externalAudio: HTMLAudioElement | null;
+  externalAudioIsActive: boolean;
+  externalAudioIssue: string | null;
+}) {
+  return isExternalAudioClockHealthy(
+    input.externalAudio,
+    input.externalAudioIsActive,
+    input.externalAudioIssue,
+  )
+    ? ("external_audio" as const)
+    : ("video" as const);
+}
+
 function buildSnapshot(
   video: HTMLVideoElement | null,
   externalAudio: HTMLAudioElement | null,
   externalAudioIsActive: boolean,
+  externalAudioIssue: string | null,
   fallbackPlaybackRate: number,
 ): RoomVideoPlayerSnapshot {
+  const syncMode = resolveLocalPlaybackSyncMode({
+    hasExternalAudio: externalAudioIsActive,
+    suppressLocalAudioOutput: false,
+  });
+
   if (!video) {
     return {
       currentTime: 0,
       videoCurrentTime: 0,
       audibleCurrentTime: null,
       avDriftSeconds: null,
+      primaryClockSource: "video",
+      syncMode,
       playbackRate: fallbackPlaybackRate,
       status: "stopped",
     };
@@ -155,16 +209,26 @@ function buildSnapshot(
     externalAudioIsActive && externalAudio?.currentSrc
       ? externalAudio.currentTime
       : null;
+  const primaryClockSource = resolvePrimaryClockSource({
+    externalAudio,
+    externalAudioIsActive,
+    externalAudioIssue,
+  });
   const avDriftSeconds =
     audibleCurrentTime === null
       ? null
       : Number(Math.abs(audibleCurrentTime - videoCurrentTime).toFixed(3));
 
   return {
-    currentTime: audibleCurrentTime ?? videoCurrentTime,
+    currentTime:
+      primaryClockSource === "external_audio" && audibleCurrentTime != null
+        ? audibleCurrentTime
+        : videoCurrentTime,
     videoCurrentTime,
     audibleCurrentTime,
     avDriftSeconds,
+    primaryClockSource,
+    syncMode,
     playbackRate: video.playbackRate,
     status: resolvePlaybackStatus(video),
   };
@@ -174,8 +238,16 @@ function resolveReferenceCurrentTime(
   video: HTMLVideoElement | null,
   externalAudio: HTMLAudioElement | null,
   externalAudioIsActive: boolean,
+  externalAudioIssue: string | null,
 ) {
-  if (externalAudioIsActive && externalAudio?.currentSrc) {
+  if (
+    resolvePrimaryClockSource({
+      externalAudio,
+      externalAudioIsActive,
+      externalAudioIssue,
+    }) === "external_audio" &&
+    externalAudio
+  ) {
     return externalAudio.currentTime;
   }
 
@@ -313,6 +385,7 @@ export const RoomVideoPlayer = forwardRef<
   const lastStallRecoveryLogAtRef = useRef(0);
   const lastRoomHardSeekAtRef = useRef<number | null>(null);
   const lastStallRecoveryAtRef = useRef<number | null>(null);
+  const audioRecoveryStormStateRef = useRef<RecoveryEventStormState | null>(null);
   const playbackProgressSampleRef = useRef<{
     currentTime: number;
     observedAtMs: number;
@@ -353,6 +426,17 @@ export const RoomVideoPlayer = forwardRef<
   const activeExternalAudioTrack = selectedExternalAudioTrackPlayable
     ? selectedExternalAudioTrack
     : null;
+  const localSyncMode = resolveLocalPlaybackSyncMode({
+    hasExternalAudio: Boolean(activeExternalAudioTrack),
+    suppressLocalAudioOutput,
+  });
+  const currentPrimaryClockSource =
+    localSyncMode === "external_audio_mode" &&
+    Boolean(externalAudioElementState?.currentSrc) &&
+    (externalAudioElementState?.readyState ?? 0) >= 2 &&
+    externalAudioIssue == null
+      ? "external_audio"
+      : "video";
   const reconciliationProfile = getPlaybackReconciliationProfile(
     reconciliationProfileKey,
   );
@@ -363,6 +447,7 @@ export const RoomVideoPlayer = forwardRef<
         videoRef.current,
         externalAudioRef.current,
         Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+        externalAudioIssue,
         playbackRate,
       ),
     );
@@ -393,6 +478,21 @@ export const RoomVideoPlayer = forwardRef<
     }
   });
 
+  const resetAudioRecoveryStormState = useEffectEvent((reason: string) => {
+    if (!audioRecoveryStormStateRef.current) {
+      return;
+    }
+
+    audioRecoveryStormStateRef.current = null;
+    logDebugEvent({
+      level: "info",
+      category: "sync",
+      message: "Cleared the external-audio recovery event burst tracker.",
+      source: "reconciliation",
+      data: { reason },
+    });
+  });
+
   const clearPlaybackSuppression = useEffectEvent((reason: string) => {
     const activeSuppression = suppressionStateRef.current;
 
@@ -402,6 +502,7 @@ export const RoomVideoPlayer = forwardRef<
 
     suppressionStateRef.current = null;
     setSuppressionDiagnostics(null);
+    resetAudioRecoveryStormState(reason);
     logDebugEvent({
       level: "info",
       category: "sync",
@@ -532,6 +633,75 @@ export const RoomVideoPlayer = forwardRef<
     };
   });
 
+  const shouldSuppressEquivalentAudioRecoveryEvent = useEffectEvent(
+    (eventType: string, targetTime: number | null) => {
+      const nowMs = Date.now();
+      const normalizedTargetTime = roundTargetTime(targetTime);
+      const previousStorm = audioRecoveryStormStateRef.current;
+
+      if (
+        !previousStorm ||
+        nowMs - previousStorm.lastEventAtMs >
+          playbackSynchronizationConfig.localMediaRecoveryEventStormWindowMs
+      ) {
+        audioRecoveryStormStateRef.current = {
+          burstCount: 1,
+          burstStartedAtMs: nowMs,
+          lastEventAtMs: nowMs,
+          lastEventType: eventType,
+          lastTargetTime: normalizedTargetTime,
+        };
+        return false;
+      }
+
+      const equivalentTarget =
+        previousStorm.lastTargetTime == null || normalizedTargetTime == null
+          ? true
+          : Math.abs(previousStorm.lastTargetTime - normalizedTargetTime) <
+            playbackSynchronizationConfig.suppression
+              .minimumMeaningfulTargetDeltaSeconds;
+      const equivalentEvent =
+        equivalentTarget && previousStorm.lastEventType === eventType;
+      const nextStormState: RecoveryEventStormState = {
+        burstCount:
+          equivalentTarget || equivalentEvent
+            ? previousStorm.burstCount + 1
+            : 1,
+        burstStartedAtMs:
+          equivalentTarget || equivalentEvent
+            ? previousStorm.burstStartedAtMs
+            : nowMs,
+        lastEventAtMs: nowMs,
+        lastEventType: eventType,
+        lastTargetTime: normalizedTargetTime,
+      };
+
+      audioRecoveryStormStateRef.current = nextStormState;
+
+      if (
+        (equivalentTarget || equivalentEvent) &&
+        nextStormState.burstCount >=
+          playbackSynchronizationConfig.localMediaRecoveryEventStormThreshold
+      ) {
+        logDebugEvent({
+          level: "info",
+          category: "sync",
+          message:
+            "Suppressed an equivalent external-audio recovery trigger because the same target was already producing a recovery event burst.",
+          source: "reconciliation",
+          data: {
+            burstCount: nextStormState.burstCount,
+            eventType,
+            targetTime: normalizedTargetTime,
+          },
+        });
+        return true;
+      }
+
+      return false;
+    },
+  );
+
   const emitLocalAudioStateChange = useEffectEvent(() => {
     const video = videoRef.current;
     const audio = externalAudioRef.current;
@@ -615,6 +785,7 @@ export const RoomVideoPlayer = forwardRef<
       forceSeek?: boolean;
       allowDriftCorrection?: boolean;
       publishDiagnostics?: boolean;
+      targetTime?: number | null;
     }) => {
       const video = videoRef.current;
       const audio = externalAudioRef.current;
@@ -684,38 +855,77 @@ export const RoomVideoPlayer = forwardRef<
         audio.muted = shouldMuteExternalAudio;
       }
 
-      applyPlaybackRateToMedia(video.playbackRate);
+      applyPlaybackRateToMedia(
+        authoritativePlaybackRef.current.playbackRate || video.playbackRate,
+      );
 
-      const driftSeconds = Math.abs(audio.currentTime - video.currentTime);
+      const avDriftSeconds = audio.currentTime - video.currentTime;
+      const absoluteAvDriftSeconds = Math.abs(avDriftSeconds);
       const suppressionActive = isPlaybackSuppressionActive(
         suppressionStateRef.current,
       );
       const driftCorrectionThreshold = suppressionActive
         ? playbackSynchronizationConfig.localMediaAggressiveCorrectionThresholdSeconds
         : playbackSynchronizationConfig.localMediaCorrectionThresholdSeconds;
+      const externalAudioMode = localSyncMode === "external_audio_mode";
       const shouldCorrectForDrift =
         !shouldLoadNewTrack &&
         !audio.seeking &&
         !video.seeking &&
-        (options?.forceSeek ||
-          (options?.allowDriftCorrection !== false &&
-            driftSeconds >
-              driftCorrectionThreshold &&
-            Date.now() - lastExternalAudioCorrectionAtRef.current >=
-              playbackSynchronizationConfig.localMediaCorrectionThrottleMs));
+        options?.allowDriftCorrection !== false &&
+        absoluteAvDriftSeconds > driftCorrectionThreshold &&
+        Date.now() - lastExternalAudioCorrectionAtRef.current >=
+          playbackSynchronizationConfig.localMediaCorrectionThrottleMs;
+      const targetTime =
+        roundTargetTime(options?.targetTime) ??
+        roundTargetTime(
+          externalAudioMode ? audio.currentTime : video.currentTime,
+        ) ??
+        0;
 
-      if (shouldLoadNewTrack || shouldCorrectForDrift) {
+      if (shouldLoadNewTrack || options?.forceSeek) {
         try {
-          if (shouldLoadNewTrack || options?.forceSeek) {
-            audio.currentTime = video.currentTime;
+          if (externalAudioMode) {
+            audio.currentTime = targetTime;
+            video.currentTime = targetTime;
           } else {
-            video.currentTime = audio.currentTime;
-            resetPlaybackProgressSample(audio.currentTime);
+            audio.currentTime = targetTime;
           }
           lastExternalAudioCorrectionAtRef.current = Date.now();
         } catch {
           // Ignore early seek failures while metadata is still loading.
         }
+      } else if (shouldCorrectForDrift) {
+        try {
+          if (
+            externalAudioMode &&
+            absoluteAvDriftSeconds >
+              playbackSynchronizationConfig
+                .externalAudioModeVideoHardAlignThresholdSeconds
+          ) {
+            video.currentTime = audio.currentTime;
+            resetPlaybackProgressSample(audio.currentTime);
+          } else if (
+            externalAudioMode &&
+            absoluteAvDriftSeconds >
+              playbackSynchronizationConfig
+                .externalAudioModeVideoFollowThresholdSeconds
+          ) {
+            video.playbackRate = clampPlaybackRate(
+              audio.playbackRate + (avDriftSeconds > 0 ? 0.02 : -0.02),
+            );
+          } else if (externalAudioMode && video.playbackRate !== audio.playbackRate) {
+            video.playbackRate = audio.playbackRate;
+          } else if (!externalAudioMode) {
+            video.currentTime = audio.currentTime;
+            resetPlaybackProgressSample(audio.currentTime);
+          }
+          lastExternalAudioCorrectionAtRef.current = Date.now();
+        } catch {
+          // Ignore early correction failures while metadata is still loading.
+        }
+      } else if (externalAudioMode && video.playbackRate !== audio.playbackRate) {
+        video.playbackRate = audio.playbackRate;
       }
 
       if (video.paused) {
@@ -741,6 +951,71 @@ export const RoomVideoPlayer = forwardRef<
     },
   );
 
+  const repositionMediaToAuthoritativeTarget = useEffectEvent(
+    async (input: {
+      targetTime: number;
+      attemptPlayback?: boolean;
+      forcePlaybackRestart?: boolean;
+      publishDiagnostics?: boolean;
+    }) => {
+      const video = videoRef.current;
+      const audio = externalAudioRef.current;
+      const externalAudioMode =
+        localSyncMode === "external_audio_mode" &&
+        Boolean(activeExternalAudioTrack) &&
+        !suppressLocalAudioOutput &&
+        Boolean(audio);
+
+      if (!video) {
+        return;
+      }
+
+      const normalizedTargetTime = roundTargetTime(input.targetTime) ?? 0;
+
+      if (externalAudioMode && audio) {
+        if (input.forcePlaybackRestart) {
+          if (!audio.paused) {
+            audio.pause();
+          }
+          if (!video.paused) {
+            video.pause();
+          }
+        }
+
+        try {
+          audio.currentTime = normalizedTargetTime;
+        } catch {
+          // Ignore early seek failures while metadata is still loading.
+        }
+
+        try {
+          video.currentTime = normalizedTargetTime;
+        } catch {
+          // Ignore early seek failures while metadata is still loading.
+        }
+
+        resetPlaybackProgressSample(normalizedTargetTime);
+        await synchronizeExternalAudioWithVideo({
+          attemptPlayback:
+            input.forcePlaybackRestart || input.attemptPlayback || !video.paused,
+          forceSeek: true,
+          publishDiagnostics: input.publishDiagnostics,
+          targetTime: normalizedTargetTime,
+        });
+        return;
+      }
+
+      video.currentTime = normalizedTargetTime;
+      resetPlaybackProgressSample(normalizedTargetTime);
+      await synchronizeExternalAudioWithVideo({
+        attemptPlayback: input.attemptPlayback || !video.paused,
+        forceSeek: true,
+        publishDiagnostics: input.publishDiagnostics,
+        targetTime: normalizedTargetTime,
+      });
+    },
+  );
+
   const startPlayback = useEffectEvent(
     async (options?: { allowMutedFallback?: boolean }) => {
       const video = videoRef.current;
@@ -748,7 +1023,7 @@ export const RoomVideoPlayer = forwardRef<
         authoritativePlaybackRef.current.playbackRate || playbackRate;
 
       if (!video) {
-        return buildSnapshot(null, null, false, targetPlaybackRate);
+        return buildSnapshot(null, null, false, null, targetPlaybackRate);
       }
 
       applyPlaybackRateToMedia(targetPlaybackRate);
@@ -787,6 +1062,7 @@ export const RoomVideoPlayer = forwardRef<
         video,
         externalAudioRef.current,
         Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+        externalAudioIssue,
         targetPlaybackRate,
       );
     },
@@ -832,6 +1108,7 @@ export const RoomVideoPlayer = forwardRef<
           video,
           audio,
           Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+          externalAudioIssue,
         ),
         targetPlaybackRate: playback.playbackRate,
         targetTime: null,
@@ -852,6 +1129,7 @@ export const RoomVideoPlayer = forwardRef<
       video,
       audio,
       Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+      externalAudioIssue,
     );
     const stallProgress = assessPlaybackProgressStall({
       currentTime: actualTime,
@@ -895,17 +1173,16 @@ export const RoomVideoPlayer = forwardRef<
         lastStallRecoveryAtRef.current = nowMs;
         setLastStallRecoveryAt(nowMs);
         lastRoomHardSeekAtRef.current = nowMs;
-        video.currentTime = expectedTime;
-        resetPlaybackProgressSample(expectedTime);
         armRoomHardSeekSuppression(
           reconciliationProfile.postSeekHardSeekSuppressionMs,
           "stall_recovery",
           expectedTime,
         );
-        await synchronizeExternalAudioWithVideo({
+        await repositionMediaToAuthoritativeTarget({
           attemptPlayback: true,
-          forceSeek: true,
+          forcePlaybackRestart: localSyncMode === "external_audio_mode",
           publishDiagnostics: true,
+          targetTime: expectedTime,
         });
         applyPlaybackRateToMedia(playback.playbackRate);
         logDebugEvent({
@@ -947,18 +1224,16 @@ export const RoomVideoPlayer = forwardRef<
     });
 
     if (correction.kind === "hard_seek" && correction.targetTime != null) {
-      video.currentTime = correction.targetTime;
-      resetPlaybackProgressSample(correction.targetTime);
       lastRoomHardSeekAtRef.current = nowMs;
       armRoomHardSeekSuppression(
         reconciliationProfile.postSeekHardSeekSuppressionMs,
         "room_hard_seek",
         correction.targetTime,
       );
-      await synchronizeExternalAudioWithVideo({
+      await repositionMediaToAuthoritativeTarget({
         attemptPlayback: true,
-        forceSeek: true,
         publishDiagnostics: true,
+        targetTime: correction.targetTime,
       });
       applyPlaybackRateToMedia(playback.playbackRate);
       {
@@ -1068,6 +1343,8 @@ export const RoomVideoPlayer = forwardRef<
       authoritativePlaybackDiagnostics,
     ),
     leadershipMode,
+    localSyncMode,
+    primaryClockSource: currentPrimaryClockSource,
     reconciliationProfileKey,
     reconciliationProfile,
     suppressionState: suppressionDiagnostics,
@@ -1163,6 +1440,14 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleSeeked = () => {
       updateLastMediaEvent("seeked");
+      if (
+        localSyncMode === "external_audio_mode" &&
+        shouldSuppressEquivalentAudioRecoveryEvent("video_seeked", video.currentTime)
+      ) {
+        publishMediaDiagnostics();
+        emitObservedStateChange();
+        return;
+      }
       armRoomHardSeekSuppression(
         reconciliationProfile.postSeekHardSeekSuppressionMs,
         "media_recovery",
@@ -1177,6 +1462,17 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleLoadedMetadata = () => {
       updateLastMediaEvent("loadedmetadata");
+      if (
+        localSyncMode === "external_audio_mode" &&
+        shouldSuppressEquivalentAudioRecoveryEvent(
+          "video_loadedmetadata",
+          video.currentTime,
+        )
+      ) {
+        publishMediaDiagnostics();
+        emitObservedStateChange();
+        return;
+      }
       armRoomHardSeekSuppression(
         reconciliationProfile.postCanPlayHardSeekSuppressionMs,
         "media_recovery",
@@ -1207,6 +1503,15 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleAudioLoadedMetadata = () => {
       updateLastAudioEvent("loadedmetadata");
+      if (
+        shouldSuppressEquivalentAudioRecoveryEvent(
+          "audio_loadedmetadata",
+          audio.currentTime,
+        )
+      ) {
+        publishMediaDiagnostics();
+        return;
+      }
       armRoomHardSeekSuppression(
         reconciliationProfile.postCanPlayHardSeekSuppressionMs,
         "media_recovery",
@@ -1221,6 +1526,12 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleAudioCanPlay = () => {
       updateLastAudioEvent("canplay");
+      if (
+        shouldSuppressEquivalentAudioRecoveryEvent("audio_canplay", audio.currentTime)
+      ) {
+        publishMediaDiagnostics();
+        return;
+      }
       armRoomHardSeekSuppression(
         reconciliationProfile.postCanPlayHardSeekSuppressionMs,
         "media_recovery",
@@ -1245,6 +1556,12 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleAudioSeeked = () => {
       updateLastAudioEvent("seeked");
+      if (
+        shouldSuppressEquivalentAudioRecoveryEvent("audio_seeked", audio.currentTime)
+      ) {
+        publishMediaDiagnostics();
+        return;
+      }
       armRoomHardSeekSuppression(
         reconciliationProfile.postSeekHardSeekSuppressionMs,
         "media_recovery",
@@ -1300,7 +1617,7 @@ export const RoomVideoPlayer = forwardRef<
       audio.removeEventListener("ratechange", handleAudioRateChange);
       audio.removeEventListener("error", handleAudioError);
     };
-  }, [reconciliationProfile]);
+  }, [localSyncMode, reconciliationProfile]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -1321,11 +1638,17 @@ export const RoomVideoPlayer = forwardRef<
       source: "system",
       data: {
         leadershipMode,
+        localSyncMode,
         reconciliationProfileKey,
         reconciliationProfile,
       },
     });
-  }, [leadershipMode, reconciliationProfile, reconciliationProfileKey]);
+  }, [
+    leadershipMode,
+    localSyncMode,
+    reconciliationProfile,
+    reconciliationProfileKey,
+  ]);
 
   useImperativeHandle(
     ref,
@@ -1335,6 +1658,7 @@ export const RoomVideoPlayer = forwardRef<
           videoRef.current,
           externalAudioRef.current,
           Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+          externalAudioIssue,
           playbackRate,
         );
       },
@@ -1346,7 +1670,7 @@ export const RoomVideoPlayer = forwardRef<
         const video = videoRef.current;
 
         if (!video) {
-          return buildSnapshot(null, null, false, playbackRate);
+          return buildSnapshot(null, null, false, null, playbackRate);
         }
 
         clearScheduledSharedStart();
@@ -1361,6 +1685,7 @@ export const RoomVideoPlayer = forwardRef<
           video,
           externalAudioRef.current,
           Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+          externalAudioIssue,
           playbackRate,
         );
       },
@@ -1368,22 +1693,21 @@ export const RoomVideoPlayer = forwardRef<
         const video = videoRef.current;
 
         if (!video) {
-          return buildSnapshot(null, null, false, playbackRate);
+          return buildSnapshot(null, null, false, null, playbackRate);
         }
 
         clearScheduledSharedStart();
         video.pause();
-        video.currentTime = 0;
-        resetPlaybackProgressSample(0);
         armRoomHardSeekSuppression(
           reconciliationProfile.postSeekHardSeekSuppressionMs,
           "local_user_seek",
           0,
         );
-        applyPlaybackRateToMedia(playbackRate);
-        void synchronizeExternalAudioWithVideo({
-          forceSeek: true,
+        void repositionMediaToAuthoritativeTarget({
           publishDiagnostics: true,
+          targetTime: 0,
+        }).finally(() => {
+          applyPlaybackRateToMedia(playbackRate);
         });
         emitSyncIssue(null);
         updateRoomCorrectionState(null);
@@ -1391,6 +1715,7 @@ export const RoomVideoPlayer = forwardRef<
           video,
           externalAudioRef.current,
           Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+          externalAudioIssue,
           playbackRate,
         );
       },
@@ -1398,25 +1723,25 @@ export const RoomVideoPlayer = forwardRef<
         const video = videoRef.current;
 
         if (!video) {
-          return buildSnapshot(null, null, false, playbackRate);
+          return buildSnapshot(null, null, false, null, playbackRate);
         }
 
-        video.currentTime = normalizeSeekTarget(video, deltaSeconds);
-        resetPlaybackProgressSample(video.currentTime);
+        const nextTargetTime = normalizeSeekTarget(video, deltaSeconds);
         armRoomHardSeekSuppression(
           reconciliationProfile.postSeekHardSeekSuppressionMs,
           "local_user_seek",
-          video.currentTime,
+          nextTargetTime,
         );
-        void synchronizeExternalAudioWithVideo({
-          forceSeek: true,
+        void repositionMediaToAuthoritativeTarget({
           publishDiagnostics: true,
+          targetTime: nextTargetTime,
         });
         emitSyncIssue(null);
         return buildSnapshot(
           video,
           externalAudioRef.current,
           Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+          externalAudioIssue,
           playbackRate,
         );
       },
@@ -1426,7 +1751,7 @@ export const RoomVideoPlayer = forwardRef<
         setAuthoritativePlaybackDiagnostics(playback);
 
         if (!video) {
-          return buildSnapshot(null, null, false, playback.playbackRate);
+          return buildSnapshot(null, null, false, null, playback.playbackRate);
         }
 
         clearScheduledSharedStart();
@@ -1440,6 +1765,7 @@ export const RoomVideoPlayer = forwardRef<
           video,
           externalAudioRef.current,
           Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+          externalAudioIssue,
         );
 
         applyPlaybackRateToMedia(playback.playbackRate);
@@ -1449,8 +1775,10 @@ export const RoomVideoPlayer = forwardRef<
           Math.abs(referenceCurrentTime - nextCurrentTime) >
             pauseConvergenceThresholdSeconds
         ) {
-          video.currentTime = nextCurrentTime;
-          resetPlaybackProgressSample(nextCurrentTime);
+          await repositionMediaToAuthoritativeTarget({
+            publishDiagnostics: false,
+            targetTime: nextCurrentTime,
+          });
           armRoomHardSeekSuppression(
             reconciliationProfile.postSeekHardSeekSuppressionMs,
             "authoritative_reposition",
@@ -1463,6 +1791,7 @@ export const RoomVideoPlayer = forwardRef<
             video.pause();
             await synchronizeExternalAudioWithVideo({
               forceSeek: true,
+              targetTime: nextCurrentTime,
               publishDiagnostics: true,
             });
             scheduleSharedPlaybackStart(playback);
@@ -1479,6 +1808,7 @@ export const RoomVideoPlayer = forwardRef<
               video,
               externalAudioRef.current,
               Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+              externalAudioIssue,
               playback.playbackRate,
             );
           }
@@ -1497,6 +1827,7 @@ export const RoomVideoPlayer = forwardRef<
               video,
               externalAudioRef.current,
               Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+              externalAudioIssue,
               playback.playbackRate,
             );
           }
@@ -1505,6 +1836,7 @@ export const RoomVideoPlayer = forwardRef<
         video.pause();
         await synchronizeExternalAudioWithVideo({
           forceSeek: true,
+          targetTime: nextCurrentTime,
           publishDiagnostics: true,
         });
         updateRoomCorrectionState(null);
@@ -1513,12 +1845,14 @@ export const RoomVideoPlayer = forwardRef<
           video,
           externalAudioRef.current,
           Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+          externalAudioIssue,
           playback.playbackRate,
         );
       },
     }),
     [
       activeExternalAudioTrack,
+      externalAudioIssue,
       playbackRate,
       reconciliationProfile,
       suppressLocalAudioOutput,

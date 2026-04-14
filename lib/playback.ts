@@ -5,17 +5,25 @@ type SharedPlaybackCommandType = "play" | "pause" | "stop" | "seek";
 export type PlaybackLeadershipMode =
   | "local_leader"
   | "local_follower"
+  | "local_external_audio_follower"
   | "cast_handoff"
   | "cast_leader_stabilizing"
   | "cast_leader_stable"
   | "cast_driven_local_follower"
+  | "cast_driven_external_audio_follower"
   | "mobile_external_audio_follower";
 
 export type PlaybackReconciliationProfileKey =
   | "local_leader"
   | "local_follower"
+  | "local_external_audio_follower"
   | "cast_driven_local_follower"
+  | "cast_driven_external_audio_follower"
   | "mobile_external_audio_follower";
+
+export type LocalPlaybackSyncMode =
+  | "embedded_audio_mode"
+  | "external_audio_mode";
 
 export type BuildAuthoritativePlaybackStateInput = {
   clientEventId: string | null;
@@ -103,6 +111,14 @@ export const playbackSynchronizationConfig = {
       postSeekHardSeekSuppressionMs: 2000,
       postCanPlayHardSeekSuppressionMs: 1750,
     } satisfies PlaybackReconciliationProfile,
+    local_external_audio_follower: {
+      ignoreDriftThresholdSeconds: 0.2,
+      hardSeekThresholdSeconds: 0.9,
+      smoothCorrectionRateDelta: 0.025,
+      hardSeekCooldownMs: 3000,
+      postSeekHardSeekSuppressionMs: 2250,
+      postCanPlayHardSeekSuppressionMs: 2000,
+    } satisfies PlaybackReconciliationProfile,
     cast_driven_local_follower: {
       ignoreDriftThresholdSeconds: 0.15,
       hardSeekThresholdSeconds: 1,
@@ -111,9 +127,17 @@ export const playbackSynchronizationConfig = {
       postSeekHardSeekSuppressionMs: 2250,
       postCanPlayHardSeekSuppressionMs: 2000,
     } satisfies PlaybackReconciliationProfile,
+    cast_driven_external_audio_follower: {
+      ignoreDriftThresholdSeconds: 0.2,
+      hardSeekThresholdSeconds: 1.2,
+      smoothCorrectionRateDelta: 0.02,
+      hardSeekCooldownMs: 3000,
+      postSeekHardSeekSuppressionMs: 2500,
+      postCanPlayHardSeekSuppressionMs: 2250,
+    } satisfies PlaybackReconciliationProfile,
     mobile_external_audio_follower: {
-      ignoreDriftThresholdSeconds: 0.15,
-      hardSeekThresholdSeconds: 1,
+      ignoreDriftThresholdSeconds: 0.2,
+      hardSeekThresholdSeconds: 1.2,
       smoothCorrectionRateDelta: 0.025,
       hardSeekCooldownMs: 3000,
       postSeekHardSeekSuppressionMs: 2500,
@@ -138,7 +162,13 @@ export const playbackSynchronizationConfig = {
   localMediaSyncThresholdSeconds: 0.08,
   localMediaCorrectionThresholdSeconds: 0.12,
   localMediaAggressiveCorrectionThresholdSeconds: 0.3,
+  externalAudioModeRoomDriftIgnoreThresholdSeconds: 0.2,
+  externalAudioModeVideoFollowThresholdSeconds: 0.2,
+  externalAudioModeVideoHardAlignThresholdSeconds: 0.45,
+  externalAudioModePrimaryClockProgressThresholdSeconds: 0.15,
   localMediaCorrectionThrottleMs: 250,
+  localMediaRecoveryEventStormWindowMs: 1500,
+  localMediaRecoveryEventStormThreshold: 3,
   stalledProgressThresholdSeconds: 0.15,
   stalledProgressWindowMs: 2000,
   stallRecoveryCooldownMs: 3000,
@@ -150,6 +180,8 @@ export const playbackSynchronizationConfig = {
     stabilizationWindowMs: 4000,
     postMirrorStabilizationWindowMs: 3500,
     debounceWindowMs: 500,
+    intentConfirmationWindowMs: 900,
+    antiReversionWindowMs: 1200,
     implausibleDriftThresholdSeconds: 1.75,
     absurdRegressionThresholdSeconds: 30,
     startupResetThresholdSeconds: 3,
@@ -175,23 +207,45 @@ export function resolvePlaybackReconciliationProfileKey(input: {
   isMobile: boolean;
   leadershipMode: PlaybackLeadershipMode;
 }): PlaybackReconciliationProfileKey {
+  if (input.hasExternalAudio && input.isMobile) {
+    return "mobile_external_audio_follower";
+  }
+
+  if (
+    input.leadershipMode === "cast_driven_external_audio_follower"
+  ) {
+    return "cast_driven_external_audio_follower";
+  }
+
   if (
     input.leadershipMode === "cast_driven_local_follower" ||
     input.leadershipMode === "cast_handoff" ||
     input.leadershipMode === "cast_leader_stabilizing"
   ) {
-    return input.hasExternalAudio && input.isMobile
-      ? "mobile_external_audio_follower"
+    return input.hasExternalAudio
+      ? "cast_driven_external_audio_follower"
       : "cast_driven_local_follower";
   }
 
-  if (input.hasExternalAudio && input.isMobile) {
-    return "mobile_external_audio_follower";
+  if (
+    input.leadershipMode === "local_external_audio_follower" ||
+    (input.hasExternalAudio && input.leadershipMode === "local_follower")
+  ) {
+    return "local_external_audio_follower";
   }
 
   return input.leadershipMode === "local_leader"
     ? "local_leader"
     : "local_follower";
+}
+
+export function resolveLocalPlaybackSyncMode(input: {
+  hasExternalAudio: boolean;
+  suppressLocalAudioOutput: boolean;
+}) {
+  return input.hasExternalAudio && !input.suppressLocalAudioOutput
+    ? "external_audio_mode"
+    : "embedded_audio_mode";
 }
 
 export function roundPlaybackSeconds(value: number) {

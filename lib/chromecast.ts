@@ -280,6 +280,13 @@ type CastRemoteLeadershipMode =
   | "cast_leader_stabilizing"
   | "cast_leader_stable";
 
+type CastRemoteIntentState =
+  | "cast_remote_idle"
+  | "cast_remote_intent_observed"
+  | "cast_remote_intent_stabilizing"
+  | "cast_remote_intent_committed"
+  | "cast_remote_intent_rejected";
+
 export type ChromecastRemotePlaybackEvent = {
   type: CastRemoteRoomCommandType;
   status: PlaybackStatus;
@@ -313,11 +320,26 @@ type CastRemoteObserverState = {
   estimatedObservationDelayMs: number | null;
   leadershipMode: CastRemoteLeadershipMode;
   lastEmittedSignature: string | null;
+  lastCommittedIntent: {
+    committedAtMs: number;
+    signature: string;
+    status: PlaybackStatus;
+  } | null;
   lastMirroredPlayback: PlaybackStateSnapshot | null;
   lastObservedCurrentTime: number | null;
   lastObservedSessionId: string | null;
   lastObservedSignature: string | null;
   lastObservedStatus: PlaybackStatus | null;
+  pendingIntent: {
+    event: ChromecastRemotePlaybackEvent;
+    firstObservedCurrentTime: number;
+    firstObservedAtMs: number;
+    lastObservedAtMs: number;
+    observationCount: number;
+    signature: string;
+    state: CastRemoteIntentState;
+    timerId: number | null;
+  } | null;
   pendingCandidate: {
     event: ChromecastRemotePlaybackEvent;
     signature: string;
@@ -385,11 +407,13 @@ const castRemoteObserverState: CastRemoteObserverState = {
     playbackSynchronizationConfig.castRemoteObservation.initialDelayMs,
   leadershipMode: "idle",
   lastEmittedSignature: null,
+  lastCommittedIntent: null,
   lastMirroredPlayback: null,
   lastObservedCurrentTime: null,
   lastObservedSessionId: null,
   lastObservedSignature: null,
   lastObservedStatus: null,
+  pendingIntent: null,
   pendingCandidate: null,
   pollTimerId: null,
   remotePlayer: null,
@@ -624,6 +648,103 @@ function clearPendingCastRemoteCandidate(reason: string) {
   });
 }
 
+function updateCastRemoteIntentState(
+  state: CastRemoteIntentState,
+  reason: string,
+  event?: ChromecastRemotePlaybackEvent | null,
+) {
+  updateChromecastRuntimeState({
+    castRemoteIntentState: state,
+    castRemoteIntentReason: reason,
+    castRemoteIntentStatus: event?.status ?? null,
+    castRemoteIntentType: event?.type ?? null,
+    castRemoteIntentCurrentTime: event?.currentTime ?? null,
+    castRemoteIntentObservedAt: event?.observedAt ?? null,
+  });
+}
+
+function clearPendingCastRemoteIntent(reason: string) {
+  if (castRemoteObserverState.pendingIntent?.timerId != null) {
+    window.clearTimeout(castRemoteObserverState.pendingIntent.timerId);
+  }
+
+  castRemoteObserverState.pendingIntent = null;
+  updateCastRemoteIntentState("cast_remote_idle", reason, null);
+}
+
+function rejectCastRemoteIntent(
+  reason:
+    | "rejected_due_to_insufficient_remote_stability"
+    | "rejected_due_to_recent_local_cast_command"
+    | "rejected_due_to_cast_stabilization_window"
+    | "rejected_due_to_implausible_remote_time"
+    | "rejected_due_to_contradictory_remote_transition"
+    | "rejected_due_to_recent_committed_remote_intent",
+  event: ChromecastRemotePlaybackEvent,
+  data: Record<string, unknown> = {},
+) {
+  updateCastRemoteIntentState("cast_remote_intent_rejected", reason, event);
+  logDebugEvent({
+    level: "info",
+    category: "cast",
+    message: `Rejected a Chromecast remote intent candidate: ${reason}.`,
+    source: "cast_remote",
+    data: {
+      ...data,
+      event,
+    },
+  });
+}
+
+function canConfirmCastRemoteIntent(candidate: NonNullable<CastRemoteObserverState["pendingIntent"]>) {
+  const firstCurrentTime = candidate.firstObservedCurrentTime;
+  const latestCurrentTime = candidate.event.currentTime;
+
+  if (candidate.event.status === "playing") {
+    return candidate.observationCount >= 2 || latestCurrentTime >= firstCurrentTime + 0.15;
+  }
+
+  return candidate.observationCount >= 2;
+}
+
+function commitCastRemoteIntent(
+  candidate: NonNullable<CastRemoteObserverState["pendingIntent"]>,
+) {
+  if (castRemoteObserverState.pendingIntent?.timerId != null) {
+    window.clearTimeout(castRemoteObserverState.pendingIntent.timerId);
+  }
+  castRemoteObserverState.pendingIntent = null;
+  castRemoteObserverState.lastEmittedSignature = candidate.signature;
+  castRemoteObserverState.lastCommittedIntent = {
+    committedAtMs: Date.now(),
+    signature: candidate.signature,
+    status: candidate.event.status,
+  };
+  updateCastRemoteIntentState(
+    "cast_remote_intent_committed",
+    "confirmed_remote_intent",
+    candidate.event,
+  );
+  updateChromecastRuntimeState({
+    lastAppliedRemoteStateSignature: candidate.signature,
+    lastRemoteOriginatedRoomCommand: candidate.event,
+    castRemoteIntentCommittedAt: new Date(
+      castRemoteObserverState.lastCommittedIntent.committedAtMs,
+    ).toISOString(),
+  });
+  logDebugEvent({
+    level: "info",
+    category: "cast",
+    message: `Committed a confirmed Chromecast remote ${candidate.event.type} intent into shared room sync.`,
+    source: "cast_remote",
+    data: {
+      observationCount: candidate.observationCount,
+      event: candidate.event,
+    },
+  });
+  notifyChromecastRemotePlaybackListeners(candidate.event);
+}
+
 function updateCastRemoteLeadershipMode(
   mode: CastRemoteLeadershipMode,
   reason: string,
@@ -662,6 +783,7 @@ function armCastRemoteStabilization(
     nowMs + durationMs,
   );
   clearPendingCastRemoteCandidate(`${reason}:stabilized`);
+  clearPendingCastRemoteIntent(`${reason}:stabilized`);
   updateCastRemoteLeadershipMode(mode, reason);
 }
 
@@ -826,6 +948,134 @@ function queuePendingCastRemoteCandidate(
     pendingCastRemoteObservedAt: event.observedAt,
     pendingCastRemoteReason: "awaiting_stability_debounce",
   });
+}
+
+function queuePendingCastRemoteIntent(
+  event: ChromecastRemotePlaybackEvent,
+  signature: string,
+) {
+  const nowMs = Date.now();
+  const antiReversionWindowMs =
+    playbackSynchronizationConfig.castRemoteObservation.antiReversionWindowMs;
+  const lastCommittedIntent = castRemoteObserverState.lastCommittedIntent;
+
+  if (
+    lastCommittedIntent &&
+    lastCommittedIntent.status !== event.status &&
+    nowMs - lastCommittedIntent.committedAtMs < antiReversionWindowMs
+  ) {
+    rejectCastRemoteIntent(
+      "rejected_due_to_recent_committed_remote_intent",
+      event,
+      {
+        antiReversionWindowMs,
+        committedAt: new Date(lastCommittedIntent.committedAtMs).toISOString(),
+        committedStatus: lastCommittedIntent.status,
+      },
+    );
+    logDebugEvent({
+      level: "info",
+      category: "cast",
+      message:
+        "Blocked a contradictory Chromecast remote reversal because the previously committed remote intent is still inside the anti-reversion guard window.",
+      source: "cast_remote",
+      data: {
+        antiReversionWindowMs,
+        committedStatus: lastCommittedIntent.status,
+        nextStatus: event.status,
+      },
+    });
+    return;
+  }
+
+  const existingIntent = castRemoteObserverState.pendingIntent;
+
+  if (existingIntent && existingIntent.event.status !== event.status) {
+    rejectCastRemoteIntent(
+      "rejected_due_to_contradictory_remote_transition",
+      existingIntent.event,
+      {
+        contradictoryEvent: event,
+        previousObservationCount: existingIntent.observationCount,
+      },
+    );
+    clearPendingCastRemoteIntent("contradictory_transition");
+  }
+
+  if (
+    castRemoteObserverState.pendingIntent &&
+    castRemoteObserverState.pendingIntent.event.status === event.status &&
+    castRemoteObserverState.pendingIntent.event.type === event.type &&
+    castRemoteObserverState.pendingIntent.event.sessionId === event.sessionId
+  ) {
+    const nextIntent = castRemoteObserverState.pendingIntent;
+    nextIntent.event = event;
+    nextIntent.signature = signature;
+    nextIntent.lastObservedAtMs = nowMs;
+    nextIntent.observationCount += 1;
+    nextIntent.state = "cast_remote_intent_stabilizing";
+    updateCastRemoteIntentState(
+      "cast_remote_intent_stabilizing",
+      "repeat_consistent_observation",
+      event,
+    );
+    return;
+  }
+
+  clearPendingCastRemoteIntent("new_intent");
+  updateCastRemoteIntentState("cast_remote_intent_observed", "candidate_observed", event);
+  logDebugEvent({
+    level: "info",
+    category: "cast",
+    message: `Observed a Chromecast remote ${event.type} candidate and started intent confirmation.`,
+    source: "cast_remote",
+    data: event,
+  });
+
+  const firstObservedAtMs = nowMs;
+  const timerId = window.setTimeout(() => {
+    const pendingIntent = castRemoteObserverState.pendingIntent;
+
+    if (
+      !pendingIntent ||
+      pendingIntent.firstObservedAtMs !== firstObservedAtMs ||
+      pendingIntent.event.status !== event.status ||
+      pendingIntent.event.sessionId !== event.sessionId
+    ) {
+      return;
+    }
+
+    if (!canConfirmCastRemoteIntent(pendingIntent)) {
+      rejectCastRemoteIntent(
+        "rejected_due_to_insufficient_remote_stability",
+        pendingIntent.event,
+        {
+          observationCount: pendingIntent.observationCount,
+          signature,
+        },
+      );
+      clearPendingCastRemoteIntent("insufficient_remote_stability");
+      return;
+    }
+
+    commitCastRemoteIntent(pendingIntent);
+  }, playbackSynchronizationConfig.castRemoteObservation.intentConfirmationWindowMs);
+
+  castRemoteObserverState.pendingIntent = {
+    event,
+    firstObservedCurrentTime: event.currentTime,
+    firstObservedAtMs,
+    lastObservedAtMs: nowMs,
+    observationCount: 1,
+    signature,
+    state: "cast_remote_intent_stabilizing",
+    timerId,
+  };
+  updateCastRemoteIntentState(
+    "cast_remote_intent_stabilizing",
+    "awaiting_confirmation_window",
+    event,
+  );
 }
 
 function updateCastResolvedMediaRuntimeState(
@@ -1369,6 +1619,7 @@ function resolveRemotePlaybackCommandType(input: {
 
 function stopChromecastRemotePlaybackObservation(reason: string) {
   clearPendingCastRemoteCandidate(`${reason}:stop`);
+  clearPendingCastRemoteIntent(`${reason}:stop`);
 
   if (castRemoteObserverState.controllerCleanup) {
     castRemoteObserverState.controllerCleanup();
@@ -1386,6 +1637,7 @@ function stopChromecastRemotePlaybackObservation(reason: string) {
     playbackSynchronizationConfig.castRemoteObservation.initialDelayMs;
   castRemoteObserverState.leadershipMode = "idle";
   castRemoteObserverState.lastEmittedSignature = null;
+  castRemoteObserverState.lastCommittedIntent = null;
   castRemoteObserverState.lastMirroredPlayback = null;
   castRemoteObserverState.lastObservedCurrentTime = null;
   castRemoteObserverState.lastObservedSessionId = null;
@@ -1407,6 +1659,8 @@ function stopChromecastRemotePlaybackObservation(reason: string) {
     lastObservedRemotePlayerState: null,
     lastObservedRemoteIsPaused: null,
     lastAppliedRemoteStateSignature: null,
+    castRemoteIntentState: "cast_remote_idle",
+    castRemoteIntentReason: reason,
     pendingCastRemoteSignature: null,
     pendingCastRemoteObservedAt: null,
     pendingCastRemoteReason: null,
@@ -1593,6 +1847,25 @@ function observeChromecastRemotePlaybackState(reason: string) {
       signature: nextSignature,
       status,
     });
+    if (commandType === "play" || commandType === "pause") {
+      rejectCastRemoteIntent(
+        "rejected_due_to_recent_local_cast_command",
+        {
+          type: commandType,
+          status,
+          currentTime: Math.round(currentTime * 1000) / 1000,
+          playbackRate,
+          expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
+          observationDelayMs,
+          observedAt: new Date(observedAtMs).toISOString(),
+          sessionId: sessionIdentity.id,
+          contentId,
+          selectionSignature,
+          source: "cast_remote",
+        },
+        { matchingLocalCommand, signature: nextSignature },
+      );
+    }
     return;
   }
 
@@ -1613,6 +1886,25 @@ function observeChromecastRemotePlaybackState(reason: string) {
           ? new Date(castRemoteObserverState.stabilizationUntilMs).toISOString()
           : null,
     });
+    if (commandType === "play" || commandType === "pause") {
+      rejectCastRemoteIntent(
+        "rejected_due_to_cast_stabilization_window",
+        {
+          type: commandType,
+          status,
+          currentTime: Math.round(currentTime * 1000) / 1000,
+          playbackRate,
+          expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
+          observationDelayMs,
+          observedAt: new Date(observedAtMs).toISOString(),
+          sessionId: sessionIdentity.id,
+          contentId,
+          selectionSignature,
+          source: "cast_remote",
+        },
+        { signature: nextSignature },
+      );
+    }
     return;
   }
 
@@ -1632,6 +1924,25 @@ function observeChromecastRemotePlaybackState(reason: string) {
       signature: nextSignature,
       status,
     });
+    if (commandType === "play" || commandType === "pause") {
+      rejectCastRemoteIntent(
+        "rejected_due_to_implausible_remote_time",
+        {
+          type: commandType,
+          status,
+          currentTime: Math.round(currentTime * 1000) / 1000,
+          playbackRate,
+          expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
+          observationDelayMs,
+          observedAt: new Date(observedAtMs).toISOString(),
+          sessionId: sessionIdentity.id,
+          contentId,
+          selectionSignature,
+          source: "cast_remote",
+        },
+        { driftSeconds: plausibility.driftSeconds, signature: nextSignature },
+      );
+    }
     return;
   }
 
@@ -1653,6 +1964,11 @@ function observeChromecastRemotePlaybackState(reason: string) {
     selectionSignature,
     source: "cast_remote",
   };
+
+  if (commandType === "play" || commandType === "pause") {
+    queuePendingCastRemoteIntent(event, nextSignature);
+    return;
+  }
 
   queuePendingCastRemoteCandidate(event, nextSignature);
 }

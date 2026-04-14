@@ -419,7 +419,9 @@ function resolvePlaybackLeadershipMode(input: {
   ) {
     return input.hasExternalAudio && input.isMobileClient
       ? "mobile_external_audio_follower"
-      : "cast_driven_local_follower";
+      : input.hasExternalAudio
+        ? "cast_driven_external_audio_follower"
+        : "cast_driven_local_follower";
   }
 
   if (
@@ -430,8 +432,12 @@ function resolvePlaybackLeadershipMode(input: {
     return "local_leader";
   }
 
-  return input.hasExternalAudio && input.isMobileClient
-    ? "mobile_external_audio_follower"
+  if (input.hasExternalAudio && input.isMobileClient) {
+    return "mobile_external_audio_follower";
+  }
+
+  return input.hasExternalAudio
+    ? "local_external_audio_follower"
     : "local_follower";
 }
 

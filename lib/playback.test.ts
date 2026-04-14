@@ -7,6 +7,7 @@ import {
   estimateCastObservationDelayMs,
   isPlaybackActivelyRunning,
   playbackSynchronizationConfig,
+  resolveLocalPlaybackSyncMode,
   resolvePlaybackReconciliationProfileKey,
   resolvePlaybackDriftCorrection,
   resolvePlaybackStartDelayMs,
@@ -140,6 +141,43 @@ test("cast-driven mobile followers with external audio use the most tolerant rec
   });
 
   assert.equal(profileKey, "mobile_external_audio_follower");
+});
+
+test("desktop followers with external audio use the external-audio follower profile", () => {
+  const profileKey = resolvePlaybackReconciliationProfileKey({
+    hasExternalAudio: true,
+    isMobile: false,
+    leadershipMode: "local_follower",
+  });
+
+  assert.equal(profileKey, "local_external_audio_follower");
+});
+
+test("cast-driven desktop followers with external audio use the cast external-audio profile", () => {
+  const profileKey = resolvePlaybackReconciliationProfileKey({
+    hasExternalAudio: true,
+    isMobile: false,
+    leadershipMode: "cast_driven_local_follower",
+  });
+
+  assert.equal(profileKey, "cast_driven_external_audio_follower");
+});
+
+test("external audio becomes the primary local sync mode when local audio output is active", () => {
+  assert.equal(
+    resolveLocalPlaybackSyncMode({
+      hasExternalAudio: true,
+      suppressLocalAudioOutput: false,
+    }),
+    "external_audio_mode",
+  );
+  assert.equal(
+    resolveLocalPlaybackSyncMode({
+      hasExternalAudio: true,
+      suppressLocalAudioOutput: true,
+    }),
+    "embedded_audio_mode",
+  );
 });
 
 test("equivalent suppression renewals are ignored inside the renewal cooldown", () => {
