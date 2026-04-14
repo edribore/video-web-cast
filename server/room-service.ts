@@ -31,9 +31,6 @@ export async function createRoomForMediaAsset(
       catalogMovieId: options?.catalogMovieId ?? null,
       name: options?.roomName ?? mediaAsset.title,
       publicId: createPublicRoomId(),
-      playbackState: {
-        create: {},
-      },
     },
     select: {
       id: true,
