@@ -28,8 +28,10 @@ import { createSafeId } from "@/lib/create-safe-id";
 import {
   formatPlaybackSeconds,
   isPlaybackActivelyRunning,
+  resolvePlaybackReconciliationProfileKey,
   resolveSynchronizedPlaybackTime,
   resolvePlaybackStartDelayMs,
+  type PlaybackLeadershipMode,
 } from "@/lib/playback";
 import { getOrCreateParticipantSessionId } from "@/lib/participant-session";
 import { logDebugEvent, setDebugLastActionSource } from "@/lib/debug-store";
@@ -46,6 +48,7 @@ import type {
   RoomSocketPlaybackSyncPayload,
   RoomSyncEvent,
   SharedRoomControlType,
+  SharedRoomControlSource,
 } from "@/types/room-sync";
 import {
   RoomVideoPlayer,
@@ -347,6 +350,91 @@ function areLocalAudioStatesEqual(
   );
 }
 
+function resolveSharedRoomCommandSource(
+  source: RoomActionSource,
+): SharedRoomControlSource | null {
+  if (
+    source === "local_user" ||
+    source === "cast_local_command" ||
+    source === "cast_remote"
+  ) {
+    return source;
+  }
+
+  return null;
+}
+
+function resolvePlaybackSyncActionSource(input: {
+  eventCommandSource: SharedRoomControlSource | null;
+  pendingSource: RoomActionSource | null;
+}): RoomActionSource {
+  if (input.pendingSource === "cast_remote") {
+    return "cast_remote";
+  }
+
+  if (input.pendingSource === "cast_local_command") {
+    return "cast_local_command";
+  }
+
+  if (input.pendingSource) {
+    return "socket_echo";
+  }
+
+  if (input.eventCommandSource === "cast_remote") {
+    return "cast_remote";
+  }
+
+  if (input.eventCommandSource === "cast_local_command") {
+    return "cast_local_command";
+  }
+
+  return "socket";
+}
+
+function resolvePlaybackLeadershipMode(input: {
+  authoritativeCommandSource: SharedRoomControlSource | null;
+  castRuntimeLeadershipMode: string | null;
+  hasExternalAudio: boolean;
+  isCastActive: boolean;
+  isMobileClient: boolean;
+  lastActionSource: RoomActionSource | null;
+  lastEventActorSessionId: string | null;
+  participantSessionId: string;
+}): PlaybackLeadershipMode {
+  if (input.isCastActive) {
+    if (
+      input.castRuntimeLeadershipMode === "cast_handoff" ||
+      input.castRuntimeLeadershipMode === "cast_leader_stabilizing" ||
+      input.castRuntimeLeadershipMode === "cast_leader_stable"
+    ) {
+      return input.castRuntimeLeadershipMode;
+    }
+
+    return "cast_leader_stabilizing";
+  }
+
+  if (
+    input.authoritativeCommandSource === "cast_remote" ||
+    input.authoritativeCommandSource === "cast_local_command"
+  ) {
+    return input.hasExternalAudio && input.isMobileClient
+      ? "mobile_external_audio_follower"
+      : "cast_driven_local_follower";
+  }
+
+  if (
+    input.lastEventActorSessionId === input.participantSessionId &&
+    (input.lastActionSource === "local_user" ||
+      input.lastActionSource === "socket_echo")
+  ) {
+    return "local_leader";
+  }
+
+  return input.hasExternalAudio && input.isMobileClient
+    ? "mobile_external_audio_follower"
+    : "local_follower";
+}
+
 export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   const [state, dispatch] = useReducer(reducer, {
     playback: snapshot.playback,
@@ -358,6 +446,11 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   });
   const [participantSessionId] = useState(() =>
     typeof window !== "undefined" ? getOrCreateParticipantSessionId() : "",
+  );
+  const [isMobileClient] = useState(() =>
+    typeof navigator !== "undefined"
+      ? /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent)
+      : false,
   );
   const [participantPreferences, setParticipantPreferences] =
     useState<ParticipantMediaPreferences>(() => createInitialParticipantPreferences(snapshot));
@@ -481,6 +574,26 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   const playbackAwaitingScheduledStart =
     state.playback.status === "playing" &&
     !isPlaybackActivelyRunning(state.playback);
+  const authoritativeCommandSource = state.lastEvent?.commandSource ?? null;
+  const castRuntimeLeadershipMode =
+    typeof castRuntimeState.castRemoteLeadershipMode === "string"
+      ? castRuntimeState.castRemoteLeadershipMode
+      : null;
+  const playbackLeadershipMode = resolvePlaybackLeadershipMode({
+    authoritativeCommandSource,
+    castRuntimeLeadershipMode,
+    hasExternalAudio: Boolean(selectedExternalAudioTrack),
+    isCastActive,
+    isMobileClient,
+    lastActionSource: state.lastActionSource,
+    lastEventActorSessionId: state.lastEvent?.actorSessionId ?? null,
+    participantSessionId,
+  });
+  const reconciliationProfileKey = resolvePlaybackReconciliationProfileKey({
+    hasExternalAudio: Boolean(selectedExternalAudioTrack),
+    isMobile: isMobileClient,
+    leadershipMode: playbackLeadershipMode,
+  });
 
   const clearScheduledCastPlaybackTimer = useEffectEvent(() => {
     if (scheduledCastPlaybackTimerRef.current != null) {
@@ -511,6 +624,9 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     resolvedAuthoritativeCurrentTime,
     playbackAwaitingScheduledStart,
     playbackVersion: state.playback.version,
+    authoritativeCommandSource,
+    playbackLeadershipMode,
+    reconciliationProfileKey,
     playbackAnchor: {
       anchorMediaTime: state.playback.anchorMediaTime,
       anchorWallClockMs: state.playback.anchorWallClockMs,
@@ -641,6 +757,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       status: command.status,
       currentTime: command.currentTime,
       playbackRate: command.playbackRate,
+      commandSource: resolveSharedRoomCommandSource(source),
     });
     logDebugEvent({
       level: "info",
@@ -957,14 +1074,10 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       const pendingSource = payload.sourceClientEventId
         ? pendingClientEventIdsRef.current.get(payload.sourceClientEventId) ?? null
         : null;
-      const source =
-        pendingSource === "cast_remote"
-          ? "cast_remote"
-          : pendingSource === "cast_local_command"
-            ? "cast_local_command"
-            : pendingSource
-              ? "socket_echo"
-              : "socket";
+      const source = resolvePlaybackSyncActionSource({
+        eventCommandSource: payload.event.commandSource,
+        pendingSource,
+      });
 
       if (payload.sourceClientEventId) {
         pendingClientEventIdsRef.current.delete(payload.sourceClientEventId);
@@ -1173,6 +1286,8 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
               roomId={snapshot.roomId}
               title={snapshot.media?.title ?? "Uploaded media"}
               videoUrl={snapshot.media?.videoUrl ?? null}
+              leadershipMode={playbackLeadershipMode}
+              reconciliationProfileKey={reconciliationProfileKey}
               audioTracks={audioTracks}
               audioTrackSupport={audioTrackSupport}
               selectedAudioTrackId={effectiveSelectedAudioTrackId}

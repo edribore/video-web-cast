@@ -4,7 +4,11 @@ import { useEffect, useState } from "react";
 import { logDebugEvent, setDebugRuntimeState } from "@/lib/debug-store";
 import { isCastableAbsoluteUrl } from "@/lib/public-origin";
 import {
+  assessCastRemoteObservationPlausibility,
+  computeExpectedCastRemoteTimeAtObservation,
+  estimateCastObservationDelayMs,
   isPlaybackActivelyRunning,
+  playbackSynchronizationConfig,
   resolvePlaybackStartDelayMs,
   resolveSynchronizedPlaybackTime,
 } from "@/lib/playback";
@@ -270,6 +274,11 @@ type CastSessionEvent = {
 };
 
 type CastRemoteRoomCommandType = "play" | "pause" | "seek" | "stop";
+type CastRemoteLeadershipMode =
+  | "idle"
+  | "cast_handoff"
+  | "cast_leader_stabilizing"
+  | "cast_leader_stable";
 
 export type ChromecastRemotePlaybackEvent = {
   type: CastRemoteRoomCommandType;
@@ -277,6 +286,8 @@ export type ChromecastRemotePlaybackEvent = {
   currentTime: number;
   playbackRate: number;
   observedAt: string;
+  expectedCurrentTime: number;
+  observationDelayMs: number;
   sessionId: string | null;
   contentId: string | null;
   selectionSignature: string | null;
@@ -299,14 +310,23 @@ type RecentLocalCastCommand = {
 
 type CastRemoteObserverState = {
   controllerCleanup: (() => void) | null;
+  estimatedObservationDelayMs: number | null;
+  leadershipMode: CastRemoteLeadershipMode;
   lastEmittedSignature: string | null;
+  lastMirroredPlayback: PlaybackStateSnapshot | null;
   lastObservedCurrentTime: number | null;
   lastObservedSessionId: string | null;
   lastObservedSignature: string | null;
   lastObservedStatus: PlaybackStatus | null;
+  pendingCandidate: {
+    event: ChromecastRemotePlaybackEvent;
+    signature: string;
+    timerId: number | null;
+  } | null;
   pollTimerId: number | null;
   remotePlayer: RemotePlayerInstance | null;
   remotePlayerController: RemotePlayerControllerInstance | null;
+  stabilizationUntilMs: number;
 };
 
 type CastEnvironmentSnapshot = {
@@ -361,14 +381,20 @@ const localCastCommandSuppressionWindowMs = 2500;
 const recentLocalCastCommands: RecentLocalCastCommand[] = [];
 const castRemoteObserverState: CastRemoteObserverState = {
   controllerCleanup: null,
+  estimatedObservationDelayMs:
+    playbackSynchronizationConfig.castRemoteObservation.initialDelayMs,
+  leadershipMode: "idle",
   lastEmittedSignature: null,
+  lastMirroredPlayback: null,
   lastObservedCurrentTime: null,
   lastObservedSessionId: null,
   lastObservedSignature: null,
   lastObservedStatus: null,
+  pendingCandidate: null,
   pollTimerId: null,
   remotePlayer: null,
   remotePlayerController: null,
+  stabilizationUntilMs: 0,
 };
 
 function getCastSdkWindow() {
@@ -583,6 +609,223 @@ function findMatchingRecentLocalCastCommand(observation: {
   }
 
   return null;
+}
+
+function clearPendingCastRemoteCandidate(reason: string) {
+  if (castRemoteObserverState.pendingCandidate?.timerId != null) {
+    window.clearTimeout(castRemoteObserverState.pendingCandidate.timerId);
+  }
+
+  castRemoteObserverState.pendingCandidate = null;
+  updateChromecastRuntimeState({
+    pendingCastRemoteSignature: null,
+    pendingCastRemoteObservedAt: null,
+    pendingCastRemoteReason: reason,
+  });
+}
+
+function updateCastRemoteLeadershipMode(
+  mode: CastRemoteLeadershipMode,
+  reason: string,
+) {
+  castRemoteObserverState.leadershipMode = mode;
+  updateChromecastRuntimeState({
+    castRemoteLeadershipMode: mode,
+    castRemoteLeadershipReason: reason,
+    castRemoteStabilizationUntil:
+      castRemoteObserverState.stabilizationUntilMs > 0
+        ? new Date(castRemoteObserverState.stabilizationUntilMs).toISOString()
+        : null,
+  });
+}
+
+function settleCastRemoteLeadershipMode(nowMs = Date.now()) {
+  if (
+    castRemoteObserverState.leadershipMode !== "idle" &&
+    castRemoteObserverState.stabilizationUntilMs > 0 &&
+    nowMs >= castRemoteObserverState.stabilizationUntilMs &&
+    castRemoteObserverState.leadershipMode !== "cast_leader_stable"
+  ) {
+    updateCastRemoteLeadershipMode("cast_leader_stable", "stabilization_elapsed");
+  }
+}
+
+function armCastRemoteStabilization(
+  reason: string,
+  durationMs: number = playbackSynchronizationConfig.castRemoteObservation
+    .postMirrorStabilizationWindowMs,
+  mode: CastRemoteLeadershipMode = "cast_leader_stabilizing",
+) {
+  const nowMs = Date.now();
+  castRemoteObserverState.stabilizationUntilMs = Math.max(
+    castRemoteObserverState.stabilizationUntilMs,
+    nowMs + durationMs,
+  );
+  clearPendingCastRemoteCandidate(`${reason}:stabilized`);
+  updateCastRemoteLeadershipMode(mode, reason);
+}
+
+function rememberMirroredCastPlayback(
+  playback: PlaybackStateSnapshot,
+  reason: string,
+) {
+  castRemoteObserverState.lastMirroredPlayback = playback;
+  updateChromecastRuntimeState({
+    castMirroredPlaybackAnchor: {
+      status: playback.status,
+      anchorMediaTime: playback.anchorMediaTime,
+      anchorWallClockMs: playback.anchorWallClockMs,
+      playbackRate: playback.playbackRate,
+      scheduledStartWallClockMs: playback.scheduledStartWallClockMs,
+      version: playback.version,
+    },
+    castMirroredPlaybackReason: reason,
+  });
+}
+
+function rememberCastObservationDelaySample(sampleMs: number, reason: string) {
+  const nextEstimateMs = estimateCastObservationDelayMs(
+    castRemoteObserverState.estimatedObservationDelayMs,
+    sampleMs,
+  );
+
+  castRemoteObserverState.estimatedObservationDelayMs = nextEstimateMs;
+  updateChromecastRuntimeState({
+    castObservationDelayMs: nextEstimateMs,
+    castObservationDelaySampleMs: sampleMs,
+    castObservationDelayReason: reason,
+  });
+}
+
+function rejectCastRemoteObservation(
+  reason:
+    | "rejected_due_to_cast_stabilization_window"
+    | "rejected_due_to_implausible_remote_time"
+    | "rejected_due_to_recent_local_cast_command"
+    | "rejected_due_to_insufficient_remote_stability",
+  data: Record<string, unknown>,
+) {
+  updateChromecastRuntimeState({
+    lastSuppressedRemoteStateSignature:
+      typeof data.signature === "string" ? data.signature : null,
+    lastSuppressedRemoteStateReason: reason,
+    lastCastRemoteRejectionReason: reason,
+  });
+  logDebugEvent({
+    level: "info",
+    category: "cast",
+    message: `Rejected a Chromecast remote observation: ${reason}.`,
+    source: "cast_remote",
+    data,
+  });
+}
+
+function queuePendingCastRemoteCandidate(
+  event: ChromecastRemotePlaybackEvent,
+  signature: string,
+) {
+  clearPendingCastRemoteCandidate("new_candidate");
+  rejectCastRemoteObservation("rejected_due_to_insufficient_remote_stability", {
+    signature,
+    event,
+  });
+
+  const timerId = window.setTimeout(() => {
+    const pendingCandidate = castRemoteObserverState.pendingCandidate;
+
+    if (!pendingCandidate || pendingCandidate.signature !== signature) {
+      return;
+    }
+
+    settleCastRemoteLeadershipMode();
+
+    if (
+      castRemoteObserverState.stabilizationUntilMs > Date.now() ||
+      castRemoteObserverState.leadershipMode === "cast_handoff" ||
+      castRemoteObserverState.leadershipMode === "cast_leader_stabilizing"
+    ) {
+      rejectCastRemoteObservation(
+        "rejected_due_to_cast_stabilization_window",
+        {
+          signature,
+          event,
+        },
+      );
+      clearPendingCastRemoteCandidate("stabilization_window");
+      return;
+    }
+
+    const matchingLocalCommand = findMatchingRecentLocalCastCommand({
+      status: event.status,
+      currentTime: event.currentTime,
+      playbackRate: event.playbackRate,
+      selectionSignature: event.selectionSignature,
+    });
+
+    if (matchingLocalCommand) {
+      rejectCastRemoteObservation(
+        "rejected_due_to_recent_local_cast_command",
+        {
+          signature,
+          event,
+          matchingLocalCommand,
+        },
+      );
+      clearPendingCastRemoteCandidate("recent_local_cast_command");
+      return;
+    }
+
+    if (castRemoteObserverState.lastMirroredPlayback) {
+      const plausibility = assessCastRemoteObservationPlausibility({
+        commandType: event.type,
+        expectedTime: computeExpectedCastRemoteTimeAtObservation(
+          castRemoteObserverState.lastMirroredPlayback,
+          new Date(event.observedAt).getTime(),
+          event.observationDelayMs,
+        ),
+        observedTime: event.currentTime,
+      });
+
+      if (!plausibility.plausible) {
+        rejectCastRemoteObservation(
+          "rejected_due_to_implausible_remote_time",
+          {
+            signature,
+            event,
+            driftSeconds: plausibility.driftSeconds,
+          },
+        );
+        clearPendingCastRemoteCandidate("implausible_remote_time");
+        return;
+      }
+    }
+
+    castRemoteObserverState.lastEmittedSignature = signature;
+    updateChromecastRuntimeState({
+      lastAppliedRemoteStateSignature: signature,
+      lastRemoteOriginatedRoomCommand: event,
+    });
+    logDebugEvent({
+      level: "info",
+      category: "cast",
+      message: `Accepted Chromecast remote ${event.type} after the stabilization debounce.`,
+      source: "cast_remote",
+      data: event,
+    });
+    notifyChromecastRemotePlaybackListeners(event);
+    clearPendingCastRemoteCandidate("accepted");
+  }, playbackSynchronizationConfig.castRemoteObservation.debounceWindowMs);
+
+  castRemoteObserverState.pendingCandidate = {
+    event,
+    signature,
+    timerId,
+  };
+  updateChromecastRuntimeState({
+    pendingCastRemoteSignature: signature,
+    pendingCastRemoteObservedAt: event.observedAt,
+    pendingCastRemoteReason: "awaiting_stability_debounce",
+  });
 }
 
 function updateCastResolvedMediaRuntimeState(
@@ -837,11 +1080,27 @@ function resetCurrentCastSessionRuntimeState(
     mediaLoadResult: null,
     mediaLoadResultErrorCode: null,
     lastCastMirrorDecision: null,
+    castMirroredPlaybackAnchor: null,
+    castMirroredPlaybackReason: null,
     resolvedSelectionSignature: null,
+    castObservationDelayMs:
+      playbackSynchronizationConfig.castRemoteObservation.initialDelayMs,
+    castObservationDelaySampleMs: null,
+    castObservationDelayReason: null,
+    castRemoteLeadershipMode: identity ? "cast_handoff" : "idle",
+    castRemoteLeadershipReason: identity ? "session_started" : "idle",
+    castRemoteStabilizationUntil: identity
+      ? new Date(
+          Date.now() +
+            playbackSynchronizationConfig.castRemoteObservation
+              .stabilizationWindowMs,
+        ).toISOString()
+      : null,
     remotePlayerObserved: false,
     remotePlayerPollingEnabled: false,
     remotePlayerObservationReason: null,
     remotePlayerObservationSessionId: null,
+    lastObservedRemoteExpectedCurrentTime: null,
     lastObservedRemoteCurrentTime: null,
     lastObservedRemotePlayerState: null,
     lastObservedRemoteIsPaused: null,
@@ -850,6 +1109,10 @@ function resetCurrentCastSessionRuntimeState(
     lastAppliedRemoteStateSignature: null,
     lastSuppressedRemoteStateSignature: null,
     lastSuppressedRemoteStateReason: null,
+    lastCastRemoteRejectionReason: null,
+    pendingCastRemoteSignature: null,
+    pendingCastRemoteObservedAt: null,
+    pendingCastRemoteReason: null,
     lastCastLocalCommandSignature: null,
     lastCastLocalCommandType: null,
     lastCastLocalCommandAt: null,
@@ -874,6 +1137,9 @@ function reconcileCurrentCastSessionScope(session: CastSessionInstance | null) {
 
   if (currentTrackedSessionId !== nextIdentity.id) {
     resetCurrentCastSessionRuntimeState(nextIdentity);
+    castRemoteObserverState.stabilizationUntilMs =
+      Date.now() + playbackSynchronizationConfig.castRemoteObservation.stabilizationWindowMs;
+    updateCastRemoteLeadershipMode("cast_handoff", "session_started");
   } else if (
     castRuntimeSnapshot.currentCastSessionStartedAt !== nextIdentity.startedAt
   ) {
@@ -1102,6 +1368,8 @@ function resolveRemotePlaybackCommandType(input: {
 }
 
 function stopChromecastRemotePlaybackObservation(reason: string) {
+  clearPendingCastRemoteCandidate(`${reason}:stop`);
+
   if (castRemoteObserverState.controllerCleanup) {
     castRemoteObserverState.controllerCleanup();
     castRemoteObserverState.controllerCleanup = null;
@@ -1114,20 +1382,34 @@ function stopChromecastRemotePlaybackObservation(reason: string) {
 
   castRemoteObserverState.remotePlayer = null;
   castRemoteObserverState.remotePlayerController = null;
+  castRemoteObserverState.estimatedObservationDelayMs =
+    playbackSynchronizationConfig.castRemoteObservation.initialDelayMs;
+  castRemoteObserverState.leadershipMode = "idle";
   castRemoteObserverState.lastEmittedSignature = null;
+  castRemoteObserverState.lastMirroredPlayback = null;
   castRemoteObserverState.lastObservedCurrentTime = null;
   castRemoteObserverState.lastObservedSessionId = null;
   castRemoteObserverState.lastObservedSignature = null;
   castRemoteObserverState.lastObservedStatus = null;
+  castRemoteObserverState.stabilizationUntilMs = 0;
 
   updateChromecastRuntimeState({
+    castObservationDelayMs:
+      playbackSynchronizationConfig.castRemoteObservation.initialDelayMs,
+    castRemoteLeadershipMode: "idle",
+    castRemoteLeadershipReason: reason,
+    castRemoteStabilizationUntil: null,
     remotePlayerObserved: false,
     remotePlayerPollingEnabled: false,
     remotePlayerObservationReason: reason,
     lastObservedRemoteCurrentTime: null,
+    lastObservedRemoteExpectedCurrentTime: null,
     lastObservedRemotePlayerState: null,
     lastObservedRemoteIsPaused: null,
     lastAppliedRemoteStateSignature: null,
+    pendingCastRemoteSignature: null,
+    pendingCastRemoteObservedAt: null,
+    pendingCastRemoteReason: null,
   });
 }
 
@@ -1153,11 +1435,14 @@ function observeChromecastRemotePlaybackState(reason: string) {
   const sessionIdentity = currentSession
     ? getOrCreateCastSessionIdentity(currentSession)
     : null;
+  const observedAtMs = Date.now();
 
   if (!currentSession || !sessionIdentity) {
     stopChromecastRemotePlaybackObservation(reason);
     return;
   }
+
+  settleCastRemoteLeadershipMode(observedAtMs);
 
   const mediaSession =
     getCurrentCastMediaSession() ??
@@ -1196,12 +1481,24 @@ function observeChromecastRemotePlaybackState(reason: string) {
     playerState,
     isPaused,
   });
+  const observationDelayMs =
+    castRemoteObserverState.estimatedObservationDelayMs ??
+    playbackSynchronizationConfig.castRemoteObservation.initialDelayMs;
+  const expectedCurrentTime = castRemoteObserverState.lastMirroredPlayback
+    ? computeExpectedCastRemoteTimeAtObservation(
+        castRemoteObserverState.lastMirroredPlayback,
+        observedAtMs,
+        observationDelayMs,
+      )
+    : currentTime;
 
   updateChromecastRuntimeState({
+    castObservationDelayMs: observationDelayMs,
     remotePlayerObserved:
       remotePlayer != null || castRemoteObserverState.remotePlayerController != null,
     remotePlayerObservationReason: reason,
     remotePlayerObservationSessionId: sessionIdentity.id,
+    lastObservedRemoteExpectedCurrentTime: expectedCurrentTime,
     lastObservedRemoteCurrentTime: currentTime,
     lastObservedRemotePlayerState: playerState,
     lastObservedRemoteIsPaused: isPaused,
@@ -1278,36 +1575,78 @@ function observeChromecastRemotePlaybackState(reason: string) {
   });
 
   if (matchingLocalCommand) {
+    rememberCastObservationDelaySample(
+      observedAtMs - matchingLocalCommand.createdAt,
+      "recent_local_cast_command",
+    );
     castRemoteObserverState.lastEmittedSignature = nextSignature;
     updateChromecastRuntimeState({
       lastAppliedRemoteStateSignature: nextSignature,
       lastSuppressedRemoteStateSignature: nextSignature,
       lastSuppressedRemoteStateReason: "recent_local_cast_command",
     });
-    logDebugEvent({
-      level: "info",
-      category: "cast",
-      message:
-        "Suppressed a Chromecast remote event because it matched a recently mirrored local Cast command.",
-      source: "cast_local_command",
-      data: {
-        commandType,
-        currentTime,
-        matchingLocalCommand,
-        selectionSignature,
-        signature: nextSignature,
-        status,
-      },
+    rejectCastRemoteObservation("rejected_due_to_recent_local_cast_command", {
+      commandType,
+      currentTime,
+      matchingLocalCommand,
+      selectionSignature,
+      signature: nextSignature,
+      status,
     });
     return;
   }
 
-  const observedAt = new Date().toISOString();
+  if (
+    castRemoteObserverState.stabilizationUntilMs > observedAtMs ||
+    castRemoteObserverState.leadershipMode === "cast_handoff" ||
+    castRemoteObserverState.leadershipMode === "cast_leader_stabilizing"
+  ) {
+    rejectCastRemoteObservation("rejected_due_to_cast_stabilization_window", {
+      commandType,
+      currentTime,
+      expectedCurrentTime,
+      observationDelayMs,
+      signature: nextSignature,
+      status,
+      stabilizationUntil:
+        castRemoteObserverState.stabilizationUntilMs > 0
+          ? new Date(castRemoteObserverState.stabilizationUntilMs).toISOString()
+          : null,
+    });
+    return;
+  }
+
+  const plausibility = assessCastRemoteObservationPlausibility({
+    commandType,
+    expectedTime: expectedCurrentTime,
+    observedTime: currentTime,
+  });
+
+  if (castRemoteObserverState.lastMirroredPlayback && !plausibility.plausible) {
+    rejectCastRemoteObservation("rejected_due_to_implausible_remote_time", {
+      commandType,
+      currentTime,
+      expectedCurrentTime,
+      observationDelayMs,
+      driftSeconds: plausibility.driftSeconds,
+      signature: nextSignature,
+      status,
+    });
+    return;
+  }
+
+  if (castRemoteObserverState.pendingCandidate?.signature === nextSignature) {
+    return;
+  }
+
+  const observedAt = new Date(observedAtMs).toISOString();
   const event: ChromecastRemotePlaybackEvent = {
     type: commandType,
     status,
     currentTime: Math.round(currentTime * 1000) / 1000,
     playbackRate,
+    expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
+    observationDelayMs,
     observedAt,
     sessionId: sessionIdentity.id,
     contentId,
@@ -1315,19 +1654,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
     source: "cast_remote",
   };
 
-  castRemoteObserverState.lastEmittedSignature = nextSignature;
-  updateChromecastRuntimeState({
-    lastAppliedRemoteStateSignature: nextSignature,
-    lastRemoteOriginatedRoomCommand: event,
-  });
-  logDebugEvent({
-    level: "info",
-    category: "cast",
-    message: `Detected Chromecast remote ${commandType}.`,
-    source: "cast_remote",
-    data: event,
-  });
-  notifyChromecastRemotePlaybackListeners(event);
+  queuePendingCastRemoteCandidate(event, nextSignature);
 }
 
 function ensureChromecastRemotePlaybackObservation(reason: string) {
@@ -2481,6 +2808,11 @@ async function ensureRoomMediaLoadedOnChromecast(
       lastCastMediaCommand: "loadMedia:already_loaded",
       lastSuccessfulCastSessionId: sessionIdentity?.id ?? null,
     });
+    armCastRemoteStabilization(
+      "media_already_loaded",
+      playbackSynchronizationConfig.castRemoteObservation.stabilizationWindowMs,
+      "cast_leader_stabilizing",
+    );
     ensureChromecastRemotePlaybackObservation("media_already_loaded");
     clearCurrentCastSessionError();
     return existingMediaSession.mediaSession;
@@ -2748,6 +3080,11 @@ async function ensureRoomMediaLoadedOnChromecast(
       lastSuccessfulCastSessionId: sessionIdentity?.id ?? null,
       remotePlaybackState: "loaded_idle",
     });
+    armCastRemoteStabilization(
+      "media_loaded",
+      playbackSynchronizationConfig.castRemoteObservation.stabilizationWindowMs,
+      "cast_leader_stabilizing",
+    );
     ensureChromecastRemotePlaybackObservation("media_loaded");
 
     return nextMediaSession;
@@ -3138,6 +3475,15 @@ export async function syncRoomPlaybackToChromecast(
     return;
   }
 
+  rememberMirroredCastPlayback(
+    playback,
+    resolverBlockedExistingMediaSession
+      ? "resolver_blocked_existing_media_session"
+      : hadUsableMediaSession
+        ? "existing_media_session"
+        : "media_loaded_for_sync",
+  );
+
   if (
     loadRecord &&
     hadUsableMediaSession &&
@@ -3221,6 +3567,7 @@ export async function syncRoomPlaybackToChromecast(
       reloadedMediaInsteadOfControlling,
       remotePlaybackState,
     });
+    armCastRemoteStabilization("mirrored_stop");
     if (loadRecord) {
       loadRecord.lastMirroredPlaybackVersion = playback.version;
     }
@@ -3336,6 +3683,9 @@ export async function syncRoomPlaybackToChromecast(
     reloadedMediaInsteadOfControlling,
     remotePlaybackState,
   });
+  if (lastRemoteSeekCommand != null || lastRemotePlaybackCommand != null) {
+    armCastRemoteStabilization(lastCastMirrorDecision);
+  }
 
   if (loadRecord) {
     loadRecord.lastMirroredPlaybackVersion = playback.version;
@@ -3509,6 +3859,17 @@ export function useChromecastAvailability() {
               sessionErrorCode: normalizedEvent.errorCode ?? null,
             });
           } else {
+            if (
+              normalizedEvent?.sessionState === "SESSION_STARTED" ||
+              normalizedEvent?.sessionState === "SESSION_RESUMED"
+            ) {
+              armCastRemoteStabilization(
+                normalizedEvent.sessionState.toLowerCase(),
+                playbackSynchronizationConfig.castRemoteObservation
+                  .stabilizationWindowMs,
+                "cast_handoff",
+              );
+            }
             if (
               normalizedEvent?.sessionState === "SESSION_ENDED" ||
               normalizedEvent?.sessionState === "SESSION_RESUMED"

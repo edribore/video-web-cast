@@ -1,6 +1,9 @@
 import type { Server, Socket } from "socket.io";
 import { applySharedRoomControl, recordRoomJoin } from "../room-realtime";
-import type { SharedRoomControlCommand } from "../../types/room-sync";
+import type {
+  SharedRoomControlCommand,
+  SharedRoomControlSource,
+} from "../../types/room-sync";
 
 type RoomJoinPayload = {
   roomId: string;
@@ -43,7 +46,19 @@ function isSharedRoomControlCommand(
     typeof candidate.currentTime === "number" &&
     Number.isFinite(candidate.currentTime) &&
     typeof candidate.playbackRate === "number" &&
-    Number.isFinite(candidate.playbackRate)
+    Number.isFinite(candidate.playbackRate) &&
+    (candidate.commandSource == null ||
+      isSharedRoomControlSource(candidate.commandSource))
+  );
+}
+
+function isSharedRoomControlSource(
+  value: unknown,
+): value is SharedRoomControlSource {
+  return (
+    value === "local_user" ||
+    value === "cast_local_command" ||
+    value === "cast_remote"
   );
 }
 

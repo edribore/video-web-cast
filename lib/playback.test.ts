@@ -1,12 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  assessCastRemoteObservationPlausibility,
+  assessPlaybackProgressStall,
   buildAuthoritativePlaybackState,
+  estimateCastObservationDelayMs,
   isPlaybackActivelyRunning,
   playbackSynchronizationConfig,
+  resolvePlaybackReconciliationProfileKey,
   resolvePlaybackDriftCorrection,
   resolvePlaybackStartDelayMs,
   resolveSynchronizedPlaybackTime,
+  updatePlaybackSuppressionState,
 } from "./playback";
 
 test("pause convergence keeps every client anchored to the paused media time", () => {
@@ -125,4 +130,72 @@ test("post-seek suppression window blocks repeated hard seeks during media recov
 
   assert.equal(correction.kind, "smooth");
   assert.equal(correction.targetTime, null);
+});
+
+test("cast-driven mobile followers with external audio use the most tolerant reconciliation profile", () => {
+  const profileKey = resolvePlaybackReconciliationProfileKey({
+    hasExternalAudio: true,
+    isMobile: true,
+    leadershipMode: "cast_driven_local_follower",
+  });
+
+  assert.equal(profileKey, "mobile_external_audio_follower");
+});
+
+test("equivalent suppression renewals are ignored inside the renewal cooldown", () => {
+  const initialSuppression = updatePlaybackSuppressionState({
+    cause: "media_recovery",
+    durationMs: 2000,
+    nowMs: 10_000,
+    previous: null,
+    targetTime: 15,
+  });
+  const repeatedSuppression = updatePlaybackSuppressionState({
+    cause: "media_recovery",
+    durationMs: 2000,
+    nowMs: 10_400,
+    previous: initialSuppression.nextState,
+    targetTime: 15.02,
+  });
+
+  assert.equal(initialSuppression.action, "started");
+  assert.equal(repeatedSuppression.action, "ignored_equivalent");
+});
+
+test("stalled playback detection trips when time barely advances over the stall window", () => {
+  const firstSample = assessPlaybackProgressStall({
+    currentTime: 20,
+    nowMs: 5_000,
+    previousSample: null,
+  });
+  const secondSample = assessPlaybackProgressStall({
+    currentTime: 20.05,
+    nowMs:
+      5_000 + playbackSynchronizationConfig.stalledProgressWindowMs + 100,
+    previousSample: firstSample.nextSample,
+  });
+
+  assert.equal(firstSample.assessment.isStalled, false);
+  assert.equal(secondSample.assessment.isStalled, true);
+});
+
+test("cast observation delay estimates are smoothed and clamped", () => {
+  assert.equal(
+    estimateCastObservationDelayMs(null, 50),
+    playbackSynchronizationConfig.castRemoteObservation.minimumDelayMs,
+  );
+  assert.equal(
+    estimateCastObservationDelayMs(700, 1100),
+    Math.round(700 * 0.75 + 1100 * 0.25),
+  );
+});
+
+test("cast remote plausibility rejects absurd regressions to startup time", () => {
+  const plausibility = assessCastRemoteObservationPlausibility({
+    commandType: "seek",
+    expectedTime: 365,
+    observedTime: 0.7,
+  });
+
+  assert.equal(plausibility.plausible, false);
 });

@@ -14,12 +14,21 @@ import {
   type AudioTrackPlaybackSupport,
 } from "@/lib/audio-track-playback";
 import {
+  assessPlaybackProgressStall,
   createInitialPlaybackState,
+  getPlaybackReconciliationProfile,
+  hasMeaningfulPlaybackProgress,
   isPlaybackActivelyRunning,
   playbackSynchronizationConfig,
   resolvePlaybackDriftCorrection,
   resolvePlaybackStartDelayMs,
   resolveSynchronizedPlaybackTime,
+  updatePlaybackSuppressionState,
+  isPlaybackSuppressionActive,
+  type PlaybackLeadershipMode,
+  type PlaybackReconciliationProfileKey,
+  type PlaybackSuppressionCause,
+  type PlaybackSuppressionState,
 } from "@/lib/playback";
 import { useDebugRuntimeState } from "@/components/debug-runtime";
 import type { PlaybackStateSnapshot, PlaybackStatus } from "@/types/playback";
@@ -68,6 +77,8 @@ type RoomVideoPlayerProps = {
   title: string;
   roomId: string;
   videoUrl: string | null;
+  leadershipMode: PlaybackLeadershipMode;
+  reconciliationProfileKey: PlaybackReconciliationProfileKey;
   audioTracks: RoomAudioTrackSummary[];
   audioTrackSupport: Record<string, AudioTrackPlaybackSupport>;
   selectedAudioTrackId: string | null;
@@ -278,6 +289,8 @@ export const RoomVideoPlayer = forwardRef<
     title,
     roomId,
     videoUrl,
+    leadershipMode,
+    reconciliationProfileKey,
     audioTracks,
     audioTrackSupport,
     selectedAudioTrackId,
@@ -296,10 +309,17 @@ export const RoomVideoPlayer = forwardRef<
   const lastExternalAudioCorrectionAtRef = useRef(0);
   const lastLoggedCorrectionSignatureRef = useRef<string | null>(null);
   const lastHardSeekSuppressionLogAtRef = useRef(0);
+  const lastIgnoredSuppressionRenewalLogAtRef = useRef(0);
+  const lastStallRecoveryLogAtRef = useRef(0);
   const lastRoomHardSeekAtRef = useRef<number | null>(null);
+  const lastStallRecoveryAtRef = useRef<number | null>(null);
+  const playbackProgressSampleRef = useRef<{
+    currentTime: number;
+    observedAtMs: number;
+  } | null>(null);
   const requestedExternalAudioUrlRef = useRef<string | null>(null);
   const scheduledSharedStartTimerRef = useRef<number | null>(null);
-  const suppressRoomHardSeekUntilRef = useRef(0);
+  const suppressionStateRef = useRef<PlaybackSuppressionState | null>(null);
   const authoritativePlaybackRef = useRef<PlaybackStateSnapshot>(
     createInitialPlaybackState(),
   );
@@ -310,10 +330,15 @@ export const RoomVideoPlayer = forwardRef<
   const [externalAudioElementState, setExternalAudioElementState] =
     useState<ExternalAudioElementState | null>(null);
   const [externalAudioIssue, setExternalAudioIssue] = useState<string | null>(null);
+  const [suppressionDiagnostics, setSuppressionDiagnostics] =
+    useState<PlaybackSuppressionState | null>(null);
   const [authoritativePlaybackDiagnostics, setAuthoritativePlaybackDiagnostics] =
     useState<PlaybackStateSnapshot>(() => createInitialPlaybackState());
   const [roomCorrectionDiagnostics, setRoomCorrectionDiagnostics] =
     useState<RoomCorrectionDiagnostics>(null);
+  const [lastStallRecoveryAt, setLastStallRecoveryAt] = useState<number | null>(
+    null,
+  );
   const renderableSubtitleTracks = subtitleTracks.filter(
     (track) => track.isRenderable && Boolean(track.url),
   );
@@ -328,6 +353,9 @@ export const RoomVideoPlayer = forwardRef<
   const activeExternalAudioTrack = selectedExternalAudioTrackPlayable
     ? selectedExternalAudioTrack
     : null;
+  const reconciliationProfile = getPlaybackReconciliationProfile(
+    reconciliationProfileKey,
+  );
 
   const emitObservedStateChange = useEffectEvent(() => {
     onObservedStateChange(
@@ -365,32 +393,80 @@ export const RoomVideoPlayer = forwardRef<
     }
   });
 
+  const clearPlaybackSuppression = useEffectEvent((reason: string) => {
+    const activeSuppression = suppressionStateRef.current;
+
+    if (!activeSuppression) {
+      return;
+    }
+
+    suppressionStateRef.current = null;
+    setSuppressionDiagnostics(null);
+    logDebugEvent({
+      level: "info",
+      category: "sync",
+      message: "Ended a local reconciliation suppression cycle.",
+      source: "reconciliation",
+      data: {
+        reason,
+        cause: activeSuppression.cause,
+        generation: activeSuppression.generation,
+      },
+    });
+  });
+
   const armRoomHardSeekSuppression = useEffectEvent(
-    (durationMs: number, reason: string) => {
-      const nextSuppressionUntil = Date.now() + durationMs;
-      const previousSuppressionUntil = suppressRoomHardSeekUntilRef.current;
+    (
+      durationMs: number,
+      cause: PlaybackSuppressionCause,
+      targetTime?: number | null,
+    ) => {
+      const nowMs = Date.now();
+      const result = updatePlaybackSuppressionState({
+        cause,
+        durationMs,
+        nowMs,
+        previous: suppressionStateRef.current,
+        targetTime,
+      });
 
-      suppressRoomHardSeekUntilRef.current = Math.max(
-        previousSuppressionUntil,
-        nextSuppressionUntil,
-      );
+      suppressionStateRef.current = result.nextState;
+      setSuppressionDiagnostics(result.nextState);
 
-      if (
-        suppressRoomHardSeekUntilRef.current > previousSuppressionUntil + 250 &&
-        Date.now() - lastHardSeekSuppressionLogAtRef.current >= 1000
-      ) {
-        lastHardSeekSuppressionLogAtRef.current = Date.now();
+      if (result.action === "ignored_equivalent") {
+        if (nowMs - lastIgnoredSuppressionRenewalLogAtRef.current >= 1000) {
+          lastIgnoredSuppressionRenewalLogAtRef.current = nowMs;
+          logDebugEvent({
+            level: "info",
+            category: "sync",
+            message:
+              "Skipped extending the local reconciliation suppression window because the media event did not represent a meaningfully new reposition.",
+            source: "reconciliation",
+            data: {
+              cause,
+              targetTime,
+              suppressionGeneration: result.nextState.generation,
+            },
+          });
+        }
+        return;
+      }
+
+      if (nowMs - lastHardSeekSuppressionLogAtRef.current >= 750) {
+        lastHardSeekSuppressionLogAtRef.current = nowMs;
         logDebugEvent({
           level: "info",
           category: "sync",
           message:
-            "Temporarily suppressed local hard-seek reconciliation while media recovers from a recent seek or canplay sequence.",
+            result.action === "started"
+              ? "Started a local reconciliation suppression cycle after a seek/recovery event."
+              : "Renewed a local reconciliation suppression cycle because a new reposition occurred.",
           source: "reconciliation",
           data: {
-            reason,
-            suppressUntil: new Date(
-              suppressRoomHardSeekUntilRef.current,
-            ).toISOString(),
+            cause,
+            targetTime,
+            suppressionGeneration: result.nextState.generation,
+            suppressUntil: new Date(result.nextState.suppressUntilMs).toISOString(),
           },
         });
       }
@@ -447,6 +523,13 @@ export const RoomVideoPlayer = forwardRef<
         ? previousState
         : nextState,
     );
+  });
+
+  const resetPlaybackProgressSample = useEffectEvent((currentTime: number) => {
+    playbackProgressSampleRef.current = {
+      currentTime,
+      observedAtMs: Date.now(),
+    };
   });
 
   const emitLocalAudioStateChange = useEffectEvent(() => {
@@ -604,6 +687,12 @@ export const RoomVideoPlayer = forwardRef<
       applyPlaybackRateToMedia(video.playbackRate);
 
       const driftSeconds = Math.abs(audio.currentTime - video.currentTime);
+      const suppressionActive = isPlaybackSuppressionActive(
+        suppressionStateRef.current,
+      );
+      const driftCorrectionThreshold = suppressionActive
+        ? playbackSynchronizationConfig.localMediaAggressiveCorrectionThresholdSeconds
+        : playbackSynchronizationConfig.localMediaCorrectionThresholdSeconds;
       const shouldCorrectForDrift =
         !shouldLoadNewTrack &&
         !audio.seeking &&
@@ -611,7 +700,7 @@ export const RoomVideoPlayer = forwardRef<
         (options?.forceSeek ||
           (options?.allowDriftCorrection !== false &&
             driftSeconds >
-              playbackSynchronizationConfig.localMediaCorrectionThresholdSeconds &&
+              driftCorrectionThreshold &&
             Date.now() - lastExternalAudioCorrectionAtRef.current >=
               playbackSynchronizationConfig.localMediaCorrectionThrottleMs));
 
@@ -621,6 +710,7 @@ export const RoomVideoPlayer = forwardRef<
             audio.currentTime = video.currentTime;
           } else {
             video.currentTime = audio.currentTime;
+            resetPlaybackProgressSample(audio.currentTime);
           }
           lastExternalAudioCorrectionAtRef.current = Date.now();
         } catch {
@@ -716,18 +806,23 @@ export const RoomVideoPlayer = forwardRef<
     const playback = authoritativePlaybackRef.current;
     const video = videoRef.current;
     const audio = externalAudioRef.current;
+    const nowMs = Date.now();
 
     if (!video) {
       return;
     }
 
     if (playback.status !== "playing") {
+      playbackProgressSampleRef.current = null;
+      clearPlaybackSuppression("playback_not_running");
       applyPlaybackRateToMedia(playback.playbackRate);
       updateRoomCorrectionState(null);
       return;
     }
 
     if (!isPlaybackActivelyRunning(playback)) {
+      playbackProgressSampleRef.current = null;
+      clearPlaybackSuppression("awaiting_scheduled_start");
       applyPlaybackRateToMedia(playback.playbackRate);
       updateRoomCorrectionState({
         kind: "none",
@@ -758,14 +853,88 @@ export const RoomVideoPlayer = forwardRef<
       audio,
       Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
     );
+    const stallProgress = assessPlaybackProgressStall({
+      currentTime: actualTime,
+      nowMs,
+      previousSample: playbackProgressSampleRef.current,
+    });
+    playbackProgressSampleRef.current = stallProgress.nextSample;
+
+    if (
+      suppressionStateRef.current &&
+      hasMeaningfulPlaybackProgress(stallProgress.assessment) &&
+      !video.seeking &&
+      !audio?.seeking
+    ) {
+      clearPlaybackSuppression("playback_progressed");
+    }
+
+    if (stallProgress.assessment.isStalled) {
+      const stallRecoveryCoolingDown =
+        lastStallRecoveryAtRef.current != null &&
+        nowMs - lastStallRecoveryAtRef.current <
+          playbackSynchronizationConfig.stallRecoveryCooldownMs;
+
+      if (stallRecoveryCoolingDown) {
+        if (nowMs - lastStallRecoveryLogAtRef.current >= 1500) {
+          lastStallRecoveryLogAtRef.current = nowMs;
+          logDebugEvent({
+            level: "info",
+            category: "sync",
+            message:
+              "Detected stalled local playback, but skipped recovery because the last stall recovery is still cooling down.",
+            source: "reconciliation",
+            data: {
+              leadershipMode,
+              reconciliationProfileKey,
+              stallAssessment: stallProgress.assessment,
+            },
+          });
+        }
+      } else {
+        lastStallRecoveryAtRef.current = nowMs;
+        setLastStallRecoveryAt(nowMs);
+        lastRoomHardSeekAtRef.current = nowMs;
+        video.currentTime = expectedTime;
+        resetPlaybackProgressSample(expectedTime);
+        armRoomHardSeekSuppression(
+          reconciliationProfile.postSeekHardSeekSuppressionMs,
+          "stall_recovery",
+          expectedTime,
+        );
+        await synchronizeExternalAudioWithVideo({
+          attemptPlayback: true,
+          forceSeek: true,
+          publishDiagnostics: true,
+        });
+        applyPlaybackRateToMedia(playback.playbackRate);
+        logDebugEvent({
+          level: "warn",
+          category: "sync",
+          message:
+            "Detected stalled local playback progression and performed one controlled recovery from the authoritative room anchor.",
+          source: "reconciliation",
+          data: {
+            leadershipMode,
+            reconciliationProfileKey,
+            expectedTime,
+            actualTime,
+            stallAssessment: stallProgress.assessment,
+          },
+        });
+        emitObservedStateChange();
+        return;
+      }
+    }
+
     const correction = resolvePlaybackDriftCorrection({
       actualTime,
       basePlaybackRate: playback.playbackRate,
       expectedTime,
       lastHardSeekAtMs: lastRoomHardSeekAtRef.current,
-      nowMs: Date.now(),
-      profile: playbackSynchronizationConfig.roomFollowerReconciliationProfile,
-      suppressHardSeekUntilMs: suppressRoomHardSeekUntilRef.current,
+      nowMs,
+      profile: reconciliationProfile,
+      suppressHardSeekUntilMs: suppressionStateRef.current?.suppressUntilMs ?? null,
     });
 
     updateRoomCorrectionState({
@@ -779,11 +948,12 @@ export const RoomVideoPlayer = forwardRef<
 
     if (correction.kind === "hard_seek" && correction.targetTime != null) {
       video.currentTime = correction.targetTime;
-      lastRoomHardSeekAtRef.current = Date.now();
+      resetPlaybackProgressSample(correction.targetTime);
+      lastRoomHardSeekAtRef.current = nowMs;
       armRoomHardSeekSuppression(
-        playbackSynchronizationConfig.roomFollowerReconciliationProfile
-          .postSeekHardSeekSuppressionMs,
+        reconciliationProfile.postSeekHardSeekSuppressionMs,
         "room_hard_seek",
+        correction.targetTime,
       );
       await synchronizeExternalAudioWithVideo({
         attemptPlayback: true,
@@ -897,6 +1067,12 @@ export const RoomVideoPlayer = forwardRef<
     authoritativePlaybackActive: isPlaybackActivelyRunning(
       authoritativePlaybackDiagnostics,
     ),
+    leadershipMode,
+    reconciliationProfileKey,
+    reconciliationProfile,
+    suppressionState: suppressionDiagnostics,
+    stallRecoveryCooldownMs: playbackSynchronizationConfig.stallRecoveryCooldownMs,
+    lastStallRecoveryAt,
     roomCorrectionDiagnostics,
     lastMediaEvent,
     lastAudioEvent,
@@ -988,9 +1164,9 @@ export const RoomVideoPlayer = forwardRef<
     const handleSeeked = () => {
       updateLastMediaEvent("seeked");
       armRoomHardSeekSuppression(
-        playbackSynchronizationConfig.roomFollowerReconciliationProfile
-          .postSeekHardSeekSuppressionMs,
-        "video_seeked_event",
+        reconciliationProfile.postSeekHardSeekSuppressionMs,
+        "media_recovery",
+        video.currentTime,
       );
       emitObservedStateChange();
       void synchronizeExternalAudioWithVideo({
@@ -1002,9 +1178,9 @@ export const RoomVideoPlayer = forwardRef<
     const handleLoadedMetadata = () => {
       updateLastMediaEvent("loadedmetadata");
       armRoomHardSeekSuppression(
-        playbackSynchronizationConfig.roomFollowerReconciliationProfile
-          .postCanPlayHardSeekSuppressionMs,
-        "video_loadedmetadata_event",
+        reconciliationProfile.postCanPlayHardSeekSuppressionMs,
+        "media_recovery",
+        video.currentTime,
       );
       emitObservedStateChange();
       void synchronizeExternalAudioWithVideo({
@@ -1032,9 +1208,9 @@ export const RoomVideoPlayer = forwardRef<
     const handleAudioLoadedMetadata = () => {
       updateLastAudioEvent("loadedmetadata");
       armRoomHardSeekSuppression(
-        playbackSynchronizationConfig.roomFollowerReconciliationProfile
-          .postCanPlayHardSeekSuppressionMs,
-        "audio_loadedmetadata_event",
+        reconciliationProfile.postCanPlayHardSeekSuppressionMs,
+        "media_recovery",
+        audio.currentTime,
       );
       void synchronizeExternalAudioWithVideo({
         attemptPlayback: !video.paused,
@@ -1046,9 +1222,9 @@ export const RoomVideoPlayer = forwardRef<
     const handleAudioCanPlay = () => {
       updateLastAudioEvent("canplay");
       armRoomHardSeekSuppression(
-        playbackSynchronizationConfig.roomFollowerReconciliationProfile
-          .postCanPlayHardSeekSuppressionMs,
-        "audio_canplay_event",
+        reconciliationProfile.postCanPlayHardSeekSuppressionMs,
+        "media_recovery",
+        audio.currentTime,
       );
       void synchronizeExternalAudioWithVideo({
         attemptPlayback: !video.paused,
@@ -1070,9 +1246,9 @@ export const RoomVideoPlayer = forwardRef<
     const handleAudioSeeked = () => {
       updateLastAudioEvent("seeked");
       armRoomHardSeekSuppression(
-        playbackSynchronizationConfig.roomFollowerReconciliationProfile
-          .postSeekHardSeekSuppressionMs,
-        "audio_seeked_event",
+        reconciliationProfile.postSeekHardSeekSuppressionMs,
+        "media_recovery",
+        audio.currentTime,
       );
       publishMediaDiagnostics();
     };
@@ -1124,7 +1300,7 @@ export const RoomVideoPlayer = forwardRef<
       audio.removeEventListener("ratechange", handleAudioRateChange);
       audio.removeEventListener("error", handleAudioError);
     };
-  }, []);
+  }, [reconciliationProfile]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -1136,6 +1312,20 @@ export const RoomVideoPlayer = forwardRef<
       clearScheduledSharedStart();
     };
   }, []);
+
+  useEffect(() => {
+    logDebugEvent({
+      level: "info",
+      category: "sync",
+      message: "Selected the local room reconciliation profile.",
+      source: "system",
+      data: {
+        leadershipMode,
+        reconciliationProfileKey,
+        reconciliationProfile,
+      },
+    });
+  }, [leadershipMode, reconciliationProfile, reconciliationProfileKey]);
 
   useImperativeHandle(
     ref,
@@ -1184,10 +1374,11 @@ export const RoomVideoPlayer = forwardRef<
         clearScheduledSharedStart();
         video.pause();
         video.currentTime = 0;
+        resetPlaybackProgressSample(0);
         armRoomHardSeekSuppression(
-          playbackSynchronizationConfig.roomFollowerReconciliationProfile
-            .postSeekHardSeekSuppressionMs,
-          "local_stop_seek",
+          reconciliationProfile.postSeekHardSeekSuppressionMs,
+          "local_user_seek",
+          0,
         );
         applyPlaybackRateToMedia(playbackRate);
         void synchronizeExternalAudioWithVideo({
@@ -1211,10 +1402,11 @@ export const RoomVideoPlayer = forwardRef<
         }
 
         video.currentTime = normalizeSeekTarget(video, deltaSeconds);
+        resetPlaybackProgressSample(video.currentTime);
         armRoomHardSeekSuppression(
-          playbackSynchronizationConfig.roomFollowerReconciliationProfile
-            .postSeekHardSeekSuppressionMs,
-          "local_seek",
+          reconciliationProfile.postSeekHardSeekSuppressionMs,
+          "local_user_seek",
+          video.currentTime,
         );
         void synchronizeExternalAudioWithVideo({
           forceSeek: true,
@@ -1258,10 +1450,11 @@ export const RoomVideoPlayer = forwardRef<
             pauseConvergenceThresholdSeconds
         ) {
           video.currentTime = nextCurrentTime;
+          resetPlaybackProgressSample(nextCurrentTime);
           armRoomHardSeekSuppression(
-            playbackSynchronizationConfig.roomFollowerReconciliationProfile
-              .postSeekHardSeekSuppressionMs,
-            "authoritative_seek",
+            reconciliationProfile.postSeekHardSeekSuppressionMs,
+            "authoritative_reposition",
+            nextCurrentTime,
           );
         }
 
@@ -1324,7 +1517,12 @@ export const RoomVideoPlayer = forwardRef<
         );
       },
     }),
-    [activeExternalAudioTrack, playbackRate, suppressLocalAudioOutput],
+    [
+      activeExternalAudioTrack,
+      playbackRate,
+      reconciliationProfile,
+      suppressLocalAudioOutput,
+    ],
   );
 
   return (

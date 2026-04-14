@@ -17,6 +17,10 @@ export const sharedRoomControlTypes = [
 
 export type RoomSyncEventType = (typeof roomSyncEventTypes)[number];
 export type SharedRoomControlType = (typeof sharedRoomControlTypes)[number];
+export type SharedRoomControlSource =
+  | "local_user"
+  | "cast_local_command"
+  | "cast_remote";
 
 type BaseRoomSyncEvent = {
   roomId: string;
@@ -30,6 +34,7 @@ type BaseRoomSyncEvent = {
   scheduledStartWallClockMs: number | null;
   playbackRate: number;
   sourceClientEventId: string | null;
+  commandSource: SharedRoomControlSource | null;
 };
 
 export type JoinRoomSyncEvent = BaseRoomSyncEvent & {
@@ -52,6 +57,7 @@ export type SharedRoomControlCommand = {
   status: PlaybackStatus;
   currentTime: number;
   playbackRate: number;
+  commandSource?: SharedRoomControlSource | null;
 };
 
 export type RoomSocketHydrationPayload = {

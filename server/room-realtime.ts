@@ -16,6 +16,7 @@ import type {
   RoomSocketPlaybackSyncPayload,
   RoomSyncEvent,
   SharedRoomControlCommand,
+  SharedRoomControlSource,
 } from "../types/room-sync";
 import type { PlaybackStateSnapshot, PlaybackStatus } from "../types/playback";
 
@@ -114,6 +115,10 @@ function toRoomSyncEvent(
     typeof payload?.sourceClientEventId === "string"
       ? payload.sourceClientEventId
       : null;
+  const commandSource =
+    typeof payload?.commandSource === "string"
+      ? (payload.commandSource as SharedRoomControlSource)
+      : null;
 
   return {
     roomId,
@@ -128,16 +133,21 @@ function toRoomSyncEvent(
     scheduledStartWallClockMs,
     playbackRate,
     sourceClientEventId,
+    commandSource,
   };
 }
 
-function buildPlaybackEventPayload(playback: PlaybackStateSnapshot) {
+function buildPlaybackEventPayload(
+  playback: PlaybackStateSnapshot,
+  commandSource: SharedRoomControlSource | null = null,
+) {
   return {
     status: playback.status,
     anchorMediaTime: playback.anchorMediaTime,
     anchorWallClockMs: playback.anchorWallClockMs,
     scheduledStartWallClockMs: playback.scheduledStartWallClockMs,
     sourceClientEventId: playback.sourceClientEventId,
+    commandSource,
   };
 }
 
@@ -211,7 +221,7 @@ export async function recordRoomJoin(
         currentTime: resolveSynchronizedPlaybackTime(playback, Date.now()),
         playbackRate: playback.playbackRate,
         playbackVersion: playback.version,
-        payload: buildPlaybackEventPayload(playback),
+        payload: buildPlaybackEventPayload(playback, null),
       },
     });
 
@@ -296,7 +306,10 @@ export async function applySharedRoomControl(
         currentTime: playbackSnapshot.anchorMediaTime,
         playbackRate: playbackSnapshot.playbackRate,
         playbackVersion: playbackSnapshot.version,
-        payload: buildPlaybackEventPayload(playbackSnapshot),
+        payload: buildPlaybackEventPayload(
+          playbackSnapshot,
+          command.commandSource ?? null,
+        ),
       },
     });
 
