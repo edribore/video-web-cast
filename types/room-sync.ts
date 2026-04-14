@@ -23,18 +23,21 @@ type BaseRoomSyncEvent = {
   actorSessionId: string | null;
   occurredAt: string;
   version: number;
+  status: PlaybackStatus;
+  currentTime: number;
+  anchorMediaTime: number;
+  anchorWallClockMs: number;
+  scheduledStartWallClockMs: number | null;
+  playbackRate: number;
+  sourceClientEventId: string | null;
 };
 
 export type JoinRoomSyncEvent = BaseRoomSyncEvent & {
   type: "join";
-  currentTime: number;
-  playbackRate: number;
 };
 
 export type SharedPlaybackRoomSyncEvent = BaseRoomSyncEvent & {
   type: SharedRoomControlType;
-  currentTime: number;
-  playbackRate: number;
 };
 
 export type RoomSyncEvent =

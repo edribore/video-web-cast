@@ -33,12 +33,17 @@ function isSharedRoomControlCommand(
 
   return (
     typeof candidate.roomId === "string" &&
+    candidate.roomId.trim().length > 0 &&
     typeof candidate.actorSessionId === "string" &&
+    candidate.actorSessionId.trim().length > 0 &&
     typeof candidate.clientEventId === "string" &&
+    candidate.clientEventId.trim().length > 0 &&
     typeof candidate.type === "string" &&
     typeof candidate.status === "string" &&
     typeof candidate.currentTime === "number" &&
-    typeof candidate.playbackRate === "number"
+    Number.isFinite(candidate.currentTime) &&
+    typeof candidate.playbackRate === "number" &&
+    Number.isFinite(candidate.playbackRate)
   );
 }
 

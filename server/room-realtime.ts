@@ -3,8 +3,12 @@ import type {
   RoomPlaybackState as PrismaRoomPlaybackState,
 } from "../app/generated/prisma/client";
 import {
+  buildAuthoritativePlaybackState,
+  clampPlaybackRate,
   createInitialPlaybackState,
   resolveSynchronizedPlaybackTime,
+  roundPlaybackSeconds,
+  roundWallClockMs,
 } from "../lib/playback";
 import { getPrismaClient } from "./prisma";
 import type {
@@ -13,38 +17,103 @@ import type {
   RoomSyncEvent,
   SharedRoomControlCommand,
 } from "../types/room-sync";
-
-function clampPlaybackRate(playbackRate: number) {
-  return Math.min(Math.max(playbackRate, 0.25), 3);
-}
+import type { PlaybackStateSnapshot, PlaybackStatus } from "../types/playback";
 
 function normalizeCurrentTime(currentTime: number) {
-  return Math.max(0, Math.round(currentTime * 1000) / 1000);
+  return roundPlaybackSeconds(currentTime);
+}
+
+function resolveEventStatus(
+  eventType: PrismaRoomEvent["type"],
+  fallbackStatus: PlaybackStatus,
+) {
+  switch (eventType) {
+    case "play":
+      return "playing";
+    case "pause":
+      return "paused";
+    case "stop":
+      return "stopped";
+    case "seek":
+    case "join":
+    default:
+      return fallbackStatus;
+  }
+}
+
+function parseEventPayload(event: PrismaRoomEvent | null) {
+  if (!event?.payload || typeof event.payload !== "object") {
+    return null;
+  }
+
+  return event.payload as Record<string, unknown>;
 }
 
 function toPlaybackSnapshot(
   playbackState: PrismaRoomPlaybackState | null,
-) {
+): PlaybackStateSnapshot {
   if (!playbackState) {
     return createInitialPlaybackState();
   }
 
-  return createInitialPlaybackState({
+  const updatedAtWallClockMs = playbackState.updatedAt.getTime();
+  const basePlayback = createInitialPlaybackState({
     status: playbackState.status,
     currentTime: playbackState.currentTime,
+    anchorMediaTime: playbackState.anchorMediaTime,
+    anchorWallClockMs:
+      playbackState.anchorWallClockMs > 0
+        ? playbackState.anchorWallClockMs
+        : updatedAtWallClockMs,
+    scheduledStartWallClockMs: playbackState.scheduledStartWallClockMs,
     playbackRate: playbackState.playbackRate,
     version: playbackState.version,
     updatedAt: playbackState.updatedAt.toISOString(),
+    sourceClientEventId: playbackState.sourceClientEventId,
   });
+
+  return {
+    ...basePlayback,
+    currentTime: resolveSynchronizedPlaybackTime(basePlayback, Date.now()),
+  };
 }
 
 function toRoomSyncEvent(
   roomId: string,
   event: PrismaRoomEvent | null,
+  fallbackPlayback: PlaybackStateSnapshot,
 ): RoomSyncEvent | null {
   if (!event || event.playbackVersion == null) {
     return null;
   }
+
+  const payload = parseEventPayload(event);
+  const anchorMediaTime =
+    typeof payload?.anchorMediaTime === "number"
+      ? roundPlaybackSeconds(payload.anchorMediaTime)
+      : normalizeCurrentTime(event.currentTime ?? fallbackPlayback.anchorMediaTime);
+  const anchorWallClockMs =
+    typeof payload?.anchorWallClockMs === "number"
+      ? roundWallClockMs(payload.anchorWallClockMs)
+      : event.createdAt.getTime();
+  const status =
+    typeof payload?.status === "string"
+      ? (payload.status as PlaybackStatus)
+      : resolveEventStatus(event.type, fallbackPlayback.status);
+  const scheduledStartWallClockMs =
+    typeof payload?.scheduledStartWallClockMs === "number"
+      ? roundWallClockMs(payload.scheduledStartWallClockMs)
+      : status === "playing"
+        ? anchorWallClockMs
+        : null;
+  const playbackRate =
+    typeof event.playbackRate === "number"
+      ? clampPlaybackRate(event.playbackRate)
+      : fallbackPlayback.playbackRate;
+  const sourceClientEventId =
+    typeof payload?.sourceClientEventId === "string"
+      ? payload.sourceClientEventId
+      : null;
 
   return {
     roomId,
@@ -52,8 +121,23 @@ function toRoomSyncEvent(
     actorSessionId: event.actorSessionId,
     occurredAt: event.createdAt.toISOString(),
     version: event.playbackVersion,
-    currentTime: event.currentTime ?? 0,
-    playbackRate: event.playbackRate ?? 1,
+    status,
+    currentTime: normalizeCurrentTime(event.currentTime ?? anchorMediaTime),
+    anchorMediaTime,
+    anchorWallClockMs,
+    scheduledStartWallClockMs,
+    playbackRate,
+    sourceClientEventId,
+  };
+}
+
+function buildPlaybackEventPayload(playback: PlaybackStateSnapshot) {
+  return {
+    status: playback.status,
+    anchorMediaTime: playback.anchorMediaTime,
+    anchorWallClockMs: playback.anchorWallClockMs,
+    scheduledStartWallClockMs: playback.scheduledStartWallClockMs,
+    sourceClientEventId: playback.sourceClientEventId,
   };
 }
 
@@ -81,9 +165,11 @@ export async function getRoomRealtimeSnapshot(
     return null;
   }
 
+  const playback = toPlaybackSnapshot(room.playbackState);
+
   return {
-    playback: toPlaybackSnapshot(room.playbackState),
-    lastEvent: toRoomSyncEvent(publicRoomId, room.events[0] ?? null),
+    playback,
+    lastEvent: toRoomSyncEvent(publicRoomId, room.events[0] ?? null, playback),
   };
 }
 
@@ -113,6 +199,7 @@ export async function recordRoomJoin(
       (await tx.roomPlaybackState.create({
         data: {
           roomId: room.id,
+          anchorWallClockMs: Date.now(),
         },
       }));
     const playback = toPlaybackSnapshot(playbackState);
@@ -121,15 +208,16 @@ export async function recordRoomJoin(
         roomId: room.id,
         type: "join",
         actorSessionId,
-        currentTime: resolveSynchronizedPlaybackTime(playback),
+        currentTime: resolveSynchronizedPlaybackTime(playback, Date.now()),
         playbackRate: playback.playbackRate,
         playbackVersion: playback.version,
+        payload: buildPlaybackEventPayload(playback),
       },
     });
 
     return {
       playback,
-      lastEvent: toRoomSyncEvent(publicRoomId, joinEvent),
+      lastEvent: toRoomSyncEvent(publicRoomId, joinEvent, playback),
     };
   });
 }
@@ -146,6 +234,11 @@ export async function applySharedRoomControl(
       },
       select: {
         id: true,
+        playbackState: {
+          select: {
+            version: true,
+          },
+        },
       },
     });
 
@@ -153,17 +246,17 @@ export async function applySharedRoomControl(
       return null;
     }
 
-    const nextStatus =
-      command.type === "stop"
-        ? "stopped"
-        : command.type === "play"
-          ? "playing"
-          : command.type === "pause"
-            ? "paused"
-            : command.status;
-    const nextCurrentTime =
-      command.type === "stop" ? 0 : normalizeCurrentTime(command.currentTime);
-    const nextPlaybackRate = clampPlaybackRate(command.playbackRate);
+    const nowWallClockMs = Date.now();
+    const nextPlayback = buildAuthoritativePlaybackState({
+      clientEventId: command.clientEventId,
+      currentTime:
+        command.type === "stop" ? 0 : normalizeCurrentTime(command.currentTime),
+      nowWallClockMs,
+      playbackRate: command.playbackRate,
+      status: command.status,
+      type: command.type,
+      version: room.playbackState ? room.playbackState.version + 1 : 1,
+    });
 
     const playbackState = await tx.roomPlaybackState.upsert({
       where: {
@@ -171,37 +264,45 @@ export async function applySharedRoomControl(
       },
       create: {
         roomId: room.id,
-        status: nextStatus,
-        currentTime: nextCurrentTime,
-        playbackRate: nextPlaybackRate,
+        status: nextPlayback.status,
+        currentTime: nextPlayback.anchorMediaTime,
+        anchorMediaTime: nextPlayback.anchorMediaTime,
+        anchorWallClockMs: nextPlayback.anchorWallClockMs,
+        scheduledStartWallClockMs: nextPlayback.scheduledStartWallClockMs,
+        playbackRate: nextPlayback.playbackRate,
+        sourceClientEventId: nextPlayback.sourceClientEventId,
+        version: nextPlayback.version,
       },
       update: {
-        status: nextStatus,
-        currentTime: nextCurrentTime,
-        playbackRate: nextPlaybackRate,
+        status: nextPlayback.status,
+        currentTime: nextPlayback.anchorMediaTime,
+        anchorMediaTime: nextPlayback.anchorMediaTime,
+        anchorWallClockMs: nextPlayback.anchorWallClockMs,
+        scheduledStartWallClockMs: nextPlayback.scheduledStartWallClockMs,
+        playbackRate: nextPlayback.playbackRate,
+        sourceClientEventId: nextPlayback.sourceClientEventId,
         version: {
           increment: 1,
         },
       },
     });
 
+    const playbackSnapshot = toPlaybackSnapshot(playbackState);
     const roomEvent = await tx.roomEvent.create({
       data: {
         roomId: room.id,
         type: command.type,
         actorSessionId: command.actorSessionId,
-        currentTime: playbackState.currentTime,
-        playbackRate: playbackState.playbackRate,
-        playbackVersion: playbackState.version,
-        payload: {
-          clientEventId: command.clientEventId,
-        },
+        currentTime: playbackSnapshot.anchorMediaTime,
+        playbackRate: playbackSnapshot.playbackRate,
+        playbackVersion: playbackSnapshot.version,
+        payload: buildPlaybackEventPayload(playbackSnapshot),
       },
     });
 
     return {
-      playback: toPlaybackSnapshot(playbackState),
-      event: toRoomSyncEvent(command.roomId, roomEvent)!,
+      playback: playbackSnapshot,
+      event: toRoomSyncEvent(command.roomId, roomEvent, playbackSnapshot)!,
       sourceClientEventId: command.clientEventId,
     };
   });

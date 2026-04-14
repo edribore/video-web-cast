@@ -3,7 +3,11 @@
 import { useEffect, useState } from "react";
 import { logDebugEvent, setDebugRuntimeState } from "@/lib/debug-store";
 import { isCastableAbsoluteUrl } from "@/lib/public-origin";
-import { resolveSynchronizedPlaybackTime } from "@/lib/playback";
+import {
+  isPlaybackActivelyRunning,
+  resolvePlaybackStartDelayMs,
+  resolveSynchronizedPlaybackTime,
+} from "@/lib/playback";
 import type {
   CastResolvedMediaFailurePayload,
   CastResolvedMediaResponse,
@@ -3239,6 +3243,8 @@ export async function syncRoomPlaybackToChromecast(
     return;
   }
 
+  const playbackShouldBeRunningNow = isPlaybackActivelyRunning(playback);
+  const scheduledPlaybackStartDelayMs = resolvePlaybackStartDelayMs(playback);
   const nextCurrentTime = resolveSynchronizedPlaybackTime(playback);
   const currentEstimatedTime = mediaSession.getEstimatedTime?.() ?? 0;
 
@@ -3262,7 +3268,7 @@ export async function syncRoomPlaybackToChromecast(
       : "applied_initial_seek_after_load";
   }
 
-  if (playback.status === "playing") {
+  if (playback.status === "playing" && playbackShouldBeRunningNow) {
     await castCommandAsPromise((resolve, reject) => {
       mediaSession.play(new chromeCastMedia.PlayRequest(), resolve, reject);
     });
@@ -3290,10 +3296,14 @@ export async function syncRoomPlaybackToChromecast(
       selectionSignature: resolvedMedia?.selectionSignature ?? null,
     });
     lastRemotePlaybackCommand = "pause";
-    lastCastMirrorDecision = hadUsableMediaSession
-      ? "mirrored_pause"
-      : "applied_initial_pause_after_load";
-    remotePlaybackState = "paused";
+    lastCastMirrorDecision = playbackShouldBeRunningNow
+      ? hadUsableMediaSession
+        ? "mirrored_pause"
+        : "applied_initial_pause_after_load"
+      : hadUsableMediaSession
+        ? "prepared_scheduled_play"
+        : "prepared_initial_scheduled_play_after_load";
+    remotePlaybackState = playbackShouldBeRunningNow ? "paused" : "scheduled";
   }
 
   updateChromecastRuntimeState({
@@ -3302,6 +3312,9 @@ export async function syncRoomPlaybackToChromecast(
     lastCastMediaCommand:
       lastRemotePlaybackCommand ?? (lastRemoteSeekCommand != null ? "seek" : "loadMedia"),
     lastCastSeekTime: lastRemoteSeekCommand,
+    authoritativeAnchorMediaTime: playback.anchorMediaTime,
+    authoritativeAnchorWallClockMs: playback.anchorWallClockMs,
+    scheduledPlaybackStartDelayMs,
     lastCastMirrorDecision,
     mediaLoadStatus: resolverBlockedExistingMediaSession
       ? "blocked_using_existing_media"
@@ -3334,13 +3347,19 @@ export async function syncRoomPlaybackToChromecast(
     message: resolverBlockedExistingMediaSession
       ? `Kept the existing Chromecast media in sync while the requested ${selectedAudioTrackId ? "audio" : "media"} selection stayed blocked.`
       : initialCastStateAppliedAfterLoad
-        ? `Applied the initial shared ${playback.status} state to Chromecast after media load.`
-        : `Mirrored shared ${playback.status} playback to Chromecast.`,
+        ? playbackShouldBeRunningNow
+          ? `Applied the initial shared ${playback.status} state to Chromecast after media load.`
+          : "Prepared Chromecast at the shared start position and paused until the authoritative room start time."
+        : playbackShouldBeRunningNow
+          ? `Mirrored shared ${playback.status} playback to Chromecast.`
+          : "Prepared Chromecast for a scheduled shared room start.",
     source: "cast_local_command",
     data: {
       status: playback.status,
       currentTime: nextCurrentTime,
       playbackRate: playback.playbackRate,
+      playbackShouldBeRunningNow,
+      scheduledPlaybackStartDelayMs,
       selectedAudioTrackId,
       selectedSubtitleTrackId,
       initialCastStateAppliedAfterLoad,

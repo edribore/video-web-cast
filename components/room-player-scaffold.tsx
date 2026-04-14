@@ -27,8 +27,9 @@ import { CatalogMoviePoster } from "@/components/catalog-movie-poster";
 import { createSafeId } from "@/lib/create-safe-id";
 import {
   formatPlaybackSeconds,
+  isPlaybackActivelyRunning,
   resolveSynchronizedPlaybackTime,
-  syncObservedPlayback,
+  resolvePlaybackStartDelayMs,
 } from "@/lib/playback";
 import { getOrCreateParticipantSessionId } from "@/lib/participant-session";
 import { logDebugEvent, setDebugLastActionSource } from "@/lib/debug-store";
@@ -62,12 +63,14 @@ type RoomActionSource =
   | "socket_echo"
   | "cast_remote"
   | "cast_local_command"
+  | "reconciliation"
   | "hydration"
   | "cast"
   | "system";
 
 type RoomPlayerState = {
   playback: PlaybackStateSnapshot;
+  observedPlayback: RoomVideoPlayerSnapshot | null;
   lastEvent: RoomSyncEvent | null;
   connectionStatus: RoomConnectionStatus;
   syncIssue: string | null;
@@ -217,16 +220,13 @@ function reducer(state: RoomPlayerState, action: RoomPlayerAction): RoomPlayerSt
     case "video_observed":
       return {
         ...state,
-        playback: syncObservedPlayback(state.playback, {
-          status: action.snapshot.status,
-          currentTime: action.snapshot.currentTime,
-          playbackRate: action.snapshot.playbackRate,
-        }),
+        observedPlayback: action.snapshot,
       };
     case "room_hydrated":
       return {
         ...state,
         playback: action.payload.playback,
+        observedPlayback: state.observedPlayback,
         lastEvent: action.payload.lastEvent,
         syncIssue: null,
         lastActionSource: action.source,
@@ -235,6 +235,7 @@ function reducer(state: RoomPlayerState, action: RoomPlayerAction): RoomPlayerSt
       return {
         ...state,
         playback: action.payload.playback,
+        observedPlayback: state.observedPlayback,
         lastEvent: action.payload.event,
         syncIssue: null,
         lastActionSource: action.source,
@@ -349,6 +350,7 @@ function areLocalAudioStatesEqual(
 export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   const [state, dispatch] = useReducer(reducer, {
     playback: snapshot.playback,
+    observedPlayback: null,
     lastEvent: snapshot.lastEvent,
     connectionStatus: "connecting" as RoomConnectionStatus,
     syncIssue: null,
@@ -372,6 +374,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   const authoritativePlaybackRef = useRef(snapshot.playback);
   const participantPreferencesRef = useRef(participantPreferences);
   const castStatusRef = useRef<ChromecastAvailabilityStatus>("unavailable");
+  const scheduledCastPlaybackTimerRef = useRef<number | null>(null);
   const {
     castStatus,
     castIssue,
@@ -472,6 +475,19 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           issue: null,
         }
       : localAudioState;
+  const resolvedAuthoritativeCurrentTime = resolveSynchronizedPlaybackTime(
+    state.playback,
+  );
+  const playbackAwaitingScheduledStart =
+    state.playback.status === "playing" &&
+    !isPlaybackActivelyRunning(state.playback);
+
+  const clearScheduledCastPlaybackTimer = useEffectEvent(() => {
+    if (scheduledCastPlaybackTimerRef.current != null) {
+      window.clearTimeout(scheduledCastPlaybackTimerRef.current);
+      scheduledCastPlaybackTimerRef.current = null;
+    }
+  });
 
   useDebugFeatureFlags({
     localPlaybackEnabled: true,
@@ -492,7 +508,16 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     participantSessionId,
     connectionStatus: state.connectionStatus,
     playback: state.playback,
+    resolvedAuthoritativeCurrentTime,
+    playbackAwaitingScheduledStart,
     playbackVersion: state.playback.version,
+    playbackAnchor: {
+      anchorMediaTime: state.playback.anchorMediaTime,
+      anchorWallClockMs: state.playback.anchorWallClockMs,
+      scheduledStartWallClockMs: state.playback.scheduledStartWallClockMs,
+      sourceClientEventId: state.playback.sourceClientEventId,
+    },
+    observedPlayback: state.observedPlayback,
     lastEvent: state.lastEvent,
     syncIssue: state.syncIssue,
     participantPreferences,
@@ -533,6 +558,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
 
       if (castStatusRef.current === "connected") {
         try {
+          clearScheduledCastPlaybackTimer();
           await syncRoomPlaybackToChromecast(
             snapshot.roomId,
             snapshot.media,
@@ -540,6 +566,30 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
             participantPreferencesRef.current.selectedAudioTrackId,
             participantPreferencesRef.current.selectedSubtitleTrackId,
           );
+
+          const scheduledCastStartDelayMs = resolvePlaybackStartDelayMs(playback);
+
+          if (scheduledCastStartDelayMs > 0) {
+            scheduledCastPlaybackTimerRef.current = window.setTimeout(() => {
+              scheduledCastPlaybackTimerRef.current = null;
+              void syncRoomPlaybackToChromecast(
+                snapshot.roomId,
+                snapshot.media,
+                authoritativePlaybackRef.current,
+                participantPreferencesRef.current.selectedAudioTrackId,
+                participantPreferencesRef.current.selectedSubtitleTrackId,
+              ).catch((error) => {
+                logDebugEvent({
+                  level: "error",
+                  category: "cast",
+                  message:
+                    "Chromecast could not apply the scheduled shared playback start.",
+                  source,
+                  data: error,
+                });
+              });
+            }, scheduledCastStartDelayMs);
+          }
         } catch (error) {
           const message = "Room playback updated, but Chromecast could not mirror it.";
           logDebugEvent({
@@ -605,6 +655,52 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     return true;
   }
 
+  function getCurrentPlaybackCommandSnapshot() {
+    const player = playerRef.current;
+
+    if (player) {
+      return player.getSnapshot();
+    }
+
+    return (
+      state.observedPlayback ?? {
+        currentTime: resolvedAuthoritativeCurrentTime,
+        videoCurrentTime: resolvedAuthoritativeCurrentTime,
+        audibleCurrentTime: null,
+        avDriftSeconds: null,
+        playbackRate: state.playback.playbackRate,
+        status: state.playback.status,
+      }
+    );
+  }
+
+  async function applyLocalPlaybackIntent(
+    type: SharedRoomControlType,
+    options?: {
+      deltaSeconds?: number;
+    },
+  ) {
+    const player = playerRef.current;
+
+    if (!player) {
+      return null;
+    }
+
+    if (type === "play") {
+      return player.play();
+    }
+
+    if (type === "pause") {
+      return player.pause();
+    }
+
+    if (type === "stop") {
+      return player.stop();
+    }
+
+    return player.seekBy(options?.deltaSeconds ?? 0);
+  }
+
   async function dispatchSharedCommand(
     type: SharedRoomControlType,
     options?: {
@@ -614,6 +710,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     const player = playerRef.current;
     const commandSource: RoomActionSource =
       playbackTarget === "cast" ? "cast_local_command" : "local_user";
+    const socketConnected = Boolean(socketRef.current?.connected);
 
     if (!player || playbackTarget === "cast") {
       const syntheticSnapshot = buildSyntheticPlaybackSnapshot(
@@ -655,44 +752,85 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     }
 
     try {
-      const playerSnapshot =
-        type === "play"
-          ? await player.play()
-          : type === "pause"
-            ? player.pause()
-            : type === "stop"
-              ? player.stop()
-              : player.seekBy(options?.deltaSeconds ?? 0);
-      dispatch({ type: "video_observed", snapshot: playerSnapshot });
+      if (!socketConnected) {
+        const offlineSnapshot = await applyLocalPlaybackIntent(type, options);
 
-      const socket = socketRef.current;
+        if (offlineSnapshot) {
+          dispatch({ type: "video_observed", snapshot: offlineSnapshot });
+        }
+
+        dispatch({
+          type: "sync_issue",
+          message: "Room sync is offline, so this change stayed local.",
+        });
+        logDebugEvent({
+          level: "warn",
+          category: "socket",
+          message: "Applied a local playback change while room sync was offline.",
+          source: commandSource,
+          data: {
+            roomId: snapshot.roomId,
+            type,
+            offlineSnapshot,
+          },
+        });
+        return;
+      }
+
+      const currentSnapshot = getCurrentPlaybackCommandSnapshot();
+      const shouldOptimisticallyApplyLocally =
+        type === "pause" ||
+        type === "stop" ||
+        (type === "seek" && authoritativePlaybackRef.current.status !== "playing");
+      const optimisticSnapshot = shouldOptimisticallyApplyLocally
+        ? await applyLocalPlaybackIntent(type, options)
+        : null;
+
+      if (optimisticSnapshot) {
+        dispatch({ type: "video_observed", snapshot: optimisticSnapshot });
+      }
+
+      const nextCurrentTime =
+        type === "stop"
+          ? 0
+          : type === "seek"
+            ? optimisticSnapshot?.currentTime ??
+              Math.max(0, currentSnapshot.currentTime + (options?.deltaSeconds ?? 0))
+            : optimisticSnapshot?.currentTime ?? currentSnapshot.currentTime;
+      const nextStatus =
+        type === "play"
+          ? "playing"
+          : type === "pause"
+            ? "paused"
+            : type === "stop"
+              ? "stopped"
+              : authoritativePlaybackRef.current.status;
+      const nextPlaybackRate =
+        optimisticSnapshot?.playbackRate ?? currentSnapshot.playbackRate;
+
       logDebugEvent({
         level: "info",
         category: "playback",
-        message: `Local ${type}.`,
+        message:
+          shouldOptimisticallyApplyLocally
+            ? `Issued ${type} and applied the local room player optimistically.`
+            : `Issued ${type} and waited for the authoritative room anchor.`,
         source: commandSource,
-        data: { roomId: snapshot.roomId, playerSnapshot },
+        data: {
+          roomId: snapshot.roomId,
+          currentSnapshot,
+          optimisticSnapshot,
+          playbackTarget,
+          type,
+        },
       });
-
-      if (!socket?.connected) {
-        emitSharedRoomCommand(
-          {
-            type,
-            status: playerSnapshot.status,
-            currentTime: playerSnapshot.currentTime,
-            playbackRate: playerSnapshot.playbackRate,
-          },
-          commandSource,
-        );
-        return;
-      }
 
       emitSharedRoomCommand(
         {
           type,
-          status: playerSnapshot.status,
-          currentTime: playerSnapshot.currentTime,
-          playbackRate: playerSnapshot.playbackRate,
+          status: nextStatus,
+          currentTime: nextCurrentTime,
+          playbackRate: nextPlaybackRate,
         },
         commandSource,
       );
@@ -741,6 +879,10 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
 
   useEffect(() => {
     castStatusRef.current = castStatus;
+
+    if (castStatus !== "connected") {
+      clearScheduledCastPlaybackTimer();
+    }
   }, [castStatus]);
 
   useEffect(() => {
@@ -841,6 +983,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     });
 
     return () => {
+      clearScheduledCastPlaybackTimer();
       socket.disconnect();
       socketRef.current = null;
     };
@@ -1138,6 +1281,13 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           </button>
         </div>
 
+        {playbackAwaitingScheduledStart ? (
+          <div className="mt-6 rounded-3xl border border-[#27415f]/35 bg-[#111d2c] px-5 py-4 text-sm leading-6 text-[#d9e8ff]">
+            Shared playback has been staged and will begin together in about{" "}
+            {Math.ceil(resolvePlaybackStartDelayMs(state.playback) / 100) / 10}s.
+          </div>
+        ) : null}
+
         {state.syncIssue ? (
           <div className="mt-6 rounded-3xl border border-[#6e2a2e]/35 bg-[#2d1417] px-5 py-4 text-sm leading-6 text-[#ffd6d5]">
             {state.syncIssue}
@@ -1339,7 +1489,9 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
             </div>
             <div className="flex items-center justify-between gap-4 rounded-3xl border border-white/10 bg-black/20 px-4 py-3">
               <dt className="text-sm text-[#c7c2ca]">Current time</dt>
-              <dd className="text-sm font-semibold text-white">{formatPlaybackSeconds(state.playback.currentTime)}</dd>
+              <dd className="text-sm font-semibold text-white">
+                {formatPlaybackSeconds(resolvedAuthoritativeCurrentTime)}
+              </dd>
             </div>
             <div className="flex items-center justify-between gap-4 rounded-3xl border border-white/10 bg-black/20 px-4 py-3">
               <dt className="text-sm text-[#c7c2ca]">Playback rate</dt>

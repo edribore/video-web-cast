@@ -150,14 +150,18 @@ model Room {
 }
 
 model RoomPlaybackState {
-  roomId       String         @id
-  status       PlaybackStatus @default(stopped)
-  currentTime  Float          @default(0)
-  playbackRate Float          @default(1)
+  roomId                    String         @id
+  status                    PlaybackStatus @default(stopped)
+  currentTime               Float          @default(0)
+  anchorMediaTime           Float          @default(0)
+  anchorWallClockMs         Float          @default(0)
+  scheduledStartWallClockMs Float?
+  playbackRate              Float          @default(1)
+  sourceClientEventId       String?
   // Increment this in the application for optimistic concurrency on sync updates.
-  version      Int            @default(1)
-  createdAt    DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
+  version                   Int            @default(1)
+  createdAt                 DateTime       @default(now())
+  updatedAt                 DateTime       @updatedAt
 
   room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
 }
