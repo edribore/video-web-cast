@@ -12,6 +12,15 @@ export type BuildAuthoritativePlaybackStateInput = {
   version: number;
 };
 
+export type PlaybackReconciliationProfile = {
+  ignoreDriftThresholdSeconds: number;
+  hardSeekThresholdSeconds: number;
+  smoothCorrectionRateDelta: number;
+  hardSeekCooldownMs: number;
+  postSeekHardSeekSuppressionMs: number;
+  postCanPlayHardSeekSuppressionMs: number;
+};
+
 export type PlaybackDriftCorrection =
   | {
       kind: "none";
@@ -35,9 +44,14 @@ export type PlaybackDriftCorrection =
 export const playbackSynchronizationConfig = {
   scheduledStartLeadTimeMs: 1000,
   roomReconciliationIntervalMs: 500,
-  roomDriftIgnoreThresholdSeconds: 0.08,
-  roomDriftHardSeekThresholdSeconds: 0.25,
-  roomSmoothCorrectionRateDelta: 0.03,
+  roomFollowerReconciliationProfile: {
+    ignoreDriftThresholdSeconds: 0.15,
+    hardSeekThresholdSeconds: 0.85,
+    smoothCorrectionRateDelta: 0.03,
+    hardSeekCooldownMs: 2500,
+    postSeekHardSeekSuppressionMs: 2000,
+    postCanPlayHardSeekSuppressionMs: 1750,
+  } satisfies PlaybackReconciliationProfile,
   pauseConvergenceThresholdSeconds: 0.05,
   localMediaSyncThresholdSeconds: 0.08,
   localMediaCorrectionThresholdSeconds: 0.12,
@@ -271,14 +285,25 @@ export function resolvePlaybackDriftCorrection(input: {
   actualTime: number;
   basePlaybackRate: number;
   expectedTime: number;
+  lastHardSeekAtMs?: number | null;
+  nowMs?: number;
+  profile?: PlaybackReconciliationProfile;
+  suppressHardSeekUntilMs?: number | null;
 }) {
+  const profile =
+    input.profile ?? playbackSynchronizationConfig.roomFollowerReconciliationProfile;
   const driftSeconds = roundPlaybackSeconds(input.expectedTime - input.actualTime);
   const absoluteDriftSeconds = Math.abs(driftSeconds);
   const normalizedPlaybackRate = clampPlaybackRate(input.basePlaybackRate);
+  const nowMs = input.nowMs ?? Date.now();
+  const hardSeekCoolingDown =
+    input.lastHardSeekAtMs != null &&
+    nowMs - input.lastHardSeekAtMs < profile.hardSeekCooldownMs;
+  const hardSeekSuppressed =
+    input.suppressHardSeekUntilMs != null &&
+    input.suppressHardSeekUntilMs > nowMs;
 
-  if (
-    absoluteDriftSeconds < playbackSynchronizationConfig.roomDriftIgnoreThresholdSeconds
-  ) {
+  if (absoluteDriftSeconds < profile.ignoreDriftThresholdSeconds) {
     return {
       kind: "none" as const,
       driftSeconds,
@@ -288,8 +313,9 @@ export function resolvePlaybackDriftCorrection(input: {
   }
 
   if (
-    absoluteDriftSeconds >=
-    playbackSynchronizationConfig.roomDriftHardSeekThresholdSeconds
+    absoluteDriftSeconds >= profile.hardSeekThresholdSeconds &&
+    !hardSeekCoolingDown &&
+    !hardSeekSuppressed
   ) {
     return {
       kind: "hard_seek" as const,
@@ -302,8 +328,8 @@ export function resolvePlaybackDriftCorrection(input: {
   const correctedPlaybackRate = clampPlaybackRate(
     normalizedPlaybackRate +
       (driftSeconds > 0
-        ? playbackSynchronizationConfig.roomSmoothCorrectionRateDelta
-        : -playbackSynchronizationConfig.roomSmoothCorrectionRateDelta),
+        ? profile.smoothCorrectionRateDelta
+        : -profile.smoothCorrectionRateDelta),
   );
 
   return {

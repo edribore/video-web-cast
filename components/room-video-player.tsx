@@ -295,8 +295,11 @@ export const RoomVideoPlayer = forwardRef<
   const externalAudioRef = useRef<HTMLAudioElement>(null);
   const lastExternalAudioCorrectionAtRef = useRef(0);
   const lastLoggedCorrectionSignatureRef = useRef<string | null>(null);
+  const lastHardSeekSuppressionLogAtRef = useRef(0);
+  const lastRoomHardSeekAtRef = useRef<number | null>(null);
   const requestedExternalAudioUrlRef = useRef<string | null>(null);
   const scheduledSharedStartTimerRef = useRef<number | null>(null);
+  const suppressRoomHardSeekUntilRef = useRef(0);
   const authoritativePlaybackRef = useRef<PlaybackStateSnapshot>(
     createInitialPlaybackState(),
   );
@@ -361,6 +364,38 @@ export const RoomVideoPlayer = forwardRef<
       audio.playbackRate = normalizedPlaybackRate;
     }
   });
+
+  const armRoomHardSeekSuppression = useEffectEvent(
+    (durationMs: number, reason: string) => {
+      const nextSuppressionUntil = Date.now() + durationMs;
+      const previousSuppressionUntil = suppressRoomHardSeekUntilRef.current;
+
+      suppressRoomHardSeekUntilRef.current = Math.max(
+        previousSuppressionUntil,
+        nextSuppressionUntil,
+      );
+
+      if (
+        suppressRoomHardSeekUntilRef.current > previousSuppressionUntil + 250 &&
+        Date.now() - lastHardSeekSuppressionLogAtRef.current >= 1000
+      ) {
+        lastHardSeekSuppressionLogAtRef.current = Date.now();
+        logDebugEvent({
+          level: "info",
+          category: "sync",
+          message:
+            "Temporarily suppressed local hard-seek reconciliation while media recovers from a recent seek or canplay sequence.",
+          source: "reconciliation",
+          data: {
+            reason,
+            suppressUntil: new Date(
+              suppressRoomHardSeekUntilRef.current,
+            ).toISOString(),
+          },
+        });
+      }
+    },
+  );
 
   const updateVideoElementState = useEffectEvent(() => {
     const nextState = buildMediaElementState(videoRef.current);
@@ -727,6 +762,10 @@ export const RoomVideoPlayer = forwardRef<
       actualTime,
       basePlaybackRate: playback.playbackRate,
       expectedTime,
+      lastHardSeekAtMs: lastRoomHardSeekAtRef.current,
+      nowMs: Date.now(),
+      profile: playbackSynchronizationConfig.roomFollowerReconciliationProfile,
+      suppressHardSeekUntilMs: suppressRoomHardSeekUntilRef.current,
     });
 
     updateRoomCorrectionState({
@@ -740,6 +779,12 @@ export const RoomVideoPlayer = forwardRef<
 
     if (correction.kind === "hard_seek" && correction.targetTime != null) {
       video.currentTime = correction.targetTime;
+      lastRoomHardSeekAtRef.current = Date.now();
+      armRoomHardSeekSuppression(
+        playbackSynchronizationConfig.roomFollowerReconciliationProfile
+          .postSeekHardSeekSuppressionMs,
+        "room_hard_seek",
+      );
       await synchronizeExternalAudioWithVideo({
         attemptPlayback: true,
         forceSeek: true,
@@ -942,6 +987,11 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleSeeked = () => {
       updateLastMediaEvent("seeked");
+      armRoomHardSeekSuppression(
+        playbackSynchronizationConfig.roomFollowerReconciliationProfile
+          .postSeekHardSeekSuppressionMs,
+        "video_seeked_event",
+      );
       emitObservedStateChange();
       void synchronizeExternalAudioWithVideo({
         forceSeek: true,
@@ -951,6 +1001,11 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleLoadedMetadata = () => {
       updateLastMediaEvent("loadedmetadata");
+      armRoomHardSeekSuppression(
+        playbackSynchronizationConfig.roomFollowerReconciliationProfile
+          .postCanPlayHardSeekSuppressionMs,
+        "video_loadedmetadata_event",
+      );
       emitObservedStateChange();
       void synchronizeExternalAudioWithVideo({
         forceSeek: true,
@@ -976,6 +1031,11 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleAudioLoadedMetadata = () => {
       updateLastAudioEvent("loadedmetadata");
+      armRoomHardSeekSuppression(
+        playbackSynchronizationConfig.roomFollowerReconciliationProfile
+          .postCanPlayHardSeekSuppressionMs,
+        "audio_loadedmetadata_event",
+      );
       void synchronizeExternalAudioWithVideo({
         attemptPlayback: !video.paused,
         forceSeek: true,
@@ -985,6 +1045,11 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleAudioCanPlay = () => {
       updateLastAudioEvent("canplay");
+      armRoomHardSeekSuppression(
+        playbackSynchronizationConfig.roomFollowerReconciliationProfile
+          .postCanPlayHardSeekSuppressionMs,
+        "audio_canplay_event",
+      );
       void synchronizeExternalAudioWithVideo({
         attemptPlayback: !video.paused,
         allowDriftCorrection: true,
@@ -1004,6 +1069,11 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleAudioSeeked = () => {
       updateLastAudioEvent("seeked");
+      armRoomHardSeekSuppression(
+        playbackSynchronizationConfig.roomFollowerReconciliationProfile
+          .postSeekHardSeekSuppressionMs,
+        "audio_seeked_event",
+      );
       publishMediaDiagnostics();
     };
 
@@ -1114,6 +1184,11 @@ export const RoomVideoPlayer = forwardRef<
         clearScheduledSharedStart();
         video.pause();
         video.currentTime = 0;
+        armRoomHardSeekSuppression(
+          playbackSynchronizationConfig.roomFollowerReconciliationProfile
+            .postSeekHardSeekSuppressionMs,
+          "local_stop_seek",
+        );
         applyPlaybackRateToMedia(playbackRate);
         void synchronizeExternalAudioWithVideo({
           forceSeek: true,
@@ -1136,6 +1211,11 @@ export const RoomVideoPlayer = forwardRef<
         }
 
         video.currentTime = normalizeSeekTarget(video, deltaSeconds);
+        armRoomHardSeekSuppression(
+          playbackSynchronizationConfig.roomFollowerReconciliationProfile
+            .postSeekHardSeekSuppressionMs,
+          "local_seek",
+        );
         void synchronizeExternalAudioWithVideo({
           forceSeek: true,
           publishDiagnostics: true,
@@ -1178,6 +1258,11 @@ export const RoomVideoPlayer = forwardRef<
             pauseConvergenceThresholdSeconds
         ) {
           video.currentTime = nextCurrentTime;
+          armRoomHardSeekSuppression(
+            playbackSynchronizationConfig.roomFollowerReconciliationProfile
+              .postSeekHardSeekSuppressionMs,
+            "authoritative_seek",
+          );
         }
 
         if (playback.status === "playing") {

@@ -91,7 +91,7 @@ test("moderate drift uses smooth rate correction instead of a hard seek", () => 
 
 test("large drift uses a hard seek back to the authoritative room time", () => {
   const correction = resolvePlaybackDriftCorrection({
-    actualTime: 9.6,
+    actualTime: 9,
     basePlaybackRate: 1,
     expectedTime: 10,
   });
@@ -99,4 +99,30 @@ test("large drift uses a hard seek back to the authoritative room time", () => {
   assert.equal(correction.kind, "hard_seek");
   assert.equal(correction.targetPlaybackRate, 1);
   assert.equal(correction.targetTime, 10);
+});
+
+test("hard seek cooldown forces large drift back into smooth correction temporarily", () => {
+  const correction = resolvePlaybackDriftCorrection({
+    actualTime: 9,
+    basePlaybackRate: 1,
+    expectedTime: 10,
+    lastHardSeekAtMs: 10_000,
+    nowMs: 11_000,
+  });
+
+  assert.equal(correction.kind, "smooth");
+  assert.equal(correction.targetPlaybackRate, 1.03);
+});
+
+test("post-seek suppression window blocks repeated hard seeks during media recovery", () => {
+  const correction = resolvePlaybackDriftCorrection({
+    actualTime: 9,
+    basePlaybackRate: 1,
+    expectedTime: 10,
+    nowMs: 10_500,
+    suppressHardSeekUntilMs: 12_000,
+  });
+
+  assert.equal(correction.kind, "smooth");
+  assert.equal(correction.targetTime, null);
 });
