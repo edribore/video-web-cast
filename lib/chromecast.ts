@@ -292,6 +292,8 @@ export type ChromecastRemotePlaybackEvent = {
   status: PlaybackStatus;
   currentTime: number;
   playbackRate: number;
+  playerState: string | null;
+  isPaused: boolean | null;
   observedAt: string;
   expectedCurrentTime: number;
   observationDelayMs: number;
@@ -676,14 +678,19 @@ function rejectCastRemoteIntent(
   reason:
     | "rejected_due_to_insufficient_remote_stability"
     | "rejected_due_to_recent_local_cast_command"
+    | "rejected_due_to_recent_conflicting_local_play"
     | "rejected_due_to_cast_stabilization_window"
     | "rejected_due_to_implausible_remote_time"
+    | "rejected_due_to_unstable_time_progression"
     | "rejected_due_to_contradictory_remote_transition"
     | "rejected_due_to_recent_committed_remote_intent",
   event: ChromecastRemotePlaybackEvent,
   data: Record<string, unknown> = {},
 ) {
   updateCastRemoteIntentState("cast_remote_intent_rejected", reason, event);
+  updateChromecastRuntimeState({
+    lastCastRemoteRejectionReason: reason,
+  });
   logDebugEvent({
     level: "info",
     category: "cast",
@@ -696,7 +703,73 @@ function rejectCastRemoteIntent(
   });
 }
 
-function canConfirmCastRemoteIntent(candidate: NonNullable<CastRemoteObserverState["pendingIntent"]>) {
+function findRecentConflictingLocalCastCommand(input: {
+  candidateStatus: PlaybackStatus;
+  selectionSignature: string | null;
+  sinceMs: number;
+}) {
+  const now = Date.now();
+  pruneRecentLocalCastCommands(now);
+  const conflictingStatus =
+    input.candidateStatus === "paused" ? "playing" : "paused";
+
+  for (let index = recentLocalCastCommands.length - 1; index >= 0; index -= 1) {
+    const command = recentLocalCastCommands[index];
+
+    if (command.createdAt < input.sinceMs) {
+      continue;
+    }
+
+    if (command.status !== conflictingStatus) {
+      continue;
+    }
+
+    if (
+      command.selectionSignature &&
+      input.selectionSignature &&
+      command.selectionSignature !== input.selectionSignature
+    ) {
+      continue;
+    }
+
+    return command;
+  }
+
+  return null;
+}
+
+function isStablePausedRemoteIntent(
+  candidate: NonNullable<CastRemoteObserverState["pendingIntent"]>,
+) {
+  const config = playbackSynchronizationConfig.castRemoteObservation;
+  const elapsedMs = candidate.lastObservedAtMs - candidate.firstObservedAtMs;
+  const timeAdvancedSeconds = Math.abs(
+    candidate.event.currentTime - candidate.firstObservedCurrentTime,
+  );
+  const pausedStateConfirmed =
+    candidate.event.status === "paused" &&
+    (candidate.event.playerState?.toUpperCase() === "PAUSED" ||
+      candidate.event.isPaused === true);
+  const stableTimeProgression =
+    timeAdvancedSeconds <= config.pauseStableNoProgressThresholdSeconds;
+  const confirmedByObservationCount = candidate.observationCount >= 2;
+  const confirmedByElapsedWindow =
+    elapsedMs >= config.pauseIntentConfirmationWindowMs && stableTimeProgression;
+
+  return {
+    confirmed:
+      pausedStateConfirmed &&
+      stableTimeProgression &&
+      (confirmedByObservationCount || confirmedByElapsedWindow),
+    elapsedMs,
+    stableTimeProgression,
+    timeAdvancedSeconds,
+  };
+}
+
+function canConfirmCastRemoteIntent(
+  candidate: NonNullable<CastRemoteObserverState["pendingIntent"]>,
+) {
   const firstCurrentTime = candidate.firstObservedCurrentTime;
   const latestCurrentTime = candidate.event.currentTime;
 
@@ -704,7 +777,7 @@ function canConfirmCastRemoteIntent(candidate: NonNullable<CastRemoteObserverSta
     return candidate.observationCount >= 2 || latestCurrentTime >= firstCurrentTime + 0.15;
   }
 
-  return candidate.observationCount >= 2;
+  return isStablePausedRemoteIntent(candidate).confirmed;
 }
 
 function commitCastRemoteIntent(
@@ -955,6 +1028,7 @@ function queuePendingCastRemoteIntent(
   signature: string,
 ) {
   const nowMs = Date.now();
+  const isPauseIntent = event.status === "paused";
   const antiReversionWindowMs =
     playbackSynchronizationConfig.castRemoteObservation.antiReversionWindowMs;
   const lastCommittedIntent = castRemoteObserverState.lastCommittedIntent;
@@ -962,7 +1036,8 @@ function queuePendingCastRemoteIntent(
   if (
     lastCommittedIntent &&
     lastCommittedIntent.status !== event.status &&
-    nowMs - lastCommittedIntent.committedAtMs < antiReversionWindowMs
+    nowMs - lastCommittedIntent.committedAtMs < antiReversionWindowMs &&
+    !isPauseIntent
   ) {
     rejectCastRemoteIntent(
       "rejected_due_to_recent_committed_remote_intent",
@@ -1027,12 +1102,18 @@ function queuePendingCastRemoteIntent(
   logDebugEvent({
     level: "info",
     category: "cast",
-    message: `Observed a Chromecast remote ${event.type} candidate and started intent confirmation.`,
+    message: isPauseIntent
+      ? "remote_pause_candidate_observed"
+      : `Observed a Chromecast remote ${event.type} candidate and started intent confirmation.`,
     source: "cast_remote",
     data: event,
   });
 
   const firstObservedAtMs = nowMs;
+  const confirmationWindowMs = isPauseIntent
+    ? playbackSynchronizationConfig.castRemoteObservation
+        .pauseIntentConfirmationWindowMs
+    : playbackSynchronizationConfig.castRemoteObservation.intentConfirmationWindowMs;
   const timerId = window.setTimeout(() => {
     const pendingIntent = castRemoteObserverState.pendingIntent;
 
@@ -1042,6 +1123,85 @@ function queuePendingCastRemoteIntent(
       pendingIntent.event.status !== event.status ||
       pendingIntent.event.sessionId !== event.sessionId
     ) {
+      return;
+    }
+
+    const conflictingLocalPlayCommand =
+      pendingIntent.event.status === "paused"
+        ? findRecentConflictingLocalCastCommand({
+            candidateStatus: pendingIntent.event.status,
+            selectionSignature: pendingIntent.event.selectionSignature,
+            sinceMs: pendingIntent.firstObservedAtMs,
+          })
+        : null;
+
+    if (conflictingLocalPlayCommand) {
+      rejectCastRemoteIntent(
+        "rejected_due_to_recent_conflicting_local_play",
+        pendingIntent.event,
+        {
+          conflictingLocalPlayCommand,
+          observationCount: pendingIntent.observationCount,
+          signature,
+        },
+      );
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "remote_pause_rejected_due_to_recent_conflicting_local_play",
+        source: "cast_remote",
+        data: {
+          conflictingLocalPlayCommand,
+          event: pendingIntent.event,
+        },
+      });
+      clearPendingCastRemoteIntent("recent_conflicting_local_play");
+      return;
+    }
+
+    if (pendingIntent.event.status === "paused") {
+      const pauseConfirmation = isStablePausedRemoteIntent(pendingIntent);
+
+      if (pauseConfirmation.confirmed) {
+        logDebugEvent({
+          level: "info",
+          category: "cast",
+          message: "remote_pause_confirmed_fast_path",
+          source: "cast_remote",
+          data: {
+            elapsedMs: pauseConfirmation.elapsedMs,
+            observationCount: pendingIntent.observationCount,
+            timeAdvancedSeconds: pauseConfirmation.timeAdvancedSeconds,
+            event: pendingIntent.event,
+          },
+        });
+        commitCastRemoteIntent(pendingIntent);
+        return;
+      }
+
+      rejectCastRemoteIntent(
+        "rejected_due_to_unstable_time_progression",
+        pendingIntent.event,
+        {
+          elapsedMs: pauseConfirmation.elapsedMs,
+          observationCount: pendingIntent.observationCount,
+          stableTimeProgression: pauseConfirmation.stableTimeProgression,
+          timeAdvancedSeconds: pauseConfirmation.timeAdvancedSeconds,
+        },
+      );
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "remote_pause_rejected_due_to_unstable_time_progression",
+        source: "cast_remote",
+        data: {
+          elapsedMs: pauseConfirmation.elapsedMs,
+          observationCount: pendingIntent.observationCount,
+          timeAdvancedSeconds: pauseConfirmation.timeAdvancedSeconds,
+          event: pendingIntent.event,
+        },
+      });
+      clearPendingCastRemoteIntent("pause_unstable_time_progression");
       return;
     }
 
@@ -1058,8 +1218,18 @@ function queuePendingCastRemoteIntent(
       return;
     }
 
+    logDebugEvent({
+      level: "info",
+      category: "cast",
+      message: "remote_play_confirmation_still_using_stricter_rules",
+      source: "cast_remote",
+      data: {
+        observationCount: pendingIntent.observationCount,
+        event: pendingIntent.event,
+      },
+    });
     commitCastRemoteIntent(pendingIntent);
-  }, playbackSynchronizationConfig.castRemoteObservation.intentConfirmationWindowMs);
+  }, confirmationWindowMs);
 
   castRemoteObserverState.pendingIntent = {
     event,
@@ -1855,6 +2025,8 @@ function observeChromecastRemotePlaybackState(reason: string) {
           status,
           currentTime: Math.round(currentTime * 1000) / 1000,
           playbackRate,
+          playerState,
+          isPaused,
           expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
           observationDelayMs,
           observedAt: new Date(observedAtMs).toISOString(),
@@ -1874,6 +2046,47 @@ function observeChromecastRemotePlaybackState(reason: string) {
     castRemoteObserverState.leadershipMode === "cast_handoff" ||
     castRemoteObserverState.leadershipMode === "cast_leader_stabilizing"
   ) {
+    const pauseCandidateDuringStabilization =
+      commandType === "pause" &&
+      status === "paused" &&
+      (playerState?.toUpperCase() === "PAUSED" || isPaused === true);
+
+    if (pauseCandidateDuringStabilization) {
+      const pauseEvent: ChromecastRemotePlaybackEvent = {
+        type: commandType,
+        status,
+        currentTime: Math.round(currentTime * 1000) / 1000,
+        playbackRate,
+        playerState,
+        isPaused,
+        expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
+        observationDelayMs,
+        observedAt: new Date(observedAtMs).toISOString(),
+        sessionId: sessionIdentity.id,
+        contentId,
+        selectionSignature,
+        source: "cast_remote",
+      };
+
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message:
+          "Observed a paused Chromecast remote state during stabilization and routed it into the remote pause confirmation fast-path.",
+        source: "cast_remote",
+        data: {
+          commandType,
+          currentTime,
+          expectedCurrentTime,
+          observationDelayMs,
+          signature: nextSignature,
+          status,
+        },
+      });
+      queuePendingCastRemoteIntent(pauseEvent, nextSignature);
+      return;
+    }
+
     rejectCastRemoteObservation("rejected_due_to_cast_stabilization_window", {
       commandType,
       currentTime,
@@ -1894,6 +2107,8 @@ function observeChromecastRemotePlaybackState(reason: string) {
           status,
           currentTime: Math.round(currentTime * 1000) / 1000,
           playbackRate,
+          playerState,
+          isPaused,
           expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
           observationDelayMs,
           observedAt: new Date(observedAtMs).toISOString(),
@@ -1932,6 +2147,8 @@ function observeChromecastRemotePlaybackState(reason: string) {
           status,
           currentTime: Math.round(currentTime * 1000) / 1000,
           playbackRate,
+          playerState,
+          isPaused,
           expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
           observationDelayMs,
           observedAt: new Date(observedAtMs).toISOString(),
@@ -1956,6 +2173,8 @@ function observeChromecastRemotePlaybackState(reason: string) {
     status,
     currentTime: Math.round(currentTime * 1000) / 1000,
     playbackRate,
+    playerState,
+    isPaused,
     expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
     observationDelayMs,
     observedAt,
