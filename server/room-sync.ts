@@ -98,6 +98,7 @@ export async function getRoomScaffoldSnapshot(
             title: true,
             originalFilename: true,
             mimeType: true,
+            durationSeconds: true,
             storagePath: true,
             audioTracks: {
               orderBy: [{ isDefault: "desc" }, { createdAt: "asc" }],
@@ -126,6 +127,7 @@ export async function getRoomScaffoldSnapshot(
         title: room.mediaAsset.title,
         originalFilename: room.mediaAsset.originalFilename,
         mimeType: room.mediaAsset.mimeType,
+        durationSeconds: room.mediaAsset.durationSeconds,
         posterUrl: null,
         videoUrl: storedUploadHref(room.mediaAsset.storagePath),
         absoluteVideoUrl: storedUploadAbsoluteHref(

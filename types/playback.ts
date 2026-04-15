@@ -15,6 +15,7 @@ export type PlaybackStateSnapshot = {
 };
 
 export type ParticipantMediaPreferences = {
+  audioSelectionMode: "auto" | "manual";
   selectedAudioTrackId: string | null;
   selectedSubtitleTrackId: string | null;
 };

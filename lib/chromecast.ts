@@ -1,6 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import {
+  confirmCastRemoteControlSession,
+  expireCastRemoteControlSession,
+  isCastRemoteControlTrustedContinuationActive,
+  markCastRemoteControlSessionConfirming,
+  type CastRemoteControlSession,
+  type CastRemoteRoomCommandType,
+} from "@/lib/cast-remote-control";
 import { logDebugEvent, setDebugRuntimeState } from "@/lib/debug-store";
 import { isCastableAbsoluteUrl } from "@/lib/public-origin";
 import {
@@ -273,7 +281,6 @@ type CastSessionEvent = {
   errorCode?: string;
 };
 
-type CastRemoteRoomCommandType = "play" | "pause" | "seek" | "stop";
 type CastRemoteLeadershipMode =
   | "idle"
   | "cast_handoff"
@@ -300,6 +307,8 @@ export type ChromecastRemotePlaybackEvent = {
   sessionId: string | null;
   contentId: string | null;
   selectionSignature: string | null;
+  seekDeltaSeconds: number | null;
+  seekDirection: "forward" | "backward" | null;
   source: "cast_remote";
 };
 
@@ -350,23 +359,7 @@ type CastRemoteObserverState = {
   pollTimerId: number | null;
   remotePlayer: RemotePlayerInstance | null;
   remotePlayerController: RemotePlayerControllerInstance | null;
-  remoteControlSequence: {
-    expiresAtMs: number;
-    lastAcceptedSeekTime: number | null;
-    lastInteractionType: CastRemoteRoomCommandType;
-    selectionSignature: string | null;
-    sessionId: string | null;
-    startedAtMs: number;
-  } | null;
-  trustedContinuation: {
-    committedAtMs: number;
-    contentId: string | null;
-    currentTime: number;
-    expiresAtMs: number;
-    selectionSignature: string | null;
-    sessionId: string | null;
-    type: "pause" | "seek";
-  } | null;
+  remoteControlSession: CastRemoteControlSession | null;
   stabilizationUntilMs: number;
 };
 
@@ -437,8 +430,7 @@ const castRemoteObserverState: CastRemoteObserverState = {
   pollTimerId: null,
   remotePlayer: null,
   remotePlayerController: null,
-  remoteControlSequence: null,
-  trustedContinuation: null,
+  remoteControlSession: null,
   stabilizationUntilMs: 0,
 };
 
@@ -486,10 +478,12 @@ function buildCastResolveRequestKey(
   mediaId: string,
   selectedAudioTrackId: string | null,
   selectedSubtitleTrackId: string | null,
+  preferredAudioLanguages: readonly string[] = [],
 ) {
   return JSON.stringify({
     roomId,
     mediaId,
+    preferredAudioLanguages,
     selectedAudioTrackId,
     selectedSubtitleTrackId,
   });
@@ -499,6 +493,7 @@ function buildCastResolveUrl(
   roomId: string,
   selectedAudioTrackId: string | null,
   selectedSubtitleTrackId: string | null,
+  preferredAudioLanguages: readonly string[] = [],
 ) {
   const url = new URL(
     `/api/cast/resolve/${encodeURIComponent(roomId)}`,
@@ -512,6 +507,10 @@ function buildCastResolveUrl(
   if (selectedSubtitleTrackId) {
     url.searchParams.set("subtitleTrackId", selectedSubtitleTrackId);
   }
+
+  preferredAudioLanguages.forEach((language) => {
+    url.searchParams.append("preferredAudioLanguage", language);
+  });
 
   return url.toString();
 }
@@ -693,206 +692,177 @@ function clearPendingCastRemoteIntent(reason: string) {
   updateCastRemoteIntentState("cast_remote_idle", reason, null);
 }
 
-function clearCastRemoteControlSequence(
+function updateCastRemoteControlSessionRuntime(
   reason: string,
-  options?: { logExpired?: boolean },
+  session: CastRemoteControlSession | null,
 ) {
-  if (!castRemoteObserverState.remoteControlSequence) {
-    return;
-  }
-
-  const previousSequence = castRemoteObserverState.remoteControlSequence;
-  castRemoteObserverState.remoteControlSequence = null;
   updateChromecastRuntimeState({
-    castRemoteSequenceActive: false,
-    castRemoteSequenceReason: reason,
-    castRemoteSequenceExpiresAt: null,
-    castRemoteSequenceLastInteractionType: null,
-    castRemoteSequenceLastAcceptedSeekTime: null,
-    castRemoteSequenceSessionId: null,
-  });
-
-  if (options?.logExpired) {
-    logDebugEvent({
-      level: "info",
-      category: "cast",
-      message: "cast_remote_sequence_expired",
-      source: "cast_remote",
-      data: previousSequence,
-    });
-  }
-}
-
-function getActiveCastRemoteControlSequence(nowMs = Date.now()) {
-  const sequence = castRemoteObserverState.remoteControlSequence;
-
-  if (!sequence) {
-    return null;
-  }
-
-  if (sequence.expiresAtMs <= nowMs) {
-    clearCastRemoteControlSequence("expired", { logExpired: true });
-    return null;
-  }
-
-  return sequence;
-}
-
-function clearCastRemoteTrustedContinuation(
-  reason: string,
-  options?: { logExpired?: boolean },
-) {
-  if (!castRemoteObserverState.trustedContinuation) {
-    return;
-  }
-
-  const previousContinuation = castRemoteObserverState.trustedContinuation;
-  castRemoteObserverState.trustedContinuation = null;
-  updateChromecastRuntimeState({
-    castRemoteTrustedContinuationActive: false,
+    castRemoteControlSessionActive:
+      session != null &&
+      session.state !== "remote_control_session_expired" &&
+      session.expiresAtMs > Date.now(),
+    castRemoteControlSessionContentId: session?.contentId ?? null,
+    castRemoteControlSessionControlSessionId: session?.controlSessionId ?? null,
+    castRemoteControlSessionExpiresAt:
+      session != null ? new Date(session.expiresAtMs).toISOString() : null,
+    castRemoteControlSessionLastConfirmedAction:
+      session?.lastConfirmedRemoteAction ?? null,
+    castRemoteControlSessionLastConfirmedState:
+      session?.lastConfirmedRemoteState ?? null,
+    castRemoteControlSessionLastConfirmedTime:
+      session?.lastConfirmedRemoteTime ?? null,
+    castRemoteControlSessionReason: reason,
+    castRemoteControlSessionSelectionSignature:
+      session?.selectionSignature ?? null,
+    castRemoteControlSessionSessionId: session?.sessionId ?? null,
+    castRemoteControlSessionStartedAt:
+      session != null ? new Date(session.startedAtMs).toISOString() : null,
+    castRemoteControlSessionState: session?.state ?? "idle",
+    castRemoteTrustedContinuationActive:
+      session != null &&
+      session.state !== "remote_control_session_expired" &&
+      session.trustedContinuationUntilMs != null &&
+      session.trustedContinuationUntilMs > Date.now(),
+    castRemoteTrustedContinuationContentId: session?.contentId ?? null,
+    castRemoteTrustedContinuationExpiresAt:
+      session?.trustedContinuationUntilMs != null
+        ? new Date(session.trustedContinuationUntilMs).toISOString()
+        : null,
     castRemoteTrustedContinuationReason: reason,
-    castRemoteTrustedContinuationExpiresAt: null,
-    castRemoteTrustedContinuationType: null,
-    castRemoteTrustedContinuationSessionId: null,
-    castRemoteTrustedContinuationContentId: null,
+    castRemoteTrustedContinuationSessionId: session?.sessionId ?? null,
+    castRemoteTrustedContinuationType:
+      session?.trustedContinuationSource ?? null,
   });
+}
 
-  if (options?.logExpired) {
+function clearCastRemoteControlSession(reason: string) {
+  castRemoteObserverState.remoteControlSession = null;
+  updateCastRemoteControlSessionRuntime(reason, null);
+}
+
+function syncExpiredCastRemoteControlSession(nowMs = Date.now()) {
+  const expirationResult = expireCastRemoteControlSession(
+    castRemoteObserverState.remoteControlSession,
+    nowMs,
+  );
+
+  if (expirationResult.didExpire && expirationResult.session) {
+    castRemoteObserverState.remoteControlSession = expirationResult.session;
+    updateCastRemoteControlSessionRuntime(
+      "expired",
+      castRemoteObserverState.remoteControlSession,
+    );
     logDebugEvent({
       level: "info",
       category: "cast",
-      message: "cast_remote_trusted_continuation_expired",
+      message: "cast_remote_control_session_expired",
       source: "cast_remote",
-      data: previousContinuation,
+      data: expirationResult.session,
     });
   }
 }
 
-function getActiveCastRemoteTrustedContinuation(nowMs = Date.now()) {
-  const continuation = castRemoteObserverState.trustedContinuation;
+function getActiveCastRemoteControlSession(nowMs = Date.now()) {
+  syncExpiredCastRemoteControlSession(nowMs);
 
-  if (!continuation) {
+  const session = castRemoteObserverState.remoteControlSession;
+
+  if (
+    !session ||
+    session.state === "remote_control_session_expired" ||
+    session.expiresAtMs <= nowMs
+  ) {
     return null;
   }
 
-  if (continuation.expiresAtMs <= nowMs) {
-    clearCastRemoteTrustedContinuation("expired", { logExpired: true });
-    return null;
-  }
-
-  return continuation;
+  return session;
 }
 
-function armCastRemoteTrustedContinuation(input: {
-  contentId: string | null;
-  currentTime: number;
-  selectionSignature: string | null;
-  sessionId: string | null;
-  type: "pause" | "seek";
-}) {
-  const nowMs = Date.now();
-  const expiresAtMs =
-    nowMs +
-    playbackSynchronizationConfig.castRemoteObservation
-      .remoteControlSequenceWindowMs;
-  const previousContinuation = getActiveCastRemoteTrustedContinuation(nowMs);
-  const nextContinuation = previousContinuation
-    ? {
-        ...previousContinuation,
-        committedAtMs: nowMs,
-        contentId: input.contentId,
-        currentTime: input.currentTime,
-        expiresAtMs: Math.max(previousContinuation.expiresAtMs, expiresAtMs),
-        selectionSignature: input.selectionSignature,
-        sessionId: input.sessionId,
-        type: input.type,
-      }
-    : {
-        committedAtMs: nowMs,
-        contentId: input.contentId,
-        currentTime: input.currentTime,
-        expiresAtMs,
-        selectionSignature: input.selectionSignature,
-        sessionId: input.sessionId,
-        type: input.type,
-      };
-
-  castRemoteObserverState.trustedContinuation = nextContinuation;
-  updateChromecastRuntimeState({
-    castRemoteTrustedContinuationActive: true,
-    castRemoteTrustedContinuationReason: input.type,
-    castRemoteTrustedContinuationExpiresAt: new Date(
-      nextContinuation.expiresAtMs,
-    ).toISOString(),
-    castRemoteTrustedContinuationType: nextContinuation.type,
-    castRemoteTrustedContinuationSessionId: nextContinuation.sessionId,
-    castRemoteTrustedContinuationContentId: nextContinuation.contentId,
-  });
-  logDebugEvent({
-    level: "info",
-    category: "cast",
-    message:
-      previousContinuation == null
-        ? "cast_remote_trusted_continuation_started"
-        : "cast_remote_trusted_continuation_extended",
-    source: "cast_remote",
-    data: nextContinuation,
-  });
-}
-
-function armCastRemoteControlSequence(
+function markCastRemoteControlSessionForObservation(
   event: ChromecastRemotePlaybackEvent,
-  reason: "seek_accepted",
+  reason: string,
 ) {
-  const nowMs = Date.now();
-  const activeSequence = getActiveCastRemoteControlSequence(nowMs);
-  const expiresAtMs =
-    nowMs +
-    playbackSynchronizationConfig.castRemoteObservation
-      .remoteControlSequenceWindowMs;
-  const nextSequence = activeSequence
-    ? {
-        ...activeSequence,
-        expiresAtMs: Math.max(activeSequence.expiresAtMs, expiresAtMs),
-        lastAcceptedSeekTime:
-          event.type === "seek"
-            ? event.currentTime
-            : activeSequence.lastAcceptedSeekTime,
-        lastInteractionType: event.type,
-        selectionSignature: event.selectionSignature,
-        sessionId: event.sessionId,
-      }
-    : {
-        expiresAtMs,
-        lastAcceptedSeekTime: event.type === "seek" ? event.currentTime : null,
-        lastInteractionType: event.type,
-        selectionSignature: event.selectionSignature,
-        sessionId: event.sessionId,
-        startedAtMs: nowMs,
-      };
+  const update = markCastRemoteControlSessionConfirming(
+    castRemoteObserverState.remoteControlSession,
+    {
+      contentId: event.contentId,
+      currentTime: event.currentTime,
+      selectionSignature: event.selectionSignature,
+      sessionId: event.sessionId,
+      status: event.status,
+      type: event.type,
+    },
+    Date.now(),
+    {
+      controlSessionWindowMs:
+        playbackSynchronizationConfig.castRemoteObservation.controlSessionWindowMs,
+      trustedContinuationWindowMs:
+        playbackSynchronizationConfig.castRemoteObservation
+          .trustedContinuationWindowMs,
+    },
+  );
 
-  castRemoteObserverState.remoteControlSequence = nextSequence;
-  updateChromecastRuntimeState({
-    castRemoteSequenceActive: true,
-    castRemoteSequenceReason: reason,
-    castRemoteSequenceExpiresAt: new Date(nextSequence.expiresAtMs).toISOString(),
-    castRemoteSequenceLastInteractionType: nextSequence.lastInteractionType,
-    castRemoteSequenceLastAcceptedSeekTime: nextSequence.lastAcceptedSeekTime,
-    castRemoteSequenceSessionId: nextSequence.sessionId,
-  });
+  castRemoteObserverState.remoteControlSession = update.session;
+  updateCastRemoteControlSessionRuntime(reason, update.session);
   logDebugEvent({
     level: "info",
     category: "cast",
     message:
-      activeSequence == null
-        ? "cast_remote_sequence_started"
-        : "cast_remote_sequence_extended_by_seek",
+      update.transition === "started"
+        ? "cast_remote_control_session_started"
+        : "cast_remote_control_session_extended",
     source: "cast_remote",
     data: {
       event,
-      sequence: nextSequence,
+      reason,
+      session: update.session,
     },
   });
+}
+
+function confirmCastRemoteControlSessionFromEvent(
+  event: ChromecastRemotePlaybackEvent,
+  reason: string,
+) {
+  const update = confirmCastRemoteControlSession(
+    castRemoteObserverState.remoteControlSession,
+    {
+      contentId: event.contentId,
+      currentTime: event.currentTime,
+      selectionSignature: event.selectionSignature,
+      sessionId: event.sessionId,
+      status: event.status,
+      type: event.type,
+    },
+    Date.now(),
+    {
+      controlSessionWindowMs:
+        playbackSynchronizationConfig.castRemoteObservation.controlSessionWindowMs,
+      trustedContinuationWindowMs:
+        playbackSynchronizationConfig.castRemoteObservation
+          .trustedContinuationWindowMs,
+    },
+  );
+
+  castRemoteObserverState.remoteControlSession = update.session;
+  updateCastRemoteControlSessionRuntime(reason, update.session);
+
+  if (update.transition !== "confirmed") {
+    logDebugEvent({
+      level: "info",
+      category: "cast",
+      message:
+        update.transition === "started"
+          ? "cast_remote_control_session_started"
+          : "cast_remote_control_session_extended",
+      source: "cast_remote",
+      data: {
+        event,
+        reason,
+        session: update.session,
+      },
+    });
+  }
 }
 
 function rejectCastRemoteIntent(
@@ -1101,11 +1071,7 @@ function evaluatePendingCastRemoteIntent(
   reason: "timer" | "repeat_observation",
 ) {
   const evaluationNowMs = Date.now();
-  const observationWindowMs =
-    evaluationNowMs - pendingIntent.firstObservedAtMs;
-  const activeSequence = getActiveCastRemoteControlSequence(evaluationNowMs);
-  const activeTrustedContinuation =
-    getActiveCastRemoteTrustedContinuation(evaluationNowMs);
+  const observationWindowMs = evaluationNowMs - pendingIntent.firstObservedAtMs;
   const recheckedSnapshot = readCurrentCastRemotePlaybackSnapshot(evaluationNowMs);
   const evaluationEvent =
     recheckedSnapshot &&
@@ -1126,6 +1092,16 @@ function evaluatePendingCastRemoteIntent(
     event: evaluationEvent,
     lastObservedAtMs: recheckedSnapshot?.observedAtMs ?? pendingIntent.lastObservedAtMs,
   };
+  const activeControlSession = getActiveCastRemoteControlSession(evaluationNowMs);
+  const trustedContinuationActive = isCastRemoteControlTrustedContinuationActive(
+    activeControlSession,
+    {
+      contentId: evaluationIntent.event.contentId,
+      selectionSignature: evaluationIntent.event.selectionSignature,
+      sessionId: evaluationIntent.event.sessionId,
+    },
+    evaluationNowMs,
+  );
   logDebugEvent({
     level: "info",
     category: "cast",
@@ -1180,7 +1156,7 @@ function evaluatePendingCastRemoteIntent(
       message: "cast_remote_timer_recheck_pause_snapshot",
       source: "cast_remote",
       data: {
-        activeSequence,
+        activeControlSession,
         observationCount: evaluationIntent.observationCount,
         snapshot: recheckedSnapshot,
       },
@@ -1194,12 +1170,7 @@ function evaluatePendingCastRemoteIntent(
       logDebugEvent({
         level: "info",
         category: "cast",
-        message:
-          activeSequence != null
-            ? "cast_remote_pause_committed_from_remote_sequence"
-            : reason === "timer"
-            ? "cast_remote_pause_committed_after_confirmation_window"
-            : "remote_pause_confirmed_fast_path",
+        message: "cast_remote_pause_committed",
         source: "cast_remote",
         data: {
           elapsedMs: pauseConfirmation.elapsedMs,
@@ -1252,8 +1223,8 @@ function evaluatePendingCastRemoteIntent(
     message: "cast_remote_timer_recheck_play_snapshot",
     source: "cast_remote",
     data: {
-      activeSequence,
-      activeTrustedContinuation,
+      activeControlSession,
+      trustedContinuationActive,
       observationCount: evaluationIntent.observationCount,
       snapshot: recheckedSnapshot,
     },
@@ -1266,21 +1237,26 @@ function evaluatePendingCastRemoteIntent(
   const playTimeAdvancedSeconds =
     evaluationIntent.event.currentTime - evaluationIntent.firstObservedCurrentTime;
   const playConfirmedFromTrustedContinuation =
-    activeTrustedContinuation != null &&
+    trustedContinuationActive &&
     playingStateConfirmed &&
-    activeTrustedContinuation.sessionId === evaluationIntent.event.sessionId &&
-    activeTrustedContinuation.contentId === evaluationIntent.event.contentId &&
-    (activeTrustedContinuation.selectionSignature == null ||
-      evaluationIntent.event.selectionSignature == null ||
-      activeTrustedContinuation.selectionSignature ===
-        evaluationIntent.event.selectionSignature) &&
     (playTimeAdvancedSeconds >= 0.1 ||
+      observationWindowMs >=
+        playbackSynchronizationConfig.castRemoteObservation
+          .playIntentConfirmationWindowMs);
+  const playConfirmedFromTimerRecheck =
+    playingStateConfirmed &&
+    recheckedSnapshot != null &&
+    recheckedSnapshot.sessionId === evaluationIntent.event.sessionId &&
+    recheckedSnapshot.status === "playing" &&
+    (recheckedSnapshot.currentTime >=
+      pendingIntent.firstObservedCurrentTime + 0.1 ||
       observationWindowMs >=
         playbackSynchronizationConfig.castRemoteObservation
           .playIntentConfirmationWindowMs);
 
   if (
     playConfirmedFromTrustedContinuation ||
+    playConfirmedFromTimerRecheck ||
     canConfirmCastRemoteIntent(evaluationIntent, evaluationNowMs)
   ) {
     logDebugEvent({
@@ -1288,11 +1264,11 @@ function evaluatePendingCastRemoteIntent(
       category: "cast",
       message:
         playConfirmedFromTrustedContinuation
-          ? "cast_remote_play_committed_from_trusted_continuation"
-          : activeSequence != null
-          ? "cast_remote_play_committed_from_remote_sequence"
+          ? "cast_remote_play_committed"
+          : playConfirmedFromTimerRecheck
+          ? "cast_remote_play_committed"
           : reason === "timer"
-          ? "cast_remote_play_committed_after_confirmation_window"
+          ? "cast_remote_play_committed"
           : "remote_play_confirmation_still_using_stricter_rules",
       source: "cast_remote",
       data: {
@@ -1324,12 +1300,13 @@ function evaluatePendingCastRemoteIntent(
     level: "info",
     category: "cast",
     message:
-      activeTrustedContinuation == null
-        ? "cast_remote_play_rejected_outside_trusted_continuation"
+      !trustedContinuationActive
+        ? "cast_remote_candidate_rejected_outside_trusted_continuation"
         : "cast_remote_play_rejected_after_recheck",
     source: "cast_remote",
     data: {
-      activeTrustedContinuation,
+      activeControlSession,
+      trustedContinuationActive,
       observationCount: evaluationIntent.observationCount,
       observationWindowMs,
       event: evaluationIntent.event,
@@ -1363,27 +1340,23 @@ function commitCastRemoteIntent(
       castRemoteObserverState.lastCommittedIntent.committedAtMs,
     ).toISOString(),
   });
+  confirmCastRemoteControlSessionFromEvent(candidate.event, "intent_committed");
   logDebugEvent({
     level: "info",
     category: "cast",
-    message: `Committed a confirmed Chromecast remote ${candidate.event.type} intent into shared room sync.`,
+    message:
+      candidate.event.type === "pause"
+        ? "cast_remote_pause_committed"
+        : candidate.event.type === "play"
+        ? "cast_remote_play_committed"
+        : "cast_remote_seek_committed",
     source: "cast_remote",
     data: {
       observationCount: candidate.observationCount,
       event: candidate.event,
     },
   });
-  if (candidate.event.type === "pause") {
-    armCastRemoteTrustedContinuation({
-      contentId: candidate.event.contentId,
-      currentTime: candidate.event.currentTime,
-      selectionSignature: candidate.event.selectionSignature,
-      sessionId: candidate.event.sessionId,
-      type: "pause",
-    });
-  } else if (candidate.event.type === "play") {
-    clearCastRemoteTrustedContinuation("play_committed");
-  }
+
   notifyChromecastRemotePlaybackListeners(candidate.event);
 }
 
@@ -1489,6 +1462,7 @@ function queuePendingCastRemoteCandidate(
   signature: string,
 ) {
   clearPendingCastRemoteCandidate("new_candidate");
+  markCastRemoteControlSessionForObservation(event, "candidate_observed");
   rejectCastRemoteObservation("rejected_due_to_insufficient_remote_stability", {
     signature,
     event,
@@ -1502,11 +1476,27 @@ function queuePendingCastRemoteCandidate(
     }
 
     settleCastRemoteLeadershipMode();
+    const evaluationNowMs = Date.now();
+    const activeControlSession = getActiveCastRemoteControlSession(
+      evaluationNowMs,
+    );
+    const trustedContinuationActive = isCastRemoteControlTrustedContinuationActive(
+      activeControlSession,
+      {
+        contentId: event.contentId,
+        selectionSignature: event.selectionSignature,
+        sessionId: event.sessionId,
+      },
+      evaluationNowMs,
+    );
+    const seekAllowedFromTrustedContinuation =
+      event.type === "seek" && trustedContinuationActive;
 
     if (
-      castRemoteObserverState.stabilizationUntilMs > Date.now() ||
+      !seekAllowedFromTrustedContinuation &&
+      (castRemoteObserverState.stabilizationUntilMs > evaluationNowMs ||
       castRemoteObserverState.leadershipMode === "cast_handoff" ||
-      castRemoteObserverState.leadershipMode === "cast_leader_stabilizing"
+      castRemoteObserverState.leadershipMode === "cast_leader_stabilizing")
     ) {
       rejectCastRemoteObservation(
         "rejected_due_to_cast_stabilization_window",
@@ -1515,6 +1505,17 @@ function queuePendingCastRemoteCandidate(
           event,
         },
       );
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "cast_remote_candidate_rejected_outside_trusted_continuation",
+        source: "cast_remote",
+        data: {
+          event,
+          signature,
+          reason: "stabilization_window",
+        },
+      });
       clearPendingCastRemoteCandidate("stabilization_window");
       return;
     }
@@ -1526,7 +1527,7 @@ function queuePendingCastRemoteCandidate(
       selectionSignature: event.selectionSignature,
     });
 
-    if (matchingLocalCommand) {
+    if (matchingLocalCommand && !seekAllowedFromTrustedContinuation) {
       rejectCastRemoteObservation(
         "rejected_due_to_recent_local_cast_command",
         {
@@ -1535,6 +1536,18 @@ function queuePendingCastRemoteCandidate(
           matchingLocalCommand,
         },
       );
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "cast_remote_candidate_rejected_outside_trusted_continuation",
+        source: "cast_remote",
+        data: {
+          event,
+          matchingLocalCommand,
+          signature,
+          reason: "recent_local_cast_command",
+        },
+      });
       clearPendingCastRemoteCandidate("recent_local_cast_command");
       return;
     }
@@ -1569,26 +1582,46 @@ function queuePendingCastRemoteCandidate(
       lastAppliedRemoteStateSignature: signature,
       lastRemoteOriginatedRoomCommand: event,
     });
-    if (event.type === "seek") {
-      armCastRemoteControlSequence(event, "seek_accepted");
-      armCastRemoteTrustedContinuation({
-        contentId: event.contentId,
-        currentTime: event.currentTime,
-        selectionSignature: event.selectionSignature,
-        sessionId: event.sessionId,
-        type: "seek",
-      });
-    }
+    confirmCastRemoteControlSessionFromEvent(event, "candidate_committed");
     logDebugEvent({
       level: "info",
       category: "cast",
-      message: `Accepted Chromecast remote ${event.type} after the stabilization debounce.`,
+      message:
+        event.type === "seek"
+          ? "cast_remote_seek_committed"
+          : event.type === "stop"
+          ? "cast_remote_stop_committed"
+          : `Accepted Chromecast remote ${event.type} after the stabilization debounce.`,
       source: "cast_remote",
-      data: event,
+      data: {
+        event,
+        trustedContinuationActive,
+      },
     });
+    if (seekAllowedFromTrustedContinuation) {
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "cast_remote_seek_allowed_from_trusted_continuation",
+        source: "cast_remote",
+        data: {
+          event,
+          session: activeControlSession,
+        },
+      });
+    }
+    if (event.type === "seek" && event.seekDirection === "forward") {
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "cast_remote_forward_seek_committed",
+        source: "cast_remote",
+        data: event,
+      });
+    }
     notifyChromecastRemotePlaybackListeners(event);
     clearPendingCastRemoteCandidate("accepted");
-  }, playbackSynchronizationConfig.castRemoteObservation.debounceWindowMs);
+  }, playbackSynchronizationConfig.castRemoteObservation.seekIntentConfirmationWindowMs);
 
   castRemoteObserverState.pendingCandidate = {
     event,
@@ -1608,7 +1641,7 @@ function queuePendingCastRemoteIntent(
 ) {
   const nowMs = Date.now();
   const isPauseIntent = event.status === "paused";
-  const activeSequence = getActiveCastRemoteControlSequence(nowMs);
+  const activeControlSession = getActiveCastRemoteControlSession(nowMs);
   const antiReversionWindowMs =
     playbackSynchronizationConfig.castRemoteObservation.antiReversionWindowMs;
   const lastCommittedIntent = castRemoteObserverState.lastCommittedIntent;
@@ -1618,7 +1651,7 @@ function queuePendingCastRemoteIntent(
     lastCommittedIntent.status !== event.status &&
     nowMs - lastCommittedIntent.committedAtMs < antiReversionWindowMs &&
     !isPauseIntent &&
-    activeSequence == null
+    activeControlSession == null
   ) {
     rejectCastRemoteIntent(
       "rejected_due_to_recent_committed_remote_intent",
@@ -1643,6 +1676,8 @@ function queuePendingCastRemoteIntent(
     });
     return;
   }
+
+  markCastRemoteControlSessionForObservation(event, "intent_observed");
 
   const existingIntent = castRemoteObserverState.pendingIntent;
 
@@ -1700,7 +1735,7 @@ function queuePendingCastRemoteIntent(
       : "cast_remote_candidate_pending",
     source: "cast_remote",
     data: {
-      activeSequence,
+      activeControlSession,
       event,
     },
   });
@@ -1824,6 +1859,7 @@ async function resolveCastMediaPayload(
   media: RoomMediaSummary,
   selectedAudioTrackId: string | null,
   selectedSubtitleTrackId: string | null,
+  preferredAudioLanguages: readonly string[] = [],
   options?: { forceRefresh?: boolean },
 ) {
   const normalizedAudioTrackId = normalizeSelectedTrackId(selectedAudioTrackId);
@@ -1835,6 +1871,7 @@ async function resolveCastMediaPayload(
     media.id,
     normalizedAudioTrackId,
     normalizedSubtitleTrackId,
+    preferredAudioLanguages,
   );
 
   if (!options?.forceRefresh) {
@@ -1847,7 +1884,12 @@ async function resolveCastMediaPayload(
   }
 
   const response = await fetch(
-    buildCastResolveUrl(roomId, normalizedAudioTrackId, normalizedSubtitleTrackId),
+    buildCastResolveUrl(
+      roomId,
+      normalizedAudioTrackId,
+      normalizedSubtitleTrackId,
+      preferredAudioLanguages,
+    ),
     {
       method: "GET",
       cache: "no-store",
@@ -2283,8 +2325,7 @@ function resolveRemotePlaybackCommandType(input: {
 function stopChromecastRemotePlaybackObservation(reason: string) {
   clearPendingCastRemoteCandidate(`${reason}:stop`);
   clearPendingCastRemoteIntent(`${reason}:stop`);
-  clearCastRemoteControlSequence(`${reason}:stop`);
-  clearCastRemoteTrustedContinuation(`${reason}:stop`);
+  clearCastRemoteControlSession(`${reason}:stop`);
 
   if (castRemoteObserverState.controllerCleanup) {
     castRemoteObserverState.controllerCleanup();
@@ -2308,8 +2349,7 @@ function stopChromecastRemotePlaybackObservation(reason: string) {
   castRemoteObserverState.lastObservedSessionId = null;
   castRemoteObserverState.lastObservedSignature = null;
   castRemoteObserverState.lastObservedStatus = null;
-  castRemoteObserverState.remoteControlSequence = null;
-  castRemoteObserverState.trustedContinuation = null;
+  castRemoteObserverState.remoteControlSession = null;
   castRemoteObserverState.stabilizationUntilMs = 0;
 
   updateChromecastRuntimeState({
@@ -2364,9 +2404,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
   }
 
   settleCastRemoteLeadershipMode(observedAtMs);
-  getActiveCastRemoteControlSequence(observedAtMs);
-  const activeTrustedContinuation =
-    getActiveCastRemoteTrustedContinuation(observedAtMs);
+  const activeControlSession = getActiveCastRemoteControlSession(observedAtMs);
 
   const mediaSession =
     getCurrentCastMediaSession() ??
@@ -2453,15 +2491,16 @@ function observeChromecastRemotePlaybackState(reason: string) {
   });
   const sessionChanged =
     castRemoteObserverState.lastObservedSessionId !== sessionIdentity.id;
+  const previousObservedCurrentTime = sessionChanged
+    ? null
+    : castRemoteObserverState.lastObservedCurrentTime;
   const commandType = resolveRemotePlaybackCommandType({
     nextStatus: status,
     nextCurrentTime: currentTime,
     previousStatus: sessionChanged
       ? null
       : castRemoteObserverState.lastObservedStatus,
-    previousCurrentTime: sessionChanged
-      ? null
-      : castRemoteObserverState.lastObservedCurrentTime,
+    previousCurrentTime: previousObservedCurrentTime,
   });
 
   castRemoteObserverState.lastObservedSessionId = sessionIdentity.id;
@@ -2497,15 +2536,19 @@ function observeChromecastRemotePlaybackState(reason: string) {
     playbackRate,
     selectionSignature,
   });
+  const trustedContinuationActive = isCastRemoteControlTrustedContinuationActive(
+    activeControlSession,
+    {
+      contentId,
+      selectionSignature,
+      sessionId: sessionIdentity.id,
+    },
+    observedAtMs,
+  );
   const playAllowedFromTrustedContinuation =
-    activeTrustedContinuation != null &&
+    trustedContinuationActive &&
     commandType === "play" &&
-    status === "playing" &&
-    activeTrustedContinuation.sessionId === sessionIdentity.id &&
-    activeTrustedContinuation.contentId === contentId &&
-    (activeTrustedContinuation.selectionSignature == null ||
-      selectionSignature == null ||
-      activeTrustedContinuation.selectionSignature === selectionSignature);
+    status === "playing";
 
   if (matchingLocalCommand && !playAllowedFromTrustedContinuation) {
     rememberCastObservationDelaySample(
@@ -2542,6 +2585,8 @@ function observeChromecastRemotePlaybackState(reason: string) {
           sessionId: sessionIdentity.id,
           contentId,
           selectionSignature,
+          seekDeltaSeconds: null,
+          seekDirection: null,
           source: "cast_remote",
         },
         { matchingLocalCommand, signature: nextSignature },
@@ -2553,6 +2598,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
         source: "cast_remote",
         data: {
           matchingLocalCommand,
+          trustedContinuationActive,
           commandType,
           currentTime,
           status,
@@ -2566,10 +2612,10 @@ function observeChromecastRemotePlaybackState(reason: string) {
     logDebugEvent({
       level: "info",
       category: "cast",
-      message: "cast_remote_play_allowed_despite_recent_local_cast_command",
+      message: "cast_remote_play_allowed_from_trusted_continuation",
       source: "cast_remote",
       data: {
-        activeTrustedContinuation,
+        activeControlSession,
         commandType,
         currentTime,
         matchingLocalCommand,
@@ -2602,6 +2648,8 @@ function observeChromecastRemotePlaybackState(reason: string) {
         sessionId: sessionIdentity.id,
         contentId,
         selectionSignature,
+        seekDeltaSeconds: null,
+        seekDirection: null,
         source: "cast_remote",
       };
 
@@ -2643,16 +2691,18 @@ function observeChromecastRemotePlaybackState(reason: string) {
         sessionId: sessionIdentity.id,
         contentId,
         selectionSignature,
+        seekDeltaSeconds: null,
+        seekDirection: null,
         source: "cast_remote",
       };
 
       logDebugEvent({
         level: "info",
         category: "cast",
-        message: "cast_remote_play_allowed_despite_stabilization_window",
+        message: "cast_remote_play_allowed_from_trusted_continuation",
         source: "cast_remote",
         data: {
-          activeTrustedContinuation,
+          activeControlSession,
           commandType,
           currentTime,
           expectedCurrentTime,
@@ -2676,6 +2726,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
         castRemoteObserverState.stabilizationUntilMs > 0
           ? new Date(castRemoteObserverState.stabilizationUntilMs).toISOString()
           : null,
+      trustedContinuationActive,
     });
     if (commandType === "play" || commandType === "pause") {
       rejectCastRemoteIntent(
@@ -2693,10 +2744,27 @@ function observeChromecastRemotePlaybackState(reason: string) {
           sessionId: sessionIdentity.id,
           contentId,
           selectionSignature,
+          seekDeltaSeconds: null,
+          seekDirection: null,
           source: "cast_remote",
         },
         { signature: nextSignature },
       );
+    }
+    if (!trustedContinuationActive) {
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "cast_remote_candidate_rejected_outside_trusted_continuation",
+        source: "cast_remote",
+        data: {
+          commandType,
+          currentTime,
+          expectedCurrentTime,
+          signature: nextSignature,
+          status,
+        },
+      });
     }
     return;
   }
@@ -2733,6 +2801,8 @@ function observeChromecastRemotePlaybackState(reason: string) {
           sessionId: sessionIdentity.id,
           contentId,
           selectionSignature,
+          seekDeltaSeconds: null,
+          seekDirection: null,
           source: "cast_remote",
         },
         { driftSeconds: plausibility.driftSeconds, signature: nextSignature },
@@ -2746,6 +2816,10 @@ function observeChromecastRemotePlaybackState(reason: string) {
   }
 
   const observedAt = new Date(observedAtMs).toISOString();
+  const seekDeltaSeconds =
+    commandType === "seek" && previousObservedCurrentTime != null
+      ? Math.round((currentTime - previousObservedCurrentTime) * 1000) / 1000
+      : null;
   const event: ChromecastRemotePlaybackEvent = {
     type: commandType,
     status,
@@ -2759,6 +2833,13 @@ function observeChromecastRemotePlaybackState(reason: string) {
     sessionId: sessionIdentity.id,
     contentId,
     selectionSignature,
+    seekDeltaSeconds,
+    seekDirection:
+      seekDeltaSeconds == null
+        ? null
+        : seekDeltaSeconds >= 0
+        ? "forward"
+        : "backward",
     source: "cast_remote",
   };
 
@@ -4453,6 +4534,7 @@ export async function prepareChromecastMediaForSession(
   media: RoomMediaSummary | null,
   selectedAudioTrackId: string | null,
   selectedSubtitleTrackId: string | null,
+  preferredAudioLanguages: readonly string[] = [],
 ) {
   if (!media) {
     throw new ChromecastError(
@@ -4466,6 +4548,7 @@ export async function prepareChromecastMediaForSession(
     media,
     selectedAudioTrackId,
     selectedSubtitleTrackId,
+    preferredAudioLanguages,
   );
 }
 
@@ -4519,6 +4602,7 @@ export async function syncRoomPlaybackToChromecast(
   playback: PlaybackStateSnapshot,
   selectedAudioTrackId: string | null,
   selectedSubtitleTrackId: string | null,
+  preferredAudioLanguages: readonly string[] = [],
 ) {
   if (!media) {
     return;
@@ -4537,6 +4621,7 @@ export async function syncRoomPlaybackToChromecast(
       media,
       selectedAudioTrackId,
       selectedSubtitleTrackId,
+      preferredAudioLanguages,
     );
     const existingMediaSession = currentSession
       ? resolveUsableCastMediaSession(resolvedMedia, loadRecord)

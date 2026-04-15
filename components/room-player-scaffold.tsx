@@ -19,11 +19,14 @@ import {
   type ChromecastAvailabilityStatus,
 } from "@/lib/chromecast";
 import {
+  getPreferredBrowserLanguages,
+  resolvePreferredExternalAudioTrack,
+} from "@/lib/audio-preferences";
+import {
   assessAudioTrackPlaybackSupport,
   isPlayableAudioTrackSupport,
   type AudioTrackPlaybackSupport,
 } from "@/lib/audio-track-playback";
-import { CatalogMoviePoster } from "@/components/catalog-movie-poster";
 import { createSafeId } from "@/lib/create-safe-id";
 import {
   formatPlaybackSeconds,
@@ -56,6 +59,7 @@ import {
   type RoomVideoPlayerLocalAudioState,
   type RoomVideoPlayerSnapshot,
 } from "@/components/room-video-player";
+import { RoomPlaybackSurface } from "@/components/room-playback-surface";
 
 type RoomPlayerScaffoldProps = { snapshot: RoomScaffoldSnapshot };
 type RoomConnectionStatus = "connecting" | "connected" | "disconnected";
@@ -93,13 +97,21 @@ type RoomPlayerAction =
   | { type: "last_action_source"; source: RoomActionSource | null };
 
 const EMPTY_AUDIO_TRACKS: RoomAudioTrackSummary[] = [];
+const EMPTY_LANGUAGES: string[] = [];
 
 function buildSyntheticPlaybackSnapshot(
   playback: PlaybackStateSnapshot,
   type: SharedRoomControlType,
-  deltaSeconds = 0,
+  options?: {
+    deltaSeconds?: number;
+    targetTimeSeconds?: number;
+  },
 ) {
   const resolvedCurrentTime = resolveSynchronizedPlaybackTime(playback);
+  const nextSeekTargetTime =
+    typeof options?.targetTimeSeconds === "number"
+      ? Math.max(0, options.targetTimeSeconds)
+      : Math.max(0, resolvedCurrentTime + (options?.deltaSeconds ?? 0));
 
   switch (type) {
     case "play":
@@ -123,7 +135,7 @@ function buildSyntheticPlaybackSnapshot(
     case "seek":
       return {
         status: playback.status,
-        currentTime: Math.max(0, resolvedCurrentTime + deltaSeconds),
+        currentTime: nextSeekTargetTime,
         playbackRate: playback.playbackRate,
       };
   }
@@ -297,14 +309,20 @@ function isHttpsUrl(urlValue: string | null | undefined) {
 
 function createInitialParticipantPreferences(
   snapshot: RoomScaffoldSnapshot,
+  preferredAudioLanguages: readonly string[],
 ): ParticipantMediaPreferences {
   const selectedSubtitleTrackId =
     snapshot.media?.subtitleTracks.find((track) => track.isDefault && track.isRenderable)?.id ??
     snapshot.media?.subtitleTracks.find((track) => track.isRenderable)?.id ??
     null;
+  const resolvedAudioTrack = resolvePreferredExternalAudioTrack({
+    audioTracks: snapshot.media?.audioTracks ?? EMPTY_AUDIO_TRACKS,
+    preferredLanguages: preferredAudioLanguages,
+  });
 
   return {
-    selectedAudioTrackId: null,
+    audioSelectionMode: "auto",
+    selectedAudioTrackId: resolvedAudioTrack.trackId,
     selectedSubtitleTrackId,
   };
 }
@@ -453,13 +471,18 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   const [participantSessionId] = useState(() =>
     typeof window !== "undefined" ? getOrCreateParticipantSessionId() : "",
   );
+  const [preferredAudioLanguages] = useState(() =>
+    getPreferredBrowserLanguages(),
+  );
   const [isMobileClient] = useState(() =>
     typeof navigator !== "undefined"
       ? /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent)
       : false,
   );
   const [participantPreferences, setParticipantPreferences] =
-    useState<ParticipantMediaPreferences>(() => createInitialParticipantPreferences(snapshot));
+    useState<ParticipantMediaPreferences>(() =>
+      createInitialParticipantPreferences(snapshot, preferredAudioLanguages),
+    );
   const [localAudioState, setLocalAudioState] = useState<RoomVideoPlayerLocalAudioState>(
     () => createInitialLocalAudioState(snapshot),
   );
@@ -497,6 +520,18 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   const mediaOriginSummary = snapshot.origins.mediaOrigin ?? "local relative URLs";
   const appOriginSummary = snapshot.origins.appOrigin ?? "local relative URLs";
   const audioTracks = snapshot.media?.audioTracks ?? EMPTY_AUDIO_TRACKS;
+  const resolvedAutomaticAudioTrack = resolvePreferredExternalAudioTrack({
+    audioTracks,
+    preferredLanguages: preferredAudioLanguages,
+  });
+  const requestedAudioTrackId =
+    participantPreferences.audioSelectionMode === "auto"
+      ? resolvedAutomaticAudioTrack.trackId
+      : participantPreferences.selectedAudioTrackId;
+  const castPreferredAudioLanguages =
+    participantPreferences.audioSelectionMode === "auto"
+      ? preferredAudioLanguages
+      : EMPTY_LANGUAGES;
   const audioTrackSupport = useMemo<Record<string, AudioTrackPlaybackSupport>>(() => {
     if (typeof document === "undefined") {
       return {};
@@ -518,11 +553,9 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   );
   const unavailableAudioTrackCount = audioTracks.length - playableAudioTracks.length;
   const effectiveSelectedAudioTrackId =
-    participantPreferences.selectedAudioTrackId &&
-    isPlayableAudioTrackSupport(
-      audioTrackSupport[participantPreferences.selectedAudioTrackId],
-    )
-      ? participantPreferences.selectedAudioTrackId
+    requestedAudioTrackId &&
+    isPlayableAudioTrackSupport(audioTrackSupport[requestedAudioTrackId])
+      ? requestedAudioTrackId
       : null;
   const selectedExternalAudioTrack =
     audioTracks.find(
@@ -541,18 +574,26 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     typeof castRuntimeState.resolvedEffectiveSubtitleTrackId === "string"
       ? castRuntimeState.resolvedEffectiveSubtitleTrackId
       : null;
+  const resolvedEffectiveCastSubtitleTrack =
+    (snapshot.media?.subtitleTracks ?? []).find(
+      (track) => track.id === resolvedEffectiveCastSubtitleTrackId,
+    ) ?? null;
   const castRemotePlayerObserved = castRuntimeState.remotePlayerObserved === true;
   const effectiveCastAudioTrack =
     audioTracks.find((track) => track.id === resolvedEffectiveCastAudioTrackId) ?? null;
+  const localSelectedSubtitleTrack =
+    (snapshot.media?.subtitleTracks ?? []).find(
+      (track) => track.id === participantPreferences.selectedSubtitleTrackId,
+    ) ?? null;
   const castAudioFallbackVisible =
     isCastActive &&
-    participantPreferences.selectedAudioTrackId != null &&
+    requestedAudioTrackId != null &&
     castFallbackApplied;
   const castAudioStatusMessage = !isCastActive
     ? null
     : effectiveCastAudioTrack
       ? `Chromecast audio is using ${effectiveCastAudioTrack.label}.`
-      : participantPreferences.selectedAudioTrackId
+      : requestedAudioTrackId
         ? castFallbackApplied
           ? "Chromecast is using the base video audio instead of the selected external audio."
           : "Chromecast audio is using the resolved base video audio."
@@ -600,6 +641,61 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     isMobile: isMobileClient,
     leadershipMode: playbackLeadershipMode,
   });
+  const surfaceCurrentTime =
+    state.observedPlayback?.currentTime ?? resolvedAuthoritativeCurrentTime;
+  const surfaceDurationSeconds =
+    state.observedPlayback?.duration ?? snapshot.media?.durationSeconds ?? null;
+  const surfaceSubtitleStatusMessage = isCastActive
+    ? `Chromecast subtitles are using ${resolvedEffectiveCastSubtitleTrack?.label ?? "no subtitle track"}.`
+    : `Local subtitles are using ${localSelectedSubtitleTrack?.label ?? "no subtitle track"}.`;
+  const surfacePlaybackStatusMessage = playbackTarget === "cast"
+    ? castRemotePlayerObserved
+      ? "Chromecast remote actions and web controls both flow back through the authoritative room playback anchor."
+      : "Chromecast is holding the room timeline while the receiver observer finishes attaching."
+    : playbackAwaitingScheduledStart
+      ? `Shared playback is staged and will start together in about ${Math.ceil(resolvePlaybackStartDelayMs(state.playback) / 100) / 10}s.`
+      : "Shared controls update the room anchor first, then local playback reconciles to that authoritative state.";
+  const surfacePrimaryClockLabel = playbackTarget === "cast"
+    ? "Chromecast receiver"
+    : state.observedPlayback?.primaryClockSource === "external_audio"
+      ? "External audio"
+      : "Embedded video";
+  const surfaceSyncModeLabel = playbackTarget === "cast"
+    ? "Authoritative room sync mirrored to Chromecast"
+    : state.observedPlayback?.syncMode === "external_audio_mode"
+      ? "External audio clock with gentle video follow"
+      : "Embedded media clock";
+
+  function handleAudioTrackSelection(nextAudioTrackId: string | null) {
+    setParticipantPreferences((currentPreferences) => ({
+      ...currentPreferences,
+      audioSelectionMode: "manual",
+      selectedAudioTrackId: nextAudioTrackId,
+    }));
+    setDebugLastActionSource("local_user");
+    logDebugEvent({
+      level: "info",
+      category: "playback",
+      message: "Changed local audio source.",
+      source: "local_user",
+      data: { nextAudioTrackId },
+    });
+  }
+
+  function handleSubtitleTrackSelection(nextSubtitleTrackId: string | null) {
+    setParticipantPreferences((currentPreferences) => ({
+      ...currentPreferences,
+      selectedSubtitleTrackId: nextSubtitleTrackId,
+    }));
+    setDebugLastActionSource("local_user");
+    logDebugEvent({
+      level: "info",
+      category: "playback",
+      message: "Changed local subtitles.",
+      source: "local_user",
+      data: { nextSubtitleTrackId },
+    });
+  }
 
   const clearScheduledCastPlaybackTimer = useEffectEvent(() => {
     if (scheduledCastPlaybackTimerRef.current != null) {
@@ -687,6 +783,9 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
             playback,
             participantPreferencesRef.current.selectedAudioTrackId,
             participantPreferencesRef.current.selectedSubtitleTrackId,
+            participantPreferencesRef.current.audioSelectionMode === "auto"
+              ? preferredAudioLanguages
+              : [],
           );
 
           const scheduledCastStartDelayMs = resolvePlaybackStartDelayMs(playback);
@@ -700,6 +799,9 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                 authoritativePlaybackRef.current,
                 participantPreferencesRef.current.selectedAudioTrackId,
                 participantPreferencesRef.current.selectedSubtitleTrackId,
+                participantPreferencesRef.current.audioSelectionMode === "auto"
+                  ? preferredAudioLanguages
+                  : [],
               ).catch((error) => {
                 logDebugEvent({
                   level: "error",
@@ -790,7 +892,12 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
         currentTime: resolvedAuthoritativeCurrentTime,
         videoCurrentTime: resolvedAuthoritativeCurrentTime,
         audibleCurrentTime: null,
+        duration: snapshot.media?.durationSeconds ?? null,
         avDriftSeconds: null,
+        primaryClockSource: selectedExternalAudioTrack ? "external_audio" : "video",
+        syncMode: selectedExternalAudioTrack
+          ? "external_audio_mode"
+          : "embedded_audio_mode",
         playbackRate: state.playback.playbackRate,
         status: state.playback.status,
       }
@@ -801,6 +908,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     type: SharedRoomControlType,
     options?: {
       deltaSeconds?: number;
+      targetTimeSeconds?: number;
     },
   ) {
     const player = playerRef.current;
@@ -821,6 +929,10 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       return player.stop();
     }
 
+    if (typeof options?.targetTimeSeconds === "number") {
+      return player.seekTo(options.targetTimeSeconds);
+    }
+
     return player.seekBy(options?.deltaSeconds ?? 0);
   }
 
@@ -828,6 +940,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     type: SharedRoomControlType,
     options?: {
       deltaSeconds?: number;
+      targetTimeSeconds?: number;
     },
   ) {
     const player = playerRef.current;
@@ -839,7 +952,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       const syntheticSnapshot = buildSyntheticPlaybackSnapshot(
         authoritativePlaybackRef.current,
         type,
-        options?.deltaSeconds ?? 0,
+        options,
       );
 
       dispatch({
@@ -918,7 +1031,9 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           ? 0
           : type === "seek"
             ? optimisticSnapshot?.currentTime ??
-              Math.max(0, currentSnapshot.currentTime + (options?.deltaSeconds ?? 0))
+              (typeof options?.targetTimeSeconds === "number"
+                ? Math.max(0, options.targetTimeSeconds)
+                : Math.max(0, currentSnapshot.currentTime + (options?.deltaSeconds ?? 0)))
             : optimisticSnapshot?.currentTime ?? currentSnapshot.currentTime;
       const nextStatus =
         type === "play"
@@ -968,6 +1083,17 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
         data: error,
       });
     }
+  }
+
+  function handlePlaybackSurfaceCommand(command: {
+    type: SharedRoomControlType;
+    deltaSeconds?: number;
+    targetTimeSeconds?: number;
+  }) {
+    void dispatchSharedCommand(command.type, {
+      deltaSeconds: command.deltaSeconds,
+      targetTimeSeconds: command.targetTimeSeconds,
+    });
   }
 
   const handleCastRemotePlayback = useEffectEvent(
@@ -1141,6 +1267,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       authoritativePlaybackRef.current,
       participantPreferences.selectedAudioTrackId,
       participantPreferences.selectedSubtitleTrackId,
+      castPreferredAudioLanguages,
     )
       .catch((error) => {
         const message =
@@ -1155,8 +1282,11 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       });
   }, [
     castStatus,
+    participantPreferences.audioSelectionMode,
     participantPreferences.selectedAudioTrackId,
     participantPreferences.selectedSubtitleTrackId,
+    castPreferredAudioLanguages,
+    preferredAudioLanguages,
     snapshot.media,
     snapshot.roomId,
   ]);
@@ -1193,6 +1323,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
         snapshot.media,
         participantPreferences.selectedAudioTrackId,
         participantPreferences.selectedSubtitleTrackId,
+        castPreferredAudioLanguages,
       );
     } catch (error) {
       logDebugEvent({
@@ -1208,16 +1339,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
 
     await requestChromecastSession();
   }
-
-  const resolvedEffectiveCastSubtitleTrack =
-    (snapshot.media?.subtitleTracks ?? []).find(
-      (track) => track.id === resolvedEffectiveCastSubtitleTrackId,
-    ) ?? null;
-  const localSelectedSubtitleTrack =
-    (snapshot.media?.subtitleTracks ?? []).find(
-      (track) => track.id === participantPreferences.selectedSubtitleTrackId,
-    ) ?? null;
-
   return (
     <div className="grid gap-6 xl:grid-cols-[1.45fr_0.85fr]">
       <section
@@ -1263,143 +1384,198 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
             >
               Cast {castDisplayStatus}
             </div>
-            <button
-              type="button"
-              onClick={() => void handleCastButton()}
-              disabled={
-                castDisplayStatus === "loading" ||
-                castDisplayStatus === "connecting" ||
-                (!isCastActive && !canRequestSession)
-              }
-              data-debug-cast-button="true"
-              className="rounded-full border border-white/10 bg-black/20 px-5 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7] hover:text-[#dbe8ff] disabled:cursor-not-allowed disabled:border-white/10 disabled:text-[#8c8a91]"
-            >
-              {isCastActive
-                ? "End Cast"
-                : castDisplayStatus === "loading"
-                  ? "Checking Cast..."
-                  : castDisplayStatus === "connecting"
-                  ? "Connecting Cast..."
-                  : "Start Cast"}
-            </button>
+            {playbackTarget === "cast" || !snapshot.media?.videoUrl ? (
+              <button
+                type="button"
+                onClick={() => void handleCastButton()}
+                disabled={
+                  castDisplayStatus === "loading" ||
+                  castDisplayStatus === "connecting" ||
+                  (!isCastActive && !canRequestSession)
+                }
+                data-debug-cast-button="true"
+                className="rounded-full border border-white/10 bg-black/20 px-5 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7] hover:text-[#dbe8ff] disabled:cursor-not-allowed disabled:border-white/10 disabled:text-[#8c8a91]"
+              >
+                {isCastActive
+                  ? "End Cast"
+                  : castDisplayStatus === "loading"
+                    ? "Checking Cast..."
+                    : castDisplayStatus === "connecting"
+                    ? "Connecting Cast..."
+                    : "Start Cast"}
+              </button>
+            ) : null}
           </div>
         </div>
 
-        {playbackTarget === "local" ? (
-          <div className="mt-8">
-            <RoomVideoPlayer
-              ref={playerRef}
-              roomId={snapshot.roomId}
-              title={snapshot.media?.title ?? "Uploaded media"}
-              videoUrl={snapshot.media?.videoUrl ?? null}
-              leadershipMode={playbackLeadershipMode}
-              reconciliationProfileKey={reconciliationProfileKey}
-              audioTracks={audioTracks}
-              audioTrackSupport={audioTrackSupport}
-              selectedAudioTrackId={effectiveSelectedAudioTrackId}
-              subtitleTracks={snapshot.media?.subtitleTracks ?? []}
-              selectedSubtitleTrackId={participantPreferences.selectedSubtitleTrackId}
-              playbackRate={state.playback.playbackRate}
-              suppressLocalAudioOutput={false}
-              onAudioStateChange={(nextLocalAudioState) =>
-                setLocalAudioState((currentLocalAudioState) =>
-                  areLocalAudioStatesEqual(currentLocalAudioState, nextLocalAudioState)
-                    ? currentLocalAudioState
-                    : nextLocalAudioState,
-                )
-              }
-              onObservedStateChange={(playerSnapshot) =>
-                dispatch({ type: "video_observed", snapshot: playerSnapshot })
-              }
-              onSyncIssueChange={(message) =>
-                dispatch({ type: "sync_issue", message })
-              }
-            />
-          </div>
-        ) : (
-          <div className="mt-8 rounded-[1.8rem] border border-white/10 bg-black/20 p-5">
-            <div className="grid gap-5 md:grid-cols-[12rem_1fr]">
-              <CatalogMoviePoster
-                title={roomDisplayTitle}
-                posterUrl={snapshot.movie?.posterUrl ?? null}
-                className="aspect-[3/4] min-h-[16rem]"
+        <div className="mt-8">
+          <RoomPlaybackSurface
+            title={roomDisplayTitle}
+            subtitle={
+              snapshot.movie?.releaseLabel ??
+              (playbackTarget === "cast"
+                ? "Chromecast companion controls"
+                : "Shared room playback")
+            }
+            playbackTarget={playbackTarget}
+            playbackStatus={state.playback.status}
+            currentTimeSeconds={surfaceCurrentTime}
+            durationSeconds={surfaceDurationSeconds}
+            audioTracks={audioTracks}
+            audioTrackSupport={audioTrackSupport}
+            selectedAudioTrackId={effectiveSelectedAudioTrackId}
+            audioSelectionMode={participantPreferences.audioSelectionMode}
+            subtitleTracks={snapshot.media?.subtitleTracks ?? []}
+            selectedSubtitleTrackId={participantPreferences.selectedSubtitleTrackId}
+            audioStatusMessage={
+              playbackTarget === "cast"
+                ? castAudioStatusMessage ?? "Chromecast is using the base video audio."
+                : displayedLocalAudioState.activeSource === "external"
+                  ? `External audio track active${selectedExternalAudioTrack ? `: ${selectedExternalAudioTrack.label}.` : "."}`
+                  : displayedLocalAudioState.activeSource === "embedded"
+                    ? "Embedded video audio active."
+                    : "No local audio source is active yet."
+            }
+            subtitleStatusMessage={surfaceSubtitleStatusMessage}
+            playbackStatusMessage={surfacePlaybackStatusMessage}
+            castStatus={castDisplayStatus}
+            canToggleCast={
+              !(
+                castDisplayStatus === "loading" ||
+                castDisplayStatus === "connecting" ||
+                (!isCastActive && !canRequestSession)
+              )
+            }
+            onCastToggle={() => void handleCastButton()}
+            onRequestCommand={handlePlaybackSurfaceCommand}
+            onSelectAudioTrack={handleAudioTrackSelection}
+            onSelectSubtitleTrack={handleSubtitleTrackSelection}
+            primaryClockLabel={surfacePrimaryClockLabel}
+            syncModeLabel={surfaceSyncModeLabel}
+            syncIssue={state.syncIssue}
+            castRemoteObserved={castRemotePlayerObserved}
+          >
+            {playbackTarget === "local" ? (
+              <RoomVideoPlayer
+                ref={playerRef}
+                roomId={snapshot.roomId}
+                title={snapshot.media?.title ?? "Uploaded media"}
+                videoUrl={snapshot.media?.videoUrl ?? null}
+                leadershipMode={playbackLeadershipMode}
+                reconciliationProfileKey={reconciliationProfileKey}
+                audioTracks={audioTracks}
+                audioTrackSupport={audioTrackSupport}
+                selectedAudioTrackId={effectiveSelectedAudioTrackId}
+                subtitleTracks={snapshot.media?.subtitleTracks ?? []}
+                selectedSubtitleTrackId={participantPreferences.selectedSubtitleTrackId}
+                playbackRate={state.playback.playbackRate}
+                suppressLocalAudioOutput={false}
+                onAudioStateChange={(nextLocalAudioState) =>
+                  setLocalAudioState((currentLocalAudioState) =>
+                    areLocalAudioStatesEqual(currentLocalAudioState, nextLocalAudioState)
+                      ? currentLocalAudioState
+                      : nextLocalAudioState,
+                  )
+                }
+                onObservedStateChange={(playerSnapshot) =>
+                  dispatch({ type: "video_observed", snapshot: playerSnapshot })
+                }
+                onSyncIssueChange={(message) =>
+                  dispatch({ type: "sync_issue", message })
+                }
+                className="h-full w-full"
               />
-              <div className="space-y-4">
-                <div className="rounded-[1.4rem] border border-white/10 bg-[#111922] px-4 py-4">
+            ) : (
+              <div
+                className="relative h-full w-full bg-[radial-gradient(circle_at_top,#152033,#04070d_62%)]"
+                style={
+                  snapshot.movie?.posterUrl
+                    ? {
+                        backgroundImage: `linear-gradient(90deg, rgba(4,7,13,0.82), rgba(4,7,13,0.4)), url(${snapshot.movie.posterUrl})`,
+                        backgroundPosition: "center",
+                        backgroundSize: "cover",
+                      }
+                    : undefined
+                }
+              >
+                <div className="absolute left-6 top-6 max-w-sm rounded-[1.5rem] border border-white/10 bg-black/30 px-5 py-4 backdrop-blur-xl">
                   <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#8fa7c7]">
                     Cast companion mode
                   </p>
-                  <p className="mt-2 text-base font-semibold text-white">
-                    The TV is the only active playback surface right now.
+                  <p className="mt-2 text-lg font-semibold text-white">
+                    The TV is holding the room timeline.
                   </p>
-                  <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
-                    Local video and audio are suppressed while Chromecast holds
-                    the room timeline.
+                  <p className="mt-2 text-sm leading-6 text-[#d4d0d8]">
+                    Shared room commands, scrub commits, and Chromecast remote actions
+                    all converge through the same authoritative playback anchor.
                   </p>
                 </div>
-                <div className="rounded-[1.4rem] border border-white/10 bg-[#111922] px-4 py-4">
-                  <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#8fa7c7]">
+                <div className="absolute bottom-6 left-6 max-w-md rounded-[1.5rem] border border-white/10 bg-black/32 px-5 py-4 backdrop-blur-xl">
+                  <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#d7c19d]">
                     Effective Cast media
                   </p>
-                  <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+                  <p className="mt-2 text-sm leading-6 text-[#d4d0d8]">
                     {castAudioStatusMessage}
                   </p>
-                  <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
-                    Chromecast subtitles are using{" "}
-                    {resolvedEffectiveCastSubtitleTrack?.label ?? "no subtitle track"}.
-                  </p>
-                </div>
-                <div className="rounded-[1.4rem] border border-white/10 bg-[#111922] px-4 py-4">
-                  <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#8fa7c7]">
-                    Remote sync
-                  </p>
-                  <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
-                    {castRemotePlayerObserved
-                      ? "Chromecast remote play, pause, and seek changes are being mirrored back into the room."
-                      : "Waiting for the remote player observer to attach to the current Cast media session."}
+                  <p className="mt-2 text-sm leading-6 text-[#d4d0d8]">
+                    {surfaceSubtitleStatusMessage}
                   </p>
                 </div>
               </div>
-            </div>
-          </div>
-        )}
+            )}
+          </RoomPlaybackSurface>
+        </div>
 
-        <div data-debug-playback-controls="true" className="mt-6 grid gap-3 sm:grid-cols-5">
-          <button
-            type="button"
-            onClick={() => void dispatchSharedCommand("play")}
-            className="rounded-3xl bg-[#d07a3e] px-4 py-3 text-sm font-semibold text-white transition hover:bg-[#b76630]"
-          >
-            Play
-          </button>
-          <button
-            type="button"
-            onClick={() => void dispatchSharedCommand("pause")}
-            className="rounded-3xl border border-white/10 bg-black/20 px-4 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7]"
-          >
-            Pause
-          </button>
-          <button
-            type="button"
-            onClick={() => void dispatchSharedCommand("seek", { deltaSeconds: -10 })}
-            className="rounded-3xl border border-white/10 bg-black/20 px-4 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7]"
-          >
-            Seek -10s
-          </button>
-          <button
-            type="button"
-            onClick={() => void dispatchSharedCommand("seek", { deltaSeconds: 10 })}
-            className="rounded-3xl border border-white/10 bg-black/20 px-4 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7]"
-          >
-            Seek +10s
-          </button>
-          <button
-            type="button"
-            onClick={() => void dispatchSharedCommand("stop")}
-            className="rounded-3xl border border-white/10 bg-black/20 px-4 py-3 text-sm font-semibold text-white transition hover:border-[#8fa7c7]"
-          >
-            Stop
-          </button>
+        <div className="mt-6 grid gap-4 lg:grid-cols-3">
+          <div className="rounded-[1.6rem] border border-white/10 bg-black/20 p-5">
+            <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#8fa7c7]">
+              Audio routing
+            </p>
+            <p className="mt-3 text-sm leading-6 text-[#d4d0d8]">
+              {playbackTarget === "cast"
+                ? castAudioStatusMessage
+                : displayedLocalAudioState.activeSource === "external"
+                  ? `External audio remains the audible clock${selectedExternalAudioTrack ? ` through ${selectedExternalAudioTrack.label}.` : "."}`
+                  : "Embedded video audio is currently the audible clock."}
+            </p>
+            {participantPreferences.audioSelectionMode === "auto" &&
+            requestedAudioTrackId ? (
+              <p className="mt-2 text-xs leading-6 text-[#9e9aa2]">
+                System language matching selected this external audio track automatically.
+              </p>
+            ) : null}
+            {displayedLocalAudioState.issue && playbackTarget === "local" ? (
+              <p className="mt-2 text-xs leading-6 text-[#ffd6d5]">
+                {displayedLocalAudioState.issue}
+              </p>
+            ) : null}
+          </div>
+          <div className="rounded-[1.6rem] border border-white/10 bg-black/20 p-5">
+            <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#8fa7c7]">
+              Subtitle routing
+            </p>
+            <p className="mt-3 text-sm leading-6 text-[#d4d0d8]">
+              {surfaceSubtitleStatusMessage}
+            </p>
+            {(snapshot.media?.subtitleTracks ?? []).length > 0 &&
+            (snapshot.media?.subtitleTracks ?? []).every((track) => !track.isRenderable) ? (
+              <p className="mt-2 text-xs leading-6 text-[#9e9aa2]">
+                Subtitle files are stored for this room, but none are in a browser-renderable WebVTT form yet.
+              </p>
+            ) : null}
+          </div>
+          <div className="rounded-[1.6rem] border border-white/10 bg-black/20 p-5">
+            <p className="text-xs font-semibold uppercase tracking-[0.26em] text-[#8fa7c7]">
+              Room sync
+            </p>
+            <p className="mt-3 text-sm leading-6 text-[#d4d0d8]">
+              {playbackTarget === "cast"
+                ? castRemotePlayerObserved
+                  ? "Chromecast remote play, pause, and seek actions are actively feeding back into the room state."
+                  : "Waiting for the remote player observer to attach to the current Cast media session."
+                : "Local playback still follows the room anchor, and scrub commits only emit a single authoritative shared seek when you release the timeline."}
+            </p>
+          </div>
         </div>
 
         {playbackAwaitingScheduledStart ? (
@@ -1482,114 +1658,31 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
               </div>
             ) : null}
           </div>
-          <div className="space-y-4">
-            <div>
-              <label htmlFor="audio-select" className="text-sm font-semibold uppercase tracking-[0.25em] text-[#d7c19d]">
-                Audio track
-              </label>
-              <select
-                id="audio-select"
-                value={effectiveSelectedAudioTrackId ?? "video"}
-                disabled={playableAudioTracks.length === 0}
-                onChange={(event) => {
-                  const nextAudioTrackId =
-                    event.target.value === "video" ? null : event.target.value;
-                  setParticipantPreferences((currentPreferences) => ({
-                    ...currentPreferences,
-                    selectedAudioTrackId: nextAudioTrackId,
-                  }));
-                  setDebugLastActionSource("local_user");
-                  logDebugEvent({
-                    level: "info",
-                    category: "playback",
-                    message: "Changed local audio source.",
-                    source: "local_user",
-                    data: { nextAudioTrackId },
-                  });
-                }}
-                className="mt-3 min-h-12 w-full rounded-2xl border border-white/10 bg-[#120e13] px-4 text-white outline-none transition focus:border-[#8fa7c7] disabled:text-[#8c8a91]"
-              >
-                <option value="video">Embedded video audio</option>
-                {audioTracks.map((track) => {
-                  const trackSupport = audioTrackSupport[track.id];
-                  const trackPlayable = isPlayableAudioTrackSupport(trackSupport);
-
-                  return (
-                    <option
-                      key={track.id}
-                      value={track.id}
-                      disabled={!trackPlayable}
-                    >
-                      {track.label} ({track.language})
-                      {trackPlayable ? "" : " - stored only / unavailable"}
-                    </option>
-                  );
-                })}
-              </select>
-              <p className="mt-3 text-xs leading-6 text-[#c7c2ca]">
-                {playbackTarget === "cast"
-                  ? castAudioStatusMessage
-                  : displayedLocalAudioState.activeSource === "external"
-                    ? `External audio track active${selectedExternalAudioTrack ? `: ${selectedExternalAudioTrack.label}.` : "."}`
-                    : displayedLocalAudioState.activeSource === "embedded"
-                      ? "Embedded video audio active."
-                      : "No local audio source is active yet."}
+          <div className="grid gap-4">
+            <div className="rounded-[1.4rem] border border-white/10 bg-[#120e13] px-4 py-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-[#d7c19d]">
+                Player menus
               </p>
-              {audioTracks.length > 0 ? (
-                <p className="mt-2 text-xs leading-6 text-[#9e9aa2]">
-                  {playableAudioTracks.length > 0
-                    ? `${playableAudioTracks.length} alternate audio track${playableAudioTracks.length === 1 ? "" : "s"} can play locally in this browser.${unavailableAudioTrackCount > 0 ? ` ${unavailableAudioTrackCount} stored track${unavailableAudioTrackCount === 1 ? "" : "s"} are unavailable.` : ""}`
-                    : "Alternate audio files are stored for this room, but none are playable in this browser session."}
-                </p>
-              ) : null}
-              {displayedLocalAudioState.issue && playbackTarget === "local" ? (
-                <p className="mt-2 text-xs leading-6 text-[#ffd6d5]">
-                  {displayedLocalAudioState.issue}
-                </p>
-              ) : null}
+              <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+                Audio, subtitles, settings, fullscreen, and Cast controls now live directly on the player surface instead of separate page selects.
+              </p>
             </div>
-            <div>
-              <label htmlFor="subtitle-select" className="text-sm font-semibold uppercase tracking-[0.25em] text-[#d7c19d]">
-                Subtitle track
-              </label>
-              <select
-                id="subtitle-select"
-                value={participantPreferences.selectedSubtitleTrackId ?? "none"}
-                onChange={(event) => {
-                  const nextSubtitleTrackId = event.target.value === "none" ? null : event.target.value;
-                  setParticipantPreferences((currentPreferences) => ({
-                    ...currentPreferences,
-                    selectedSubtitleTrackId: nextSubtitleTrackId,
-                  }));
-                  setDebugLastActionSource("local_user");
-                  logDebugEvent({
-                    level: "info",
-                    category: "playback",
-                    message: "Changed local subtitles.",
-                    source: "local_user",
-                    data: { nextSubtitleTrackId },
-                  });
-                }}
-                className="mt-3 min-h-12 w-full rounded-2xl border border-white/10 bg-[#120e13] px-4 text-white outline-none transition focus:border-[#8fa7c7]"
-              >
-                <option value="none">No subtitles selected</option>
-                {(snapshot.media?.subtitleTracks ?? []).map((track) => (
-                  <option key={track.id} value={track.id}>
-                    {track.label}
-                    {track.isRenderable ? "" : " (stored, not renderable yet)"}
-                  </option>
-                ))}
-              </select>
-              {isCastActive ? (
-                <p className="mt-2 text-xs leading-6 text-[#c7c2ca]">
-                  Chromecast subtitles are using{" "}
-                  {resolvedEffectiveCastSubtitleTrack?.label ?? "no subtitle track"}.
-                </p>
-              ) : (
-                <p className="mt-2 text-xs leading-6 text-[#c7c2ca]">
-                  Local subtitles are using {localSelectedSubtitleTrack?.label ?? "no subtitle track"}.
-                </p>
-              )}
+            <div className="rounded-[1.4rem] border border-white/10 bg-[#120e13] px-4 py-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-[#d7c19d]">
+                Available tracks
+              </p>
+              <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+                {audioTracks.length > 0
+                  ? playableAudioTracks.length > 0
+                    ? `${playableAudioTracks.length} alternate audio track${playableAudioTracks.length === 1 ? "" : "s"} can play locally in this browser.${unavailableAudioTrackCount > 0 ? ` ${unavailableAudioTrackCount} stored track${unavailableAudioTrackCount === 1 ? "" : "s"} are unavailable.` : ""}`
+                    : "Alternate audio files are stored for this room, but none are playable in this browser session."
+                  : "This room currently uses the embedded video audio only."}
+              </p>
+              <p className="mt-2 text-sm leading-6 text-[#c7c2ca]">
+                {(snapshot.media?.subtitleTracks ?? []).length > 0
+                  ? `${(snapshot.media?.subtitleTracks ?? []).length} subtitle track${(snapshot.media?.subtitleTracks ?? []).length === 1 ? "" : "s"} are available from the on-player subtitle menu.`
+                  : "No uploaded subtitle tracks are available for this room yet."}
+              </p>
             </div>
           </div>
         </div>

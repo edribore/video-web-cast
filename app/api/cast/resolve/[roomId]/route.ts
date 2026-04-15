@@ -21,11 +21,15 @@ export async function GET(
   const { roomId } = await context.params;
   const requestUrl = new URL(request.url);
   const audioTrackId = requestUrl.searchParams.get("audioTrackId");
+  const preferredAudioLanguages = requestUrl.searchParams.getAll(
+    "preferredAudioLanguage",
+  );
   const subtitleTrackId = requestUrl.searchParams.get("subtitleTrackId");
 
   try {
     const payload = await resolveCastMediaForRoom({
       castBaseUrl: resolveCastPublicBaseUrl(request.headers),
+      preferredAudioLanguages,
       requestedAudioTrackId: audioTrackId,
       requestedSubtitleTrackId: subtitleTrackId,
       roomId,

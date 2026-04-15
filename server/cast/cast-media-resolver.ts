@@ -22,6 +22,7 @@ import type {
 
 type ResolveCastMediaInput = {
   castBaseUrl: string | null;
+  preferredAudioLanguages: readonly string[];
   requestedAudioTrackId: string | null;
   requestedSubtitleTrackId: string | null;
   roomId: string;
@@ -327,6 +328,7 @@ export async function resolveCastMediaForRoom(
   const selectedAudioTrack = resolveSelectedAudioTrack(
     room.mediaAsset.audioTracks,
     normalizedAudioTrackId,
+    input.preferredAudioLanguages,
   );
 
   if (normalizedAudioTrackId && !selectedAudioTrack) {

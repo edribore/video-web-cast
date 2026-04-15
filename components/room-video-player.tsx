@@ -44,6 +44,7 @@ export type RoomVideoPlayerSnapshot = {
   currentTime: number;
   videoCurrentTime: number;
   audibleCurrentTime: number | null;
+  duration: number | null;
   avDriftSeconds: number | null;
   primaryClockSource: "video" | "external_audio";
   syncMode: LocalPlaybackSyncMode;
@@ -72,6 +73,7 @@ export type RoomVideoPlayerHandle = {
   play(): Promise<RoomVideoPlayerSnapshot>;
   pause(): RoomVideoPlayerSnapshot;
   stop(): RoomVideoPlayerSnapshot;
+  seekTo(targetSeconds: number): RoomVideoPlayerSnapshot;
   seekBy(deltaSeconds: number): RoomVideoPlayerSnapshot;
   applySharedPlayback(
     playback: PlaybackStateSnapshot,
@@ -94,6 +96,7 @@ type RoomVideoPlayerProps = {
   onAudioStateChange(snapshot: RoomVideoPlayerLocalAudioState): void;
   onObservedStateChange(snapshot: RoomVideoPlayerSnapshot): void;
   onSyncIssueChange(message: string | null): void;
+  className?: string;
 };
 
 type RoomCorrectionDiagnostics = {
@@ -196,6 +199,7 @@ function buildSnapshot(
       currentTime: 0,
       videoCurrentTime: 0,
       audibleCurrentTime: null,
+      duration: null,
       avDriftSeconds: null,
       primaryClockSource: "video",
       syncMode,
@@ -209,6 +213,7 @@ function buildSnapshot(
     externalAudioIsActive && externalAudio?.currentSrc
       ? externalAudio.currentTime
       : null;
+  const duration = Number.isFinite(video.duration) ? video.duration : null;
   const primaryClockSource = resolvePrimaryClockSource({
     externalAudio,
     externalAudioIsActive,
@@ -226,6 +231,7 @@ function buildSnapshot(
         : videoCurrentTime,
     videoCurrentTime,
     audibleCurrentTime,
+    duration,
     avDriftSeconds,
     primaryClockSource,
     syncMode,
@@ -373,6 +379,7 @@ export const RoomVideoPlayer = forwardRef<
     onAudioStateChange,
     onObservedStateChange,
     onSyncIssueChange,
+    className,
   },
   ref,
 ) {
@@ -1719,6 +1726,32 @@ export const RoomVideoPlayer = forwardRef<
           playbackRate,
         );
       },
+      seekTo(targetSeconds: number) {
+        const video = videoRef.current;
+
+        if (!video) {
+          return buildSnapshot(null, null, false, null, playbackRate);
+        }
+
+        const normalizedTargetTime = Math.max(0, targetSeconds);
+        armRoomHardSeekSuppression(
+          reconciliationProfile.postSeekHardSeekSuppressionMs,
+          "local_user_seek",
+          normalizedTargetTime,
+        );
+        void repositionMediaToAuthoritativeTarget({
+          publishDiagnostics: true,
+          targetTime: normalizedTargetTime,
+        });
+        emitSyncIssue(null);
+        return buildSnapshot(
+          video,
+          externalAudioRef.current,
+          Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+          externalAudioIssue,
+          playbackRate,
+        );
+      },
       seekBy(deltaSeconds: number) {
         const video = videoRef.current;
 
@@ -1860,16 +1893,16 @@ export const RoomVideoPlayer = forwardRef<
   );
 
   return (
-    <div className="rounded-[2rem] border border-dashed border-line bg-[linear-gradient(135deg,rgba(255,255,255,0.72),rgba(234,220,206,0.84))] p-6">
+    <div className={className ?? "h-full w-full"}>
       {videoUrl ? (
-        <div className="space-y-4">
+        <>
           <video
             ref={videoRef}
             src={videoUrl}
             playsInline
             preload="metadata"
             data-debug-video-player="true"
-            className="aspect-video w-full rounded-[1.5rem] bg-[#120d0a] shadow-[0_20px_50px_rgba(18,13,10,0.32)]"
+            className="h-full w-full bg-[#020409] object-contain"
           >
             {renderableSubtitleTracks.map((track) => (
               <track
@@ -1892,28 +1925,11 @@ export const RoomVideoPlayer = forwardRef<
             data-debug-external-audio-player="true"
             className="hidden"
           />
-
-          <div className="flex flex-col gap-3 rounded-[1.5rem] bg-[linear-gradient(160deg,#251913,#51352b)] px-5 py-4 text-white sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.25em] text-white/60">
-                Now loaded
-              </p>
-              <p className="mt-2 text-lg font-semibold">{title}</p>
-            </div>
-            <div className="flex flex-wrap gap-2 sm:justify-end">
-              <div className="rounded-full border border-white/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.2em] text-white/70">
-                Room {roomId}
-              </div>
-              <div className="rounded-full border border-white/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.2em] text-white/70">
-                Audio target: {activeExternalAudioTrack ? "external track" : "embedded video"}
-              </div>
-            </div>
-          </div>
-        </div>
+        </>
       ) : (
-        <div className="flex aspect-video items-center justify-center rounded-[1.5rem] bg-[linear-gradient(160deg,#251913,#51352b)] px-6 text-center text-white">
+        <div className="flex h-full w-full items-center justify-center bg-[linear-gradient(160deg,#090d14,#181f2b)] px-6 text-center text-white">
           <div>
-            <p className="text-sm font-semibold uppercase tracking-[0.25em] text-white/60">
+            <p className="text-sm font-semibold uppercase tracking-[0.25em] text-white/50">
               Media unavailable
             </p>
             <p className="mt-3 text-lg font-semibold">
@@ -1922,13 +1938,6 @@ export const RoomVideoPlayer = forwardRef<
           </div>
         </div>
       )}
-
-      {subtitleTracks.length > 0 && renderableSubtitleTracks.length === 0 ? (
-        <p className="mt-4 rounded-2xl border border-line bg-white/75 px-4 py-3 text-sm leading-6 text-muted">
-          Subtitle files were uploaded for this media asset, but none are in a
-          browser-renderable WebVTT form yet.
-        </p>
-      ) : null}
     </div>
   );
 });

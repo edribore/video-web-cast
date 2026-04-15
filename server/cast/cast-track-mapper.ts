@@ -1,5 +1,6 @@
 import "server-only";
 
+import { resolvePreferredExternalAudioTrack } from "@/lib/audio-preferences";
 import { isCastableAbsoluteUrl } from "@/lib/public-origin";
 import { storedUploadAbsoluteHref } from "@/lib/routes";
 import type { CastTextTrack } from "@/types/cast";
@@ -33,14 +34,20 @@ function normalizeTrackId(trackId: string | null | undefined) {
 export function resolveSelectedAudioTrack(
   audioTracks: CastAudioTrackRecord[],
   requestedAudioTrackId: string | null | undefined,
+  preferredAudioLanguages: readonly string[] = [],
 ) {
   const normalizedTrackId = normalizeTrackId(requestedAudioTrackId);
+  const resolvedPreference = resolvePreferredExternalAudioTrack({
+    audioTracks,
+    preferredLanguages: preferredAudioLanguages,
+    requestedAudioTrackId: normalizedTrackId,
+  });
 
-  if (!normalizedTrackId) {
+  if (!resolvedPreference.trackId) {
     return null;
   }
 
-  return audioTracks.find((track) => track.id === normalizedTrackId) ?? null;
+  return audioTracks.find((track) => track.id === resolvedPreference.trackId) ?? null;
 }
 
 export function resolveSelectedSubtitleTrack(

@@ -83,6 +83,41 @@ test("join while playing resolves against the authoritative wall clock anchor", 
   assert.equal(resolveSynchronizedPlaybackTime(playingPlayback, joinWallClockMs), 44.625);
 });
 
+test("room seek while paused keeps the room paused at the new anchor", () => {
+  const pausedSeek = buildAuthoritativePlaybackState({
+    clientEventId: "paused-seek",
+    currentTime: 88.4,
+    nowWallClockMs: 14_000,
+    playbackRate: 1,
+    status: "paused",
+    type: "seek",
+    version: 10,
+  });
+
+  assert.equal(pausedSeek.status, "paused");
+  assert.equal(pausedSeek.anchorMediaTime, 88.4);
+  assert.equal(resolveSynchronizedPlaybackTime(pausedSeek, 18_500), 88.4);
+});
+
+test("room seek while playing reanchors and continues playback coherently", () => {
+  const playingSeek = buildAuthoritativePlaybackState({
+    clientEventId: "playing-seek",
+    currentTime: 91,
+    nowWallClockMs: 20_000,
+    playbackRate: 1,
+    status: "playing",
+    type: "seek",
+    version: 11,
+  });
+
+  assert.equal(playingSeek.status, "playing");
+  assert.equal(resolveSynchronizedPlaybackTime(playingSeek, playingSeek.anchorWallClockMs), 91);
+  assert.equal(
+    resolveSynchronizedPlaybackTime(playingSeek, playingSeek.anchorWallClockMs + 1_500),
+    92.5,
+  );
+});
+
 test("moderate drift uses smooth rate correction instead of a hard seek", () => {
   const correction = resolvePlaybackDriftCorrection({
     actualTime: 9.85,

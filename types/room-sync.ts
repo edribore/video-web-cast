@@ -98,6 +98,7 @@ export type RoomMediaSummary = {
   title: string;
   originalFilename: string;
   mimeType: string;
+  durationSeconds: number | null;
   posterUrl: string | null;
   videoUrl: string;
   absoluteVideoUrl: string;
