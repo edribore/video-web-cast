@@ -1,122 +1,142 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 import {
   confirmCastRemoteControlSession,
-  expireCastRemoteControlSession,
+  isCastRemoteInteractionSessionActive,
   isCastRemoteControlTrustedContinuationActive,
   markCastRemoteControlSessionConfirming,
 } from "./cast-remote-control";
 
 const durations = {
-  controlSessionWindowMs: 4500,
-  trustedContinuationWindowMs: 3500,
-};
+  controlSessionWindowMs: 6_000,
+  trustedContinuationWindowMs: 4_500,
+} as const;
 
-test("confirmed remote pause opens a trusted continuation for follow-up play", () => {
-  const pauseObservation = {
-    contentId: "content-1",
-    currentTime: 44,
-    selectionSignature: "tracks-a",
-    sessionId: "cast-session-1",
-    status: "paused" as const,
-    type: "pause" as const,
-  };
-  const started = markCastRemoteControlSessionConfirming(
-    null,
-    pauseObservation,
-    1_000,
-    durations,
-  );
+test("confirmed remote pause starts a trusted Cast interaction session", () => {
   const confirmed = confirmCastRemoteControlSession(
-    started.session,
-    pauseObservation,
-    1_200,
+    null,
+    {
+      contentId: "movie-1",
+      currentTime: 120,
+      selectionSignature: "signature-1",
+      sessionId: "cast-session-1",
+      status: "paused",
+      type: "pause",
+    },
+    10_000,
     durations,
   );
 
-  assert.equal(started.transition, "started");
-  assert.equal(confirmed.session.lastConfirmedRemoteAction, "pause");
-  assert.equal(confirmed.session.trustedContinuationSource, "pause");
+  assert.equal(confirmed.transition, "started");
+  assert.equal(
+    isCastRemoteInteractionSessionActive(
+      confirmed.session,
+      {
+        contentId: "movie-1",
+        selectionSignature: "signature-1",
+        sessionId: "cast-session-1",
+      },
+      11_000,
+    ),
+    true,
+  );
   assert.equal(
     isCastRemoteControlTrustedContinuationActive(
       confirmed.session,
       {
-        contentId: "content-1",
-        selectionSignature: "tracks-a",
+        contentId: "movie-1",
+        selectionSignature: "signature-1",
         sessionId: "cast-session-1",
       },
-      1_700,
+      11_000,
     ),
     true,
   );
 });
 
-test("confirmed remote seek keeps the same control session active for seek-then-play flows", () => {
-  const seekObservation = {
-    contentId: "content-2",
-    currentTime: 130,
-    selectionSignature: "tracks-b",
-    sessionId: "cast-session-2",
-    status: "paused" as const,
-    type: "seek" as const,
-  };
-  const confirmedSeek = confirmCastRemoteControlSession(
+test("coherent follow-up remote actions extend the same interaction session", () => {
+  const started = confirmCastRemoteControlSession(
     null,
-    seekObservation,
+    {
+      contentId: "movie-1",
+      currentTime: 120,
+      selectionSignature: "signature-1",
+      sessionId: "cast-session-1",
+      status: "paused",
+      type: "pause",
+    },
     10_000,
     durations,
   );
-  const followUpPlay = markCastRemoteControlSessionConfirming(
-    confirmedSeek.session,
+  const observed = markCastRemoteControlSessionConfirming(
+    started.session,
     {
-      ...seekObservation,
-      currentTime: 130.3,
-      status: "playing" as const,
-      type: "play" as const,
+      contentId: "movie-1",
+      currentTime: 185,
+      selectionSignature: "signature-1",
+      sessionId: "cast-session-1",
+      status: "playing",
+      type: "seek",
     },
-    10_250,
+    12_000,
+    durations,
+  );
+  const confirmed = confirmCastRemoteControlSession(
+    observed.session,
+    {
+      contentId: "movie-1",
+      currentTime: 185,
+      selectionSignature: "signature-1",
+      sessionId: "cast-session-1",
+      status: "playing",
+      type: "play",
+    },
+    12_400,
     durations,
   );
 
-  assert.equal(followUpPlay.transition, "extended");
+  assert.equal(observed.session.controlSessionId, started.session.controlSessionId);
+  assert.equal(confirmed.session.controlSessionId, started.session.controlSessionId);
+  assert.equal(confirmed.session.expiresAtMs, 18_400);
   assert.equal(
-    followUpPlay.session.controlSessionId,
-    confirmedSeek.session.controlSessionId,
-  );
-  assert.equal(followUpPlay.session.state, "remote_control_session_confirming");
-  assert.equal(
-    isCastRemoteControlTrustedContinuationActive(
-      confirmedSeek.session,
+    isCastRemoteInteractionSessionActive(
+      confirmed.session,
       {
-        contentId: "content-2",
-        selectionSignature: "tracks-b",
-        sessionId: "cast-session-2",
+        contentId: "movie-1",
+        selectionSignature: "signature-1",
+        sessionId: "cast-session-1",
       },
-      10_500,
+      13_000,
     ),
     true,
   );
 });
 
-test("remote control sessions expire after the configured window", () => {
-  const confirmedPause = confirmCastRemoteControlSession(
+test("trusted continuation stays constrained to the same cast session and selection", () => {
+  const confirmed = confirmCastRemoteControlSession(
     null,
     {
-      contentId: "content-3",
-      currentTime: 5,
-      selectionSignature: "tracks-c",
-      sessionId: "cast-session-3",
-      status: "paused" as const,
-      type: "pause" as const,
+      contentId: "movie-1",
+      currentTime: 50,
+      selectionSignature: "signature-1",
+      sessionId: "cast-session-1",
+      status: "paused",
+      type: "pause",
     },
-    20_000,
+    5_000,
     durations,
   );
-  const expiration = expireCastRemoteControlSession(
-    confirmedPause.session,
-    25_000,
-  );
 
-  assert.equal(expiration.didExpire, true);
-  assert.equal(expiration.session?.state, "remote_control_session_expired");
+  assert.equal(
+    isCastRemoteControlTrustedContinuationActive(
+      confirmed.session,
+      {
+        contentId: "movie-1",
+        selectionSignature: "signature-2",
+        sessionId: "cast-session-1",
+      },
+      5_500,
+    ),
+    false,
+  );
 });

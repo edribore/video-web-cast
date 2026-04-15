@@ -1,10 +1,8 @@
 "use client";
 
 import {
-  useCallback,
   useEffect,
   useRef,
-  useState,
   type CSSProperties,
   type KeyboardEvent,
   type ReactNode,
@@ -14,28 +12,22 @@ import {
   type AudioTrackPlaybackSupport,
 } from "@/lib/audio-track-playback";
 import { formatPlaybackSeconds } from "@/lib/playback";
+import type { RoomPlaybackController } from "@/components/use-room-playback-controller";
 import type { AudioSelectionMode } from "@/lib/audio-preferences";
 import type { ChromecastAvailabilityStatus } from "@/lib/chromecast";
 import type { PlaybackStatus } from "@/types/playback";
 import type {
   RoomAudioTrackSummary,
   RoomSubtitleTrackSummary,
-  SharedRoomControlType,
 } from "@/types/room-sync";
 
-type PlaybackSurfaceCommand = {
-  type: SharedRoomControlType;
-  deltaSeconds?: number;
-  targetTimeSeconds?: number;
-};
-
 type RoomPlaybackSurfaceProps = {
+  controller: RoomPlaybackController;
   title: string;
   subtitle: string;
+  isMobileClient: boolean;
   playbackTarget: "local" | "cast";
   playbackStatus: PlaybackStatus;
-  currentTimeSeconds: number;
-  durationSeconds: number | null;
   audioTracks: readonly RoomAudioTrackSummary[];
   audioTrackSupport: Record<string, AudioTrackPlaybackSupport>;
   selectedAudioTrackId: string | null;
@@ -47,18 +39,12 @@ type RoomPlaybackSurfaceProps = {
   playbackStatusMessage: string;
   castStatus: ChromecastAvailabilityStatus;
   canToggleCast: boolean;
-  onCastToggle(): void;
-  onRequestCommand(command: PlaybackSurfaceCommand): void;
-  onSelectAudioTrack(trackId: string | null): void;
-  onSelectSubtitleTrack(trackId: string | null): void;
   primaryClockLabel: string;
   syncModeLabel: string;
   syncIssue: string | null;
   castRemoteObserved: boolean;
   children: ReactNode;
 };
-
-const controlAutoHideDelayMs = 2400;
 const seekStepSeconds = 10;
 
 function getCastPillClasses(status: ChromecastAvailabilityStatus) {
@@ -86,25 +72,6 @@ function getPlaybackPillClasses(status: PlaybackStatus) {
     case "stopped":
       return "border-white/10 bg-white/6 text-white/70";
   }
-}
-
-function clampTimelineValue(value: number, durationSeconds: number) {
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-
-  return Math.max(0, Math.min(value, durationSeconds));
-}
-
-function resolveTimelineDuration(
-  durationSeconds: number | null,
-  currentTimeSeconds: number,
-) {
-  if (typeof durationSeconds === "number" && Number.isFinite(durationSeconds)) {
-    return Math.max(durationSeconds, currentTimeSeconds, 1);
-  }
-
-  return Math.max(currentTimeSeconds, 1);
 }
 
 function PlaybackIcon({ paused }: { paused: boolean }) {
@@ -323,12 +290,12 @@ function MenuPanel({
 }
 
 export function RoomPlaybackSurface({
+  controller,
   title,
   subtitle,
+  isMobileClient,
   playbackTarget,
   playbackStatus,
-  currentTimeSeconds,
-  durationSeconds,
   audioTracks,
   audioTrackSupport,
   selectedAudioTrackId,
@@ -340,10 +307,6 @@ export function RoomPlaybackSurface({
   playbackStatusMessage,
   castStatus,
   canToggleCast,
-  onCastToggle,
-  onRequestCommand,
-  onSelectAudioTrack,
-  onSelectSubtitleTrack,
   primaryClockLabel,
   syncModeLabel,
   syncIssue,
@@ -351,164 +314,18 @@ export function RoomPlaybackSurface({
   children,
 }: RoomPlaybackSurfaceProps) {
   const surfaceRef = useRef<HTMLDivElement>(null);
-  const hideControlsTimerRef = useRef<number | null>(null);
-  const [controlsVisible, setControlsVisible] = useState(true);
-  const [activeMenu, setActiveMenu] = useState<"audio" | "settings" | "subtitles" | null>(
-    null,
-  );
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  const [isScrubbing, setIsScrubbing] = useState(false);
-  const [scrubPreviewTime, setScrubPreviewTime] = useState<number | null>(null);
-  const resolvedDurationSeconds = resolveTimelineDuration(
-    durationSeconds,
-    currentTimeSeconds,
-  );
-  const effectiveCurrentTime =
-    scrubPreviewTime != null ? scrubPreviewTime : currentTimeSeconds;
-  const timelineValue = clampTimelineValue(
-    effectiveCurrentTime,
-    resolvedDurationSeconds,
-  );
-  const timelineProgressPercent = Math.max(
-    0,
-    Math.min(100, (timelineValue / resolvedDurationSeconds) * 100),
-  );
-
-  const clearHideControlsTimer = useCallback(() => {
-    if (hideControlsTimerRef.current != null) {
-      window.clearTimeout(hideControlsTimerRef.current);
-      hideControlsTimerRef.current = null;
-    }
-  }, []);
-
-  const scheduleControlsHide = useCallback(() => {
-    clearHideControlsTimer();
-
-    if (
-      playbackStatus !== "playing" ||
-      isScrubbing ||
-      activeMenu != null ||
-      !controlsVisible
-    ) {
-      return;
-    }
-
-    hideControlsTimerRef.current = window.setTimeout(() => {
-      setControlsVisible(false);
-    }, controlAutoHideDelayMs);
-  }, [
-    activeMenu,
-    clearHideControlsTimer,
-    controlsVisible,
-    isScrubbing,
-    playbackStatus,
-  ]);
-
-  const revealControls = () => {
-    setControlsVisible(true);
-    scheduleControlsHide();
-  };
-
-  const closeMenus = () => {
-    setActiveMenu(null);
-  };
-
-  const commitScrub = (requestedTime: number | null) => {
-    const normalizedTime =
-      requestedTime == null
-        ? null
-        : clampTimelineValue(requestedTime, resolvedDurationSeconds);
-
-    setIsScrubbing(false);
-    setScrubPreviewTime(null);
-    scheduleControlsHide();
-
-    if (
-      normalizedTime == null ||
-      Math.abs(normalizedTime - currentTimeSeconds) < 0.2
-    ) {
-      return;
-    }
-
-    onRequestCommand({
-      type: "seek",
-      targetTimeSeconds: normalizedTime,
-    });
-  };
-
-  useEffect(() => {
-    scheduleControlsHide();
-  }, [activeMenu, controlsVisible, isScrubbing, playbackStatus, scheduleControlsHide]);
-
-  useEffect(() => {
-    const handleFullscreenChange = () => {
-      setIsFullscreen(document.fullscreenElement === surfaceRef.current);
-    };
-
-    const handleDocumentPointerDown = (event: PointerEvent) => {
-      if (
-        surfaceRef.current &&
-        event.target instanceof Node &&
-        !surfaceRef.current.contains(event.target)
-      ) {
-        setActiveMenu(null);
-      }
-    };
-
-    document.addEventListener("fullscreenchange", handleFullscreenChange);
-    document.addEventListener("pointerdown", handleDocumentPointerDown);
-
-    return () => {
-      document.removeEventListener("fullscreenchange", handleFullscreenChange);
-      document.removeEventListener("pointerdown", handleDocumentPointerDown);
-    };
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (hideControlsTimerRef.current != null) {
-        window.clearTimeout(hideControlsTimerRef.current);
-        hideControlsTimerRef.current = null;
-      }
-    };
-  }, []);
-
-  const handlePlayPause = () => {
-    revealControls();
-    closeMenus();
-    onRequestCommand({
-      type: playbackStatus === "playing" ? "pause" : "play",
-    });
-  };
-
-  const handleSeekDelta = (deltaSeconds: number) => {
-    revealControls();
-    closeMenus();
-    onRequestCommand({
-      type: "seek",
-      deltaSeconds,
-    });
-  };
-
-  const toggleMenu = (menu: "audio" | "settings" | "subtitles") => {
-    revealControls();
-    setActiveMenu((currentMenu) => (currentMenu === menu ? null : menu));
-  };
-
-  const toggleFullscreen = async () => {
-    revealControls();
-
-    if (!surfaceRef.current) {
-      return;
-    }
-
-    if (document.fullscreenElement === surfaceRef.current) {
-      await document.exitFullscreen().catch(() => undefined);
-      return;
-    }
-
-    await surfaceRef.current.requestFullscreen().catch(() => undefined);
-  };
+  const timelineInputRef = useRef<HTMLInputElement>(null);
+  const isScrubbing = controller.scrubState.phase === "scrubbing";
+  const closeMenus = controller.closeMenus;
+  const scrubCancel = controller.scrubCancel;
+  const scrubCommit = controller.scrubCommit;
+  const scrubPhase = controller.scrubState.phase;
+  const scrubPreviewTime =
+    controller.scrubState.phase === "scrubbing"
+      ? controller.scrubState.previewTime
+      : null;
+  const controlsVisible =
+    !isMobileClient || controller.overlayState.visibility !== "hidden";
 
   const handleSurfaceKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (
@@ -520,55 +337,103 @@ export function RoomPlaybackSurface({
 
     if (event.key === " " || event.key.toLowerCase() === "k") {
       event.preventDefault();
-      handlePlayPause();
+      controller.handlePlayPause();
       return;
     }
 
     if (event.key.toLowerCase() === "j" || event.key === "ArrowLeft") {
       event.preventDefault();
-      handleSeekDelta(-seekStepSeconds);
+      controller.handleSeekRelative(-seekStepSeconds);
       return;
     }
 
     if (event.key.toLowerCase() === "l" || event.key === "ArrowRight") {
       event.preventDefault();
-      handleSeekDelta(seekStepSeconds);
+      controller.handleSeekRelative(seekStepSeconds);
       return;
     }
 
     if (event.key.toLowerCase() === "f") {
       event.preventDefault();
-      void toggleFullscreen();
+      void controller.toggleFullscreen(surfaceRef);
       return;
     }
 
     if (event.key === "Escape") {
-      setActiveMenu(null);
-      setIsScrubbing(false);
-      setScrubPreviewTime(null);
-      revealControls();
+      controller.closeMenus();
+      controller.scrubCancel();
+      controller.handleActivity();
     }
   };
 
   const timelineTrackStyle = {
-    width: `${timelineProgressPercent}%`,
+    width: `${controller.timelineProgressPercent}%`,
   } satisfies CSSProperties;
 
   const timelinePreviewStyle = {
-    left: `${timelineProgressPercent}%`,
+    left: `${controller.timelineProgressPercent}%`,
   } satisfies CSSProperties;
+
+  useEffect(() => {
+    const handleDocumentPointerDown = (event: PointerEvent) => {
+      if (
+        surfaceRef.current &&
+        event.target instanceof Node &&
+        !surfaceRef.current.contains(event.target)
+      ) {
+        closeMenus();
+      }
+    };
+
+    document.addEventListener("pointerdown", handleDocumentPointerDown);
+    return () => {
+      document.removeEventListener("pointerdown", handleDocumentPointerDown);
+    };
+  }, [closeMenus]);
+
+  useEffect(() => {
+    if (scrubPhase !== "scrubbing") {
+      return;
+    }
+
+    const commitFromInput = () => {
+      const requestedTimeSeconds =
+        timelineInputRef.current == null
+          ? null
+          : Number(timelineInputRef.current.value);
+      scrubCommit(requestedTimeSeconds);
+    };
+    const cancelScrub = () => {
+      scrubCancel();
+    };
+
+    window.addEventListener("pointerup", commitFromInput);
+    window.addEventListener("mouseup", commitFromInput);
+    window.addEventListener("touchend", commitFromInput);
+    window.addEventListener("pointercancel", cancelScrub);
+    window.addEventListener("touchcancel", cancelScrub);
+
+    return () => {
+      window.removeEventListener("pointerup", commitFromInput);
+      window.removeEventListener("mouseup", commitFromInput);
+      window.removeEventListener("touchend", commitFromInput);
+      window.removeEventListener("pointercancel", cancelScrub);
+      window.removeEventListener("touchcancel", cancelScrub);
+    };
+  }, [scrubCancel, scrubCommit, scrubPhase]);
 
   return (
     <div
       ref={surfaceRef}
       tabIndex={0}
       onKeyDown={handleSurfaceKeyDown}
-      onPointerMove={revealControls}
-      onPointerDown={revealControls}
-      onFocus={revealControls}
-      onDoubleClick={() => void toggleFullscreen()}
+      onPointerMove={controller.handleActivity}
+      onPointerDown={controller.handleActivity}
+      onFocus={controller.handleActivity}
+      onTouchStart={controller.handleActivity}
+      onDoubleClick={() => void controller.toggleFullscreen(surfaceRef)}
       className={`group relative aspect-video overflow-hidden rounded-[2rem] border border-white/10 bg-[#020409] shadow-[0_26px_90px_rgba(3,5,11,0.42)] outline-none ${
-        isFullscreen ? "max-h-screen rounded-none" : ""
+        controller.isFullscreen ? "max-h-screen rounded-none" : ""
       }`}
     >
       <div className="absolute inset-0">{children}</div>
@@ -578,9 +443,11 @@ export function RoomPlaybackSurface({
 
       <div
         className={`absolute inset-0 transition-opacity duration-300 ${
-          controlsVisible || playbackStatus !== "playing" || activeMenu != null || isScrubbing
-            ? "opacity-100"
-            : "opacity-0"
+          controlsVisible || playbackStatus !== "playing"
+            ? "pointer-events-auto opacity-100"
+            : controller.overlayState.visibility === "fading"
+              ? "pointer-events-none opacity-0"
+              : "pointer-events-none opacity-0"
         }`}
       >
         <div className="absolute inset-x-0 top-0 flex items-start justify-between gap-4 p-4 sm:p-6">
@@ -610,7 +477,7 @@ export function RoomPlaybackSurface({
             <button
               type="button"
               disabled={!canToggleCast}
-              onClick={onCastToggle}
+              onClick={controller.handleCastToggle}
               className={`flex h-11 items-center gap-2 rounded-full border px-4 text-sm font-semibold backdrop-blur-xl transition ${getCastPillClasses(
                 castStatus,
               )} disabled:cursor-not-allowed disabled:border-white/8 disabled:bg-black/18 disabled:text-white/35`}
@@ -620,43 +487,40 @@ export function RoomPlaybackSurface({
             </button>
             <OverlayToolbarButton
               label="Subtitles"
-              active={activeMenu === "subtitles"}
-              onClick={() => toggleMenu("subtitles")}
+              active={controller.activeMenu === "subtitles"}
+              onClick={() => controller.toggleMenu("subtitles")}
             >
               <CaptionIcon />
             </OverlayToolbarButton>
             <OverlayToolbarButton
               label="Audio"
-              active={activeMenu === "audio"}
-              onClick={() => toggleMenu("audio")}
+              active={controller.activeMenu === "audio"}
+              onClick={() => controller.toggleMenu("audio")}
             >
               <AudioIcon />
             </OverlayToolbarButton>
             <OverlayToolbarButton
               label="Playback settings"
-              active={activeMenu === "settings"}
-              onClick={() => toggleMenu("settings")}
+              active={controller.activeMenu === "settings"}
+              onClick={() => controller.toggleMenu("settings")}
             >
               <SettingsIcon />
             </OverlayToolbarButton>
             <OverlayToolbarButton
-              label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-              onClick={() => void toggleFullscreen()}
+              label={controller.isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              onClick={() => void controller.toggleFullscreen(surfaceRef)}
             >
-              <FullscreenIcon active={isFullscreen} />
+              <FullscreenIcon active={controller.isFullscreen} />
             </OverlayToolbarButton>
 
-            {activeMenu ? (
+            {controller.activeMenu ? (
               <div className="absolute right-0 top-14 z-10">
-                {activeMenu === "audio" ? (
+                {controller.activeMenu === "audio" ? (
                   <MenuPanel title="Audio">
                     <div className="rounded-2xl border border-white/8 bg-white/4 p-1.5">
                       <button
                         type="button"
-                        onClick={() => {
-                          onSelectAudioTrack(null);
-                          setActiveMenu(null);
-                        }}
+                        onClick={() => controller.handleSelectAudioTrack(null)}
                         className={`flex w-full items-center justify-between rounded-[1rem] px-3 py-3 text-left text-sm transition ${
                           selectedAudioTrackId == null
                             ? "bg-white/12 text-white"
@@ -677,10 +541,7 @@ export function RoomPlaybackSurface({
                             key={track.id}
                             type="button"
                             disabled={!playable}
-                            onClick={() => {
-                              onSelectAudioTrack(track.id);
-                              setActiveMenu(null);
-                            }}
+                            onClick={() => controller.handleSelectAudioTrack(track.id)}
                             className={`mt-1 flex w-full items-center justify-between rounded-[1rem] px-3 py-3 text-left text-sm transition ${
                               selected
                                 ? "bg-white/12 text-white"
@@ -711,15 +572,12 @@ export function RoomPlaybackSurface({
                     ) : null}
                   </MenuPanel>
                 ) : null}
-                {activeMenu === "subtitles" ? (
+                {controller.activeMenu === "subtitles" ? (
                   <MenuPanel title="Subtitles">
                     <div className="rounded-2xl border border-white/8 bg-white/4 p-1.5">
                       <button
                         type="button"
-                        onClick={() => {
-                          onSelectSubtitleTrack(null);
-                          setActiveMenu(null);
-                        }}
+                        onClick={() => controller.handleSelectSubtitleTrack(null)}
                         className={`flex w-full items-center justify-between rounded-[1rem] px-3 py-3 text-left text-sm transition ${
                           selectedSubtitleTrackId == null
                             ? "bg-white/12 text-white"
@@ -738,10 +596,9 @@ export function RoomPlaybackSurface({
                             key={track.id}
                             type="button"
                             disabled={!selectable}
-                            onClick={() => {
-                              onSelectSubtitleTrack(track.id);
-                              setActiveMenu(null);
-                            }}
+                            onClick={() =>
+                              controller.handleSelectSubtitleTrack(track.id)
+                            }
                             className={`mt-1 flex w-full items-center justify-between rounded-[1rem] px-3 py-3 text-left text-sm transition ${
                               selected
                                 ? "bg-white/12 text-white"
@@ -766,7 +623,7 @@ export function RoomPlaybackSurface({
                     </p>
                   </MenuPanel>
                 ) : null}
-                {activeMenu === "settings" ? (
+                {controller.activeMenu === "settings" ? (
                   <MenuPanel title="Playback">
                     <div className="grid gap-2 rounded-2xl border border-white/8 bg-white/4 p-3 text-sm text-white/72">
                       <div className="flex items-center justify-between gap-4">
@@ -817,21 +674,21 @@ export function RoomPlaybackSurface({
           <div className="pointer-events-auto flex items-center gap-4 sm:gap-8">
             <SurfaceActionButton
               label={`Seek backward ${seekStepSeconds} seconds`}
-              onClick={() => handleSeekDelta(-seekStepSeconds)}
+              onClick={() => controller.handleSeekRelative(-seekStepSeconds)}
             >
               <SeekIcon direction="backward" seconds={seekStepSeconds} />
             </SurfaceActionButton>
             <button
               type="button"
               aria-label={playbackStatus === "playing" ? "Pause" : "Play"}
-              onClick={handlePlayPause}
+              onClick={controller.handlePlayPause}
               className="flex h-[5.5rem] w-[5.5rem] items-center justify-center rounded-full border border-white/15 bg-white/12 text-white shadow-[0_18px_48px_rgba(0,0,0,0.38)] backdrop-blur-2xl transition hover:scale-[1.02] hover:border-white/35 hover:bg-white/18 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/80 sm:h-[6rem] sm:w-[6rem]"
             >
               <PlaybackIcon paused={playbackStatus !== "playing"} />
             </button>
             <SurfaceActionButton
               label={`Seek forward ${seekStepSeconds} seconds`}
-              onClick={() => handleSeekDelta(seekStepSeconds)}
+              onClick={() => controller.handleSeekRelative(seekStepSeconds)}
             >
               <SeekIcon direction="forward" seconds={seekStepSeconds} />
             </SurfaceActionButton>
@@ -855,22 +712,31 @@ export function RoomPlaybackSurface({
                 style={timelineTrackStyle}
               />
               <input
+                ref={timelineInputRef}
                 type="range"
                 min={0}
-                max={resolvedDurationSeconds}
+                max={controller.resolvedDurationSeconds}
                 step={0.1}
-                value={timelineValue}
-                onPointerDown={() => {
-                  setIsScrubbing(true);
-                  setScrubPreviewTime(currentTimeSeconds);
-                  revealControls();
-                }}
-                onChange={(event) => {
-                  setIsScrubbing(true);
-                  setScrubPreviewTime(Number(event.target.value));
-                  revealControls();
-                }}
-                onPointerUp={() => commitScrub(scrubPreviewTime ?? timelineValue)}
+                value={controller.timelineValue}
+                onPointerDown={controller.scrubStart}
+                onMouseDown={controller.scrubStart}
+                onTouchStart={controller.scrubStart}
+                onInput={(event) =>
+                  controller.scrubPreview(Number(event.currentTarget.value))
+                }
+                onChange={(event) =>
+                  controller.scrubPreview(Number(event.currentTarget.value))
+                }
+                onPointerUp={(event) =>
+                  controller.scrubCommit(Number(event.currentTarget.value))
+                }
+                onMouseUp={(event) =>
+                  controller.scrubCommit(Number(event.currentTarget.value))
+                }
+                onTouchEnd={(event) =>
+                  controller.scrubCommit(Number(event.currentTarget.value))
+                }
+                onPointerCancel={controller.scrubCancel}
                 onKeyUp={(event) => {
                   if (
                     event.key === "ArrowLeft" ||
@@ -880,12 +746,12 @@ export function RoomPlaybackSurface({
                     event.key === "PageUp" ||
                     event.key === "PageDown"
                   ) {
-                    commitScrub(scrubPreviewTime ?? Number(event.currentTarget.value));
+                    controller.scrubCommit(Number(event.currentTarget.value));
                   }
                 }}
                 onBlur={() => {
-                  if (isScrubbing) {
-                    commitScrub(scrubPreviewTime ?? timelineValue);
+                  if (controller.scrubState.phase === "scrubbing") {
+                    controller.scrubCommit(Number(timelineInputRef.current?.value ?? 0));
                   }
                 }}
                 className="syncpass-timeline relative z-10 h-6 w-full cursor-pointer appearance-none bg-transparent"
@@ -895,10 +761,10 @@ export function RoomPlaybackSurface({
             <div className="mt-3 flex items-center justify-between gap-4 text-sm text-white/76">
               <div className="flex items-center gap-3">
                 <span className="min-w-[3.5rem] font-semibold text-white">
-                  {formatPlaybackSeconds(effectiveCurrentTime)}
+                  {formatPlaybackSeconds(controller.effectiveCurrentTime)}
                 </span>
                 <span className="text-white/40">/</span>
-                <span>{formatPlaybackSeconds(resolvedDurationSeconds)}</span>
+                <span>{formatPlaybackSeconds(controller.resolvedDurationSeconds)}</span>
               </div>
               <div className="flex items-center gap-3 text-xs uppercase tracking-[0.22em] text-white/48">
                 <span>{playbackTarget === "cast" ? "Chromecast" : "Local"}</span>
@@ -908,6 +774,55 @@ export function RoomPlaybackSurface({
           </div>
         </div>
       </div>
+
+      {controller.shouldRenderMiniShell ? (
+        <div
+          className="absolute inset-x-3 bottom-3 z-20 rounded-[1.4rem] border border-white/12 bg-black/72 p-3 shadow-[0_12px_36px_rgba(0,0,0,0.38)] backdrop-blur-2xl sm:hidden"
+          onPointerDown={controller.handleActivity}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-semibold text-white">{title}</p>
+              <p className="mt-1 text-xs text-white/62">
+                {formatPlaybackSeconds(controller.effectiveCurrentTime)} /{" "}
+                {formatPlaybackSeconds(controller.resolvedDurationSeconds)}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => controller.handleSeekRelative(-seekStepSeconds)}
+                className="flex h-10 w-10 items-center justify-center rounded-full border border-white/12 bg-white/8 text-white"
+                aria-label={`Seek backward ${seekStepSeconds} seconds`}
+              >
+                <SeekIcon direction="backward" seconds={seekStepSeconds} />
+              </button>
+              <button
+                type="button"
+                onClick={controller.handlePlayPause}
+                className="flex h-10 w-10 items-center justify-center rounded-full border border-white/12 bg-white/12 text-white"
+                aria-label={playbackStatus === "playing" ? "Pause" : "Play"}
+              >
+                <PlaybackIcon paused={playbackStatus !== "playing"} />
+              </button>
+              <button
+                type="button"
+                onClick={() => controller.handleSeekRelative(seekStepSeconds)}
+                className="flex h-10 w-10 items-center justify-center rounded-full border border-white/12 bg-white/8 text-white"
+                aria-label={`Seek forward ${seekStepSeconds} seconds`}
+              >
+                <SeekIcon direction="forward" seconds={seekStepSeconds} />
+              </button>
+            </div>
+          </div>
+          <div className="mt-3 h-1 rounded-full bg-white/12">
+            <div
+              className="h-1 rounded-full bg-white"
+              style={timelineTrackStyle}
+            />
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

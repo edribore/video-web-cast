@@ -272,3 +272,20 @@ test("cast remote plausibility rejects absurd regressions to startup time", () =
 
   assert.equal(plausibility.plausible, false);
 });
+
+test("trusted Cast interaction sessions slightly relax play plausibility thresholds", () => {
+  const defaultPlausibility = assessCastRemoteObservationPlausibility({
+    commandType: "play",
+    expectedTime: 100,
+    observedTime: 102.8,
+  });
+  const trustedSessionPlausibility = assessCastRemoteObservationPlausibility({
+    allowTrustedSessionLeniency: true,
+    commandType: "play",
+    expectedTime: 100,
+    observedTime: 102.8,
+  });
+
+  assert.equal(defaultPlausibility.plausible, false);
+  assert.equal(trustedSessionPlausibility.plausible, true);
+});

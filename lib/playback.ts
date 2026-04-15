@@ -181,14 +181,15 @@ export const playbackSynchronizationConfig = {
     postMirrorStabilizationWindowMs: 3500,
     debounceWindowMs: 350,
     intentConfirmationWindowMs: 900,
-    playIntentConfirmationWindowMs: 500,
+    playIntentConfirmationWindowMs: 650,
     pauseIntentConfirmationWindowMs: 400,
-    seekIntentConfirmationWindowMs: 350,
-    controlSessionWindowMs: 4500,
-    trustedContinuationWindowMs: 3500,
+    seekIntentConfirmationWindowMs: 450,
+    controlSessionWindowMs: 6000,
+    trustedContinuationWindowMs: 4500,
     antiReversionWindowMs: 1200,
     pauseStableNoProgressThresholdSeconds: 0.05,
     implausibleDriftThresholdSeconds: 1.75,
+    trustedSessionImplausibleDriftThresholdSeconds: 4.5,
     absurdRegressionThresholdSeconds: 30,
     startupResetThresholdSeconds: 3,
   },
@@ -424,11 +425,15 @@ export function computeExpectedCastRemoteTimeAtObservation(
 }
 
 export function assessCastRemoteObservationPlausibility(input: {
+  allowTrustedSessionLeniency?: boolean;
   commandType: SharedPlaybackCommandType;
   expectedTime: number;
   observedTime: number;
 }) {
   const config = playbackSynchronizationConfig.castRemoteObservation;
+  const driftThresholdSeconds = input.allowTrustedSessionLeniency
+    ? config.trustedSessionImplausibleDriftThresholdSeconds
+    : config.implausibleDriftThresholdSeconds;
   const driftSeconds = roundPlaybackSeconds(input.observedTime - input.expectedTime);
   const absoluteDriftSeconds = Math.abs(driftSeconds);
   const absurdStartupReset =
@@ -441,7 +446,7 @@ export function assessCastRemoteObservationPlausibility(input: {
       !absurdStartupReset &&
       (input.commandType === "seek"
         ? absoluteDriftSeconds <= config.absurdRegressionThresholdSeconds
-        : absoluteDriftSeconds <= config.implausibleDriftThresholdSeconds),
+        : absoluteDriftSeconds <= driftThresholdSeconds),
   };
 }
 

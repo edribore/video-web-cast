@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import {
   confirmCastRemoteControlSession,
   expireCastRemoteControlSession,
+  isCastRemoteInteractionSessionActive,
   isCastRemoteControlTrustedContinuationActive,
   markCastRemoteControlSessionConfirming,
   type CastRemoteControlSession,
@@ -755,7 +756,7 @@ function syncExpiredCastRemoteControlSession(nowMs = Date.now()) {
     logDebugEvent({
       level: "info",
       category: "cast",
-      message: "cast_remote_control_session_expired",
+      message: "cast_remote_interaction_session_expired",
       source: "cast_remote",
       data: expirationResult.session,
     });
@@ -809,8 +810,8 @@ function markCastRemoteControlSessionForObservation(
     category: "cast",
     message:
       update.transition === "started"
-        ? "cast_remote_control_session_started"
-        : "cast_remote_control_session_extended",
+        ? "cast_remote_interaction_session_started"
+        : "cast_remote_interaction_session_extended",
     source: "cast_remote",
     data: {
       event,
@@ -853,8 +854,8 @@ function confirmCastRemoteControlSessionFromEvent(
       category: "cast",
       message:
         update.transition === "started"
-          ? "cast_remote_control_session_started"
-          : "cast_remote_control_session_extended",
+          ? "cast_remote_interaction_session_started"
+          : "cast_remote_interaction_session_extended",
       source: "cast_remote",
       data: {
         event,
@@ -1093,6 +1094,15 @@ function evaluatePendingCastRemoteIntent(
     lastObservedAtMs: recheckedSnapshot?.observedAtMs ?? pendingIntent.lastObservedAtMs,
   };
   const activeControlSession = getActiveCastRemoteControlSession(evaluationNowMs);
+  const trustedInteractionSessionActive = isCastRemoteInteractionSessionActive(
+    activeControlSession,
+    {
+      contentId: evaluationIntent.event.contentId,
+      selectionSignature: evaluationIntent.event.selectionSignature,
+      sessionId: evaluationIntent.event.sessionId,
+    },
+    evaluationNowMs,
+  );
   const trustedContinuationActive = isCastRemoteControlTrustedContinuationActive(
     activeControlSession,
     {
@@ -1112,6 +1122,7 @@ function evaluatePendingCastRemoteIntent(
       observationCount: pendingIntent.observationCount,
       observationWindowMs,
       event: evaluationEvent,
+      trustedInteractionSessionActive,
     },
   });
 
@@ -1157,6 +1168,7 @@ function evaluatePendingCastRemoteIntent(
       source: "cast_remote",
       data: {
         activeControlSession,
+        trustedInteractionSessionActive,
         observationCount: evaluationIntent.observationCount,
         snapshot: recheckedSnapshot,
       },
@@ -1177,6 +1189,7 @@ function evaluatePendingCastRemoteIntent(
           observationCount: pendingIntent.observationCount,
           timeAdvancedSeconds: pauseConfirmation.timeAdvancedSeconds,
           event: evaluationIntent.event,
+          trustedInteractionSessionActive,
         },
       });
       commitCastRemoteIntent(evaluationIntent);
@@ -1224,6 +1237,7 @@ function evaluatePendingCastRemoteIntent(
     source: "cast_remote",
     data: {
       activeControlSession,
+      trustedInteractionSessionActive,
       trustedContinuationActive,
       observationCount: evaluationIntent.observationCount,
       snapshot: recheckedSnapshot,
@@ -1237,7 +1251,7 @@ function evaluatePendingCastRemoteIntent(
   const playTimeAdvancedSeconds =
     evaluationIntent.event.currentTime - evaluationIntent.firstObservedCurrentTime;
   const playConfirmedFromTrustedContinuation =
-    trustedContinuationActive &&
+    (trustedContinuationActive || trustedInteractionSessionActive) &&
     playingStateConfirmed &&
     (playTimeAdvancedSeconds >= 0.1 ||
       observationWindowMs >=
@@ -1275,6 +1289,7 @@ function evaluatePendingCastRemoteIntent(
         observationCount: evaluationIntent.observationCount,
         observationWindowMs,
         event: evaluationIntent.event,
+        trustedInteractionSessionActive,
       },
     });
     commitCastRemoteIntent(evaluationIntent);
@@ -1306,6 +1321,7 @@ function evaluatePendingCastRemoteIntent(
     source: "cast_remote",
     data: {
       activeControlSession,
+      trustedInteractionSessionActive,
       trustedContinuationActive,
       observationCount: evaluationIntent.observationCount,
       observationWindowMs,
@@ -1318,13 +1334,25 @@ function evaluatePendingCastRemoteIntent(
 function commitCastRemoteIntent(
   candidate: NonNullable<CastRemoteObserverState["pendingIntent"]>,
 ) {
+  const nowMs = Date.now();
+  const activeControlSession = getActiveCastRemoteControlSession(nowMs);
+  const trustedInteractionSessionActive = isCastRemoteInteractionSessionActive(
+    activeControlSession,
+    {
+      contentId: candidate.event.contentId,
+      selectionSignature: candidate.event.selectionSignature,
+      sessionId: candidate.event.sessionId,
+    },
+    nowMs,
+  );
+
   if (castRemoteObserverState.pendingIntent?.timerId != null) {
     window.clearTimeout(castRemoteObserverState.pendingIntent.timerId);
   }
   castRemoteObserverState.pendingIntent = null;
   castRemoteObserverState.lastEmittedSignature = candidate.signature;
   castRemoteObserverState.lastCommittedIntent = {
-    committedAtMs: Date.now(),
+    committedAtMs: nowMs,
     signature: candidate.signature,
     status: candidate.event.status,
   };
@@ -1354,8 +1382,22 @@ function commitCastRemoteIntent(
     data: {
       observationCount: candidate.observationCount,
       event: candidate.event,
+      trustedInteractionSessionActive,
     },
   });
+
+  if (trustedInteractionSessionActive) {
+    logDebugEvent({
+      level: "info",
+      category: "cast",
+      message: "cast_remote_action_committed_within_trusted_session",
+      source: "cast_remote",
+      data: {
+        action: candidate.event.type,
+        event: candidate.event,
+      },
+    });
+  }
 
   notifyChromecastRemotePlaybackListeners(candidate.event);
 }
@@ -1480,6 +1522,15 @@ function queuePendingCastRemoteCandidate(
     const activeControlSession = getActiveCastRemoteControlSession(
       evaluationNowMs,
     );
+    const trustedInteractionSessionActive = isCastRemoteInteractionSessionActive(
+      activeControlSession,
+      {
+        contentId: event.contentId,
+        selectionSignature: event.selectionSignature,
+        sessionId: event.sessionId,
+      },
+      evaluationNowMs,
+    );
     const trustedContinuationActive = isCastRemoteControlTrustedContinuationActive(
       activeControlSession,
       {
@@ -1489,11 +1540,12 @@ function queuePendingCastRemoteCandidate(
       },
       evaluationNowMs,
     );
-    const seekAllowedFromTrustedContinuation =
-      event.type === "seek" && trustedContinuationActive;
+    const seekAllowedWithinTrustedSession =
+      event.type === "seek" &&
+      (trustedContinuationActive || trustedInteractionSessionActive);
 
     if (
-      !seekAllowedFromTrustedContinuation &&
+      !seekAllowedWithinTrustedSession &&
       (castRemoteObserverState.stabilizationUntilMs > evaluationNowMs ||
       castRemoteObserverState.leadershipMode === "cast_handoff" ||
       castRemoteObserverState.leadershipMode === "cast_leader_stabilizing")
@@ -1520,6 +1572,25 @@ function queuePendingCastRemoteCandidate(
       return;
     }
 
+    if (
+      seekAllowedWithinTrustedSession &&
+      (castRemoteObserverState.stabilizationUntilMs > evaluationNowMs ||
+        castRemoteObserverState.leadershipMode === "cast_handoff" ||
+        castRemoteObserverState.leadershipMode === "cast_leader_stabilizing")
+    ) {
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "cast_remote_rejection_bypassed_due_to_trusted_session",
+        source: "cast_remote",
+        data: {
+          event,
+          reason: "stabilization_window",
+          session: activeControlSession,
+        },
+      });
+    }
+
     const matchingLocalCommand = findMatchingRecentLocalCastCommand({
       status: event.status,
       currentTime: event.currentTime,
@@ -1527,7 +1598,7 @@ function queuePendingCastRemoteCandidate(
       selectionSignature: event.selectionSignature,
     });
 
-    if (matchingLocalCommand && !seekAllowedFromTrustedContinuation) {
+    if (matchingLocalCommand && !seekAllowedWithinTrustedSession) {
       rejectCastRemoteObservation(
         "rejected_due_to_recent_local_cast_command",
         {
@@ -1552,8 +1623,24 @@ function queuePendingCastRemoteCandidate(
       return;
     }
 
+    if (matchingLocalCommand && seekAllowedWithinTrustedSession) {
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "cast_remote_rejection_bypassed_due_to_trusted_session",
+        source: "cast_remote",
+        data: {
+          event,
+          matchingLocalCommand,
+          reason: "recent_local_cast_command",
+          session: activeControlSession,
+        },
+      });
+    }
+
     if (castRemoteObserverState.lastMirroredPlayback) {
       const plausibility = assessCastRemoteObservationPlausibility({
+        allowTrustedSessionLeniency: seekAllowedWithinTrustedSession,
         commandType: event.type,
         expectedTime: computeExpectedCastRemoteTimeAtObservation(
           castRemoteObserverState.lastMirroredPlayback,
@@ -1595,14 +1682,18 @@ function queuePendingCastRemoteCandidate(
       source: "cast_remote",
       data: {
         event,
+        trustedInteractionSessionActive,
         trustedContinuationActive,
       },
     });
-    if (seekAllowedFromTrustedContinuation) {
+    if (seekAllowedWithinTrustedSession) {
       logDebugEvent({
         level: "info",
         category: "cast",
-        message: "cast_remote_seek_allowed_from_trusted_continuation",
+        message:
+          event.seekDirection === "forward"
+            ? "cast_remote_seek_forward_allowed_within_trusted_session"
+            : "cast_remote_rejection_bypassed_due_to_trusted_session",
         source: "cast_remote",
         data: {
           event,
@@ -2536,6 +2627,15 @@ function observeChromecastRemotePlaybackState(reason: string) {
     playbackRate,
     selectionSignature,
   });
+  const trustedInteractionSessionActive = isCastRemoteInteractionSessionActive(
+    activeControlSession,
+    {
+      contentId,
+      selectionSignature,
+      sessionId: sessionIdentity.id,
+    },
+    observedAtMs,
+  );
   const trustedContinuationActive = isCastRemoteControlTrustedContinuationActive(
     activeControlSession,
     {
@@ -2546,11 +2646,15 @@ function observeChromecastRemotePlaybackState(reason: string) {
     observedAtMs,
   );
   const playAllowedFromTrustedContinuation =
-    trustedContinuationActive &&
+    (trustedContinuationActive || trustedInteractionSessionActive) &&
     commandType === "play" &&
     status === "playing";
+  const seekAllowedWithinTrustedSession =
+    trustedInteractionSessionActive && commandType === "seek";
+  const observationAllowedWithinTrustedSession =
+    playAllowedFromTrustedContinuation || seekAllowedWithinTrustedSession;
 
-  if (matchingLocalCommand && !playAllowedFromTrustedContinuation) {
+  if (matchingLocalCommand && !observationAllowedWithinTrustedSession) {
     rememberCastObservationDelaySample(
       observedAtMs - matchingLocalCommand.createdAt,
       "recent_local_cast_command",
@@ -2598,6 +2702,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
         source: "cast_remote",
         data: {
           matchingLocalCommand,
+          trustedInteractionSessionActive,
           trustedContinuationActive,
           commandType,
           currentTime,
@@ -2608,11 +2713,14 @@ function observeChromecastRemotePlaybackState(reason: string) {
     return;
   }
 
-  if (matchingLocalCommand && playAllowedFromTrustedContinuation) {
+  if (matchingLocalCommand && observationAllowedWithinTrustedSession) {
     logDebugEvent({
       level: "info",
       category: "cast",
-      message: "cast_remote_play_allowed_from_trusted_continuation",
+      message:
+        commandType === "play"
+          ? "cast_remote_play_allowed_within_trusted_session"
+          : "cast_remote_rejection_bypassed_due_to_trusted_session",
       source: "cast_remote",
       data: {
         activeControlSession,
@@ -2676,6 +2784,8 @@ function observeChromecastRemotePlaybackState(reason: string) {
       playAllowedFromTrustedContinuation &&
       commandType === "play" &&
       status === "playing";
+    const seekCandidateDuringTrustedSessionStabilization =
+      seekAllowedWithinTrustedSession && commandType === "seek";
 
     if (playCandidateDuringTrustedContinuationStabilization) {
       const playEvent: ChromecastRemotePlaybackEvent = {
@@ -2699,7 +2809,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
       logDebugEvent({
         level: "info",
         category: "cast",
-        message: "cast_remote_play_allowed_from_trusted_continuation",
+        message: "cast_remote_play_allowed_within_trusted_session",
         source: "cast_remote",
         data: {
           activeControlSession,
@@ -2715,6 +2825,54 @@ function observeChromecastRemotePlaybackState(reason: string) {
       return;
     }
 
+    if (seekCandidateDuringTrustedSessionStabilization) {
+      logDebugEvent({
+        level: "info",
+        category: "cast",
+        message: "cast_remote_rejection_bypassed_due_to_trusted_session",
+        source: "cast_remote",
+        data: {
+          activeControlSession,
+          commandType,
+          currentTime,
+          expectedCurrentTime,
+          observationDelayMs,
+          signature: nextSignature,
+          status,
+        },
+      });
+      queuePendingCastRemoteCandidate(
+        {
+          type: commandType,
+          status,
+          currentTime: Math.round(currentTime * 1000) / 1000,
+          playbackRate,
+          playerState,
+          isPaused,
+          expectedCurrentTime: Math.round(expectedCurrentTime * 1000) / 1000,
+          observationDelayMs,
+          observedAt: new Date(observedAtMs).toISOString(),
+          sessionId: sessionIdentity.id,
+          contentId,
+          selectionSignature,
+          seekDeltaSeconds:
+            previousObservedCurrentTime == null
+              ? null
+              : Math.round((currentTime - previousObservedCurrentTime) * 1000) /
+                1000,
+          seekDirection:
+            previousObservedCurrentTime == null
+              ? null
+              : currentTime - previousObservedCurrentTime >= 0
+                ? "forward"
+                : "backward",
+          source: "cast_remote",
+        },
+        nextSignature,
+      );
+      return;
+    }
+
     rejectCastRemoteObservation("rejected_due_to_cast_stabilization_window", {
       commandType,
       currentTime,
@@ -2726,6 +2884,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
         castRemoteObserverState.stabilizationUntilMs > 0
           ? new Date(castRemoteObserverState.stabilizationUntilMs).toISOString()
           : null,
+      trustedInteractionSessionActive,
       trustedContinuationActive,
     });
     if (commandType === "play" || commandType === "pause") {
@@ -2770,6 +2929,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
   }
 
   const plausibility = assessCastRemoteObservationPlausibility({
+    allowTrustedSessionLeniency: observationAllowedWithinTrustedSession,
     commandType,
     expectedTime: expectedCurrentTime,
     observedTime: currentTime,
@@ -2809,6 +2969,23 @@ function observeChromecastRemotePlaybackState(reason: string) {
       );
     }
     return;
+  }
+
+  if (castRemoteObserverState.lastMirroredPlayback && observationAllowedWithinTrustedSession) {
+    logDebugEvent({
+      level: "info",
+      category: "cast",
+      message: "cast_remote_rejection_bypassed_due_to_trusted_session",
+      source: "cast_remote",
+      data: {
+        commandType,
+        currentTime,
+        driftSeconds: plausibility.driftSeconds,
+        expectedCurrentTime,
+        reason: "implausible_remote_time_threshold_relaxed",
+        signature: nextSignature,
+      },
+    });
   }
 
   if (castRemoteObserverState.pendingCandidate?.signature === nextSignature) {

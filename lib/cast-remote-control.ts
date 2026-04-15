@@ -236,3 +236,25 @@ export function isCastRemoteControlTrustedContinuationActive(
       ),
   );
 }
+
+export function isCastRemoteInteractionSessionActive(
+  session: CastRemoteControlSession | null,
+  observation: Pick<
+    CastRemoteControlObservation,
+    "contentId" | "selectionSignature" | "sessionId"
+  >,
+  nowMs = Date.now(),
+) {
+  return Boolean(
+    session &&
+      session.state !== "remote_control_session_expired" &&
+      session.expiresAtMs > nowMs &&
+      session.lastConfirmedRemoteAction != null &&
+      session.sessionId === observation.sessionId &&
+      session.contentId === observation.contentId &&
+      hasCompatibleSelectionSignature(
+        session.selectionSignature,
+        observation.selectionSignature,
+      ),
+  );
+}

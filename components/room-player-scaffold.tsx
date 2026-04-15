@@ -60,6 +60,7 @@ import {
   type RoomVideoPlayerSnapshot,
 } from "@/components/room-video-player";
 import { RoomPlaybackSurface } from "@/components/room-playback-surface";
+import { useRoomPlaybackController } from "@/components/use-room-playback-controller";
 
 type RoomPlayerScaffoldProps = { snapshot: RoomScaffoldSnapshot };
 type RoomConnectionStatus = "connecting" | "connected" | "disconnected";
@@ -1339,6 +1340,20 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
 
     await requestChromecastSession();
   }
+
+  const playbackController = useRoomPlaybackController({
+    currentTimeSeconds: surfaceCurrentTime,
+    durationSeconds: surfaceDurationSeconds,
+    isMobileClient,
+    playbackStatus: state.playback.status,
+    onCastToggle: () => {
+      void handleCastButton();
+    },
+    onRequestCommand: handlePlaybackSurfaceCommand,
+    onSelectAudioTrack: handleAudioTrackSelection,
+    onSelectSubtitleTrack: handleSubtitleTrackSelection,
+  });
+
   return (
     <div className="grid gap-6 xl:grid-cols-[1.45fr_0.85fr]">
       <section
@@ -1410,6 +1425,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
 
         <div className="mt-8">
           <RoomPlaybackSurface
+            controller={playbackController}
             title={roomDisplayTitle}
             subtitle={
               snapshot.movie?.releaseLabel ??
@@ -1417,10 +1433,9 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                 ? "Chromecast companion controls"
                 : "Shared room playback")
             }
+            isMobileClient={isMobileClient}
             playbackTarget={playbackTarget}
             playbackStatus={state.playback.status}
-            currentTimeSeconds={surfaceCurrentTime}
-            durationSeconds={surfaceDurationSeconds}
             audioTracks={audioTracks}
             audioTrackSupport={audioTrackSupport}
             selectedAudioTrackId={effectiveSelectedAudioTrackId}
@@ -1446,10 +1461,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
                 (!isCastActive && !canRequestSession)
               )
             }
-            onCastToggle={() => void handleCastButton()}
-            onRequestCommand={handlePlaybackSurfaceCommand}
-            onSelectAudioTrack={handleAudioTrackSelection}
-            onSelectSubtitleTrack={handleSubtitleTrackSelection}
             primaryClockLabel={surfacePrimaryClockLabel}
             syncModeLabel={surfaceSyncModeLabel}
             syncIssue={state.syncIssue}
