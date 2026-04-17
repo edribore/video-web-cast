@@ -37,6 +37,61 @@ env vars.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
+## Remote Diagnostics
+
+The room page now includes a debug-only `Remote Sync Diagnostics` drawer for
+Chromecast, shared-room transport, overlay lifecycle, and PiP drift analysis.
+
+Enable it with either:
+
+```bash
+# one-off from the room URL
+http://localhost:3000/room/<roomId>?debugRemote=1&debugSync=1
+
+# or persist it in local storage for this browser
+localStorage.setItem("syncpass.remote-diagnostics", "1")
+```
+
+Disable it with either:
+
+```bash
+http://localhost:3000/room/<roomId>?debugRemote=0&debugSync=0
+localStorage.setItem("syncpass.remote-diagnostics", "0")
+```
+
+What the drawer shows:
+
+- Live event stream for raw keyboard / Cast remote / transport / player events
+- Correlated event timeline with capture, send, server, receive, apply, render
+- Clock sync RTT and server offset estimates
+- Continuous drift snapshots for room time vs Chromecast vs web vs PiP
+- Overlay show/hide timer lifecycle
+- PiP following/divergence snapshots
+- Export of the bounded in-memory session as JSON
+
+Use the `Export JSON` button in the drawer to download the full active session.
+
+## Diagnostics Test Plan
+
+Run the automated checks with:
+
+```bash
+npm run test
+npm run build
+```
+
+Manual room diagnostics procedure:
+
+1. Open the same room in two browser clients. Enable diagnostics with `?debugRemote=1&debugSync=1`.
+2. On the primary client, press `Space`, `J`, `L`, `Escape`, arrow keys, and `Enter`. Confirm the drawer shows the raw key, normalized action, and whether the input was ignored, applied, or sent.
+3. On mobile or TV-style navigation, move focus so the overlay appears. Wait for it to fade. Confirm the overlay panel shows show trigger, timer start, timer reset, timer fire, and hide reason.
+4. Start Cast from the room page, then use the Chromecast remote for play, pause, seek, back, and directional input. Confirm the event stream shows Cast remote observations, queued/ignored/received stages, and transport timing.
+5. Compare `authoritative room`, `Chromecast actual`, and `web actual` in the drift panel while the room is playing. Confirm the deltas update continuously.
+6. Perform repeated seek tests from both web and Chromecast. Watch the timeline for out-of-order, duplicate, stale, or gap warnings.
+7. Spam play/pause from one client and confirm the second client receives correlated `server_received`, `broadcast`, `received`, `applied`, and `rendered` stages.
+8. Enter browser PiP for the local video element if supported. Confirm the PiP panel shows active state, PiP time, main player time, room time, and whether PiP is still following canonical room playback.
+9. Leave PiP, then export the JSON session and inspect the `events`, `correlatedTimelines`, `driftSnapshots`, `overlaySnapshots`, `pipSnapshots`, `clockSyncSamples`, and `sequenceSnapshots` sections.
+
 ## Database
 
 The Prisma schema is configured for PostgreSQL, with the client generated to `app/generated/prisma`.

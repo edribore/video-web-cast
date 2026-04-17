@@ -15,6 +15,7 @@
 
 # next.js
 /.next/
+/.tmp-tests/
 /out/
 
 # production

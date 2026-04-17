@@ -1,10 +1,20 @@
 "use client";
 
 import {
+  createSafeId,
+} from "@/lib/create-safe-id";
+import {
+  buildRawInputFromKeyboardEvent,
+  buildRawInputFromPointerEvent,
+  normalizeRoomPlaybackKeyboardAction,
+} from "@/lib/remote-diagnostics";
+import { logRemoteDiagnosticsEvent } from "@/lib/remote-diagnostics-store";
+import {
   useEffect,
   useRef,
   type CSSProperties,
   type KeyboardEvent,
+  type MouseEvent,
   type ReactNode,
 } from "react";
 import {
@@ -13,9 +23,11 @@ import {
 } from "@/lib/audio-track-playback";
 import { formatPlaybackSeconds } from "@/lib/playback";
 import type { RoomPlaybackController } from "@/components/use-room-playback-controller";
+import type { PlaybackControllerDebugInput } from "@/lib/playback-controller";
 import type { AudioSelectionMode } from "@/lib/audio-preferences";
 import type { ChromecastAvailabilityStatus } from "@/lib/chromecast";
 import type { PlaybackStatus } from "@/types/playback";
+import type { RemoteDiagnosticsAction } from "@/types/remote-diagnostics";
 import type {
   RoomAudioTrackSummary,
   RoomSubtitleTrackSummary,
@@ -46,6 +58,30 @@ type RoomPlaybackSurfaceProps = {
   children: ReactNode;
 };
 const seekStepSeconds = 10;
+
+function resolveRawKeyboardDiagnosticsAction(key: string): RemoteDiagnosticsAction {
+  switch (key.trim().toLowerCase()) {
+    case "arrowup":
+      return "up";
+    case "arrowdown":
+      return "down";
+    case "arrowleft":
+      return "left";
+    case "arrowright":
+      return "right";
+    case "enter":
+      return "select";
+    case "escape":
+    case "backspace":
+      return "back";
+    case " ":
+    case "k":
+    case "mediaplaypause":
+      return "play_pause";
+    default:
+      return "custom";
+  }
+}
 
 function getCastPillClasses(status: ChromecastAvailabilityStatus) {
   switch (status) {
@@ -227,7 +263,7 @@ function SurfaceActionButton({
 }: {
   label: string;
   children: ReactNode;
-  onClick(): void;
+  onClick(event: MouseEvent<HTMLButtonElement>): void;
 }) {
   return (
     <button
@@ -251,7 +287,7 @@ function OverlayToolbarButton({
   active?: boolean;
   disabled?: boolean;
   label: string;
-  onClick(): void;
+  onClick(event: MouseEvent<HTMLButtonElement>): void;
   children: ReactNode;
 }) {
   return (
@@ -327,34 +363,124 @@ export function RoomPlaybackSurface({
   const controlsVisible =
     !isMobileClient || controller.overlayState.visibility !== "hidden";
 
+  const createPointerDebugInput = (
+    event: MouseEvent<HTMLButtonElement>,
+    action: PlaybackControllerDebugInput["action"],
+    notes: string,
+  ) => {
+    return {
+      eventId: createSafeId("room-input"),
+      action,
+      source: "ui-button" as const,
+      rawInput: buildRawInputFromPointerEvent(event.nativeEvent),
+      notes,
+      reason: null,
+    } satisfies PlaybackControllerDebugInput;
+  };
+
   const handleSurfaceKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const rawInput = buildRawInputFromKeyboardEvent(event.nativeEvent);
+    const capturedEventId = createSafeId("room-keydown");
+    const rawAction = resolveRawKeyboardDiagnosticsAction(event.key);
+    const recordKeyboardStage = (
+      stage: "captured" | "normalized" | "applied" | "ignored",
+      notes: string,
+      reason?: string | null,
+      status?: "observed" | "applied" | "ignored" | "warning",
+    ) => {
+      logRemoteDiagnosticsEvent({
+        eventId: capturedEventId,
+        parentEventId: null,
+        source: "keyboard",
+        action: rawAction,
+        rawInput,
+        wallClockTs: Date.now(),
+        stage,
+        sequenceNumber: null,
+        roomVersion: null,
+        stateVersion: null,
+        playbackStateVersion: null,
+        currentTimeSec: null,
+        durationSec: null,
+        paused: null,
+        playbackRate: null,
+        buffering: null,
+        seeking: null,
+        module: "components/room-playback-surface",
+        functionName: "handleSurfaceKeyDown",
+        notes,
+        reason: reason ?? null,
+        status: status ?? "observed",
+        actorSessionId: null,
+        transportDirection: "local",
+        extra: {
+          defaultPreventedBefore: event.defaultPrevented,
+        },
+      });
+    };
+
+    recordKeyboardStage("captured", "surface_keyboard_captured");
+
     if (
       event.target instanceof HTMLButtonElement ||
       event.target instanceof HTMLInputElement
     ) {
+      recordKeyboardStage(
+        "ignored",
+        "surface_keyboard_ignored_interactive_target",
+        "interactive_target",
+        "ignored",
+      );
       return;
     }
 
-    if (event.key === " " || event.key.toLowerCase() === "k") {
+    const normalizedAction = normalizeRoomPlaybackKeyboardAction(event.key);
+
+    if (normalizedAction === "play_pause") {
       event.preventDefault();
-      controller.handlePlayPause();
+      recordKeyboardStage("normalized", "surface_keyboard_normalized_play_pause");
+      controller.handlePlayPause({
+        eventId: createSafeId("room-input"),
+        parentEventId: capturedEventId,
+        action: normalizedAction,
+        source: "keyboard",
+        rawInput,
+        notes: "surface_keyboard_play_pause",
+      });
       return;
     }
 
-    if (event.key.toLowerCase() === "j" || event.key === "ArrowLeft") {
+    if (normalizedAction === "seek_backward") {
       event.preventDefault();
-      controller.handleSeekRelative(-seekStepSeconds);
+      recordKeyboardStage("normalized", "surface_keyboard_normalized_seek_backward");
+      controller.handleSeekRelative(-seekStepSeconds, {
+        eventId: createSafeId("room-input"),
+        parentEventId: capturedEventId,
+        action: normalizedAction,
+        source: "keyboard",
+        rawInput,
+        notes: "surface_keyboard_seek_backward",
+      });
       return;
     }
 
-    if (event.key.toLowerCase() === "l" || event.key === "ArrowRight") {
+    if (normalizedAction === "seek_forward") {
       event.preventDefault();
-      controller.handleSeekRelative(seekStepSeconds);
+      recordKeyboardStage("normalized", "surface_keyboard_normalized_seek_forward");
+      controller.handleSeekRelative(seekStepSeconds, {
+        eventId: createSafeId("room-input"),
+        parentEventId: capturedEventId,
+        action: normalizedAction,
+        source: "keyboard",
+        rawInput,
+        notes: "surface_keyboard_seek_forward",
+      });
       return;
     }
 
     if (event.key.toLowerCase() === "f") {
       event.preventDefault();
+      recordKeyboardStage("applied", "surface_keyboard_fullscreen_toggle");
       void controller.toggleFullscreen(surfaceRef);
       return;
     }
@@ -363,7 +489,16 @@ export function RoomPlaybackSurface({
       controller.closeMenus();
       controller.scrubCancel();
       controller.handleActivity();
+      recordKeyboardStage("applied", "surface_keyboard_escape_local_overlay");
+      return;
     }
+
+    recordKeyboardStage(
+      "ignored",
+      "surface_keyboard_unhandled",
+      normalizedAction == null ? "unmapped_key" : "no_surface_handler",
+      "ignored",
+    );
   };
 
   const timelineTrackStyle = {
@@ -477,7 +612,15 @@ export function RoomPlaybackSurface({
             <button
               type="button"
               disabled={!canToggleCast}
-              onClick={controller.handleCastToggle}
+              onClick={(event) =>
+                controller.handleCastToggle(
+                  createPointerDebugInput(
+                    event,
+                    "custom",
+                    "surface_cast_toggle",
+                  ),
+                )
+              }
               className={`flex h-11 items-center gap-2 rounded-full border px-4 text-sm font-semibold backdrop-blur-xl transition ${getCastPillClasses(
                 castStatus,
               )} disabled:cursor-not-allowed disabled:border-white/8 disabled:bg-black/18 disabled:text-white/35`}
@@ -520,7 +663,16 @@ export function RoomPlaybackSurface({
                     <div className="rounded-2xl border border-white/8 bg-white/4 p-1.5">
                       <button
                         type="button"
-                        onClick={() => controller.handleSelectAudioTrack(null)}
+                        onClick={(event) =>
+                          controller.handleSelectAudioTrack(
+                            null,
+                            createPointerDebugInput(
+                              event,
+                              "custom",
+                              "surface_audio_embedded_selected",
+                            ),
+                          )
+                        }
                         className={`flex w-full items-center justify-between rounded-[1rem] px-3 py-3 text-left text-sm transition ${
                           selectedAudioTrackId == null
                             ? "bg-white/12 text-white"
@@ -541,7 +693,16 @@ export function RoomPlaybackSurface({
                             key={track.id}
                             type="button"
                             disabled={!playable}
-                            onClick={() => controller.handleSelectAudioTrack(track.id)}
+                            onClick={(event) =>
+                              controller.handleSelectAudioTrack(
+                                track.id,
+                                createPointerDebugInput(
+                                  event,
+                                  "custom",
+                                  `surface_audio_track_selected:${track.id}`,
+                                ),
+                              )
+                            }
                             className={`mt-1 flex w-full items-center justify-between rounded-[1rem] px-3 py-3 text-left text-sm transition ${
                               selected
                                 ? "bg-white/12 text-white"
@@ -577,7 +738,16 @@ export function RoomPlaybackSurface({
                     <div className="rounded-2xl border border-white/8 bg-white/4 p-1.5">
                       <button
                         type="button"
-                        onClick={() => controller.handleSelectSubtitleTrack(null)}
+                        onClick={(event) =>
+                          controller.handleSelectSubtitleTrack(
+                            null,
+                            createPointerDebugInput(
+                              event,
+                              "custom",
+                              "surface_subtitle_off_selected",
+                            ),
+                          )
+                        }
                         className={`flex w-full items-center justify-between rounded-[1rem] px-3 py-3 text-left text-sm transition ${
                           selectedSubtitleTrackId == null
                             ? "bg-white/12 text-white"
@@ -596,8 +766,15 @@ export function RoomPlaybackSurface({
                             key={track.id}
                             type="button"
                             disabled={!selectable}
-                            onClick={() =>
-                              controller.handleSelectSubtitleTrack(track.id)
+                            onClick={(event) =>
+                              controller.handleSelectSubtitleTrack(
+                                track.id,
+                                createPointerDebugInput(
+                                  event,
+                                  "custom",
+                                  `surface_subtitle_track_selected:${track.id}`,
+                                ),
+                              )
                             }
                             className={`mt-1 flex w-full items-center justify-between rounded-[1rem] px-3 py-3 text-left text-sm transition ${
                               selected
@@ -674,21 +851,47 @@ export function RoomPlaybackSurface({
           <div className="pointer-events-auto flex items-center gap-4 sm:gap-8">
             <SurfaceActionButton
               label={`Seek backward ${seekStepSeconds} seconds`}
-              onClick={() => controller.handleSeekRelative(-seekStepSeconds)}
+              onClick={(event) =>
+                controller.handleSeekRelative(
+                  -seekStepSeconds,
+                  createPointerDebugInput(
+                    event,
+                    "seek_backward",
+                    "surface_button_seek_backward",
+                  ),
+                )
+              }
             >
               <SeekIcon direction="backward" seconds={seekStepSeconds} />
             </SurfaceActionButton>
             <button
               type="button"
               aria-label={playbackStatus === "playing" ? "Pause" : "Play"}
-              onClick={controller.handlePlayPause}
+              onClick={(event) =>
+                controller.handlePlayPause(
+                  createPointerDebugInput(
+                    event,
+                    "play_pause",
+                    "surface_button_play_pause",
+                  ),
+                )
+              }
               className="flex h-[5.5rem] w-[5.5rem] items-center justify-center rounded-full border border-white/15 bg-white/12 text-white shadow-[0_18px_48px_rgba(0,0,0,0.38)] backdrop-blur-2xl transition hover:scale-[1.02] hover:border-white/35 hover:bg-white/18 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/80 sm:h-[6rem] sm:w-[6rem]"
             >
               <PlaybackIcon paused={playbackStatus !== "playing"} />
             </button>
             <SurfaceActionButton
               label={`Seek forward ${seekStepSeconds} seconds`}
-              onClick={() => controller.handleSeekRelative(seekStepSeconds)}
+              onClick={(event) =>
+                controller.handleSeekRelative(
+                  seekStepSeconds,
+                  createPointerDebugInput(
+                    event,
+                    "seek_forward",
+                    "surface_button_seek_forward",
+                  ),
+                )
+              }
             >
               <SeekIcon direction="forward" seconds={seekStepSeconds} />
             </SurfaceActionButton>
@@ -718,9 +921,33 @@ export function RoomPlaybackSurface({
                 max={controller.resolvedDurationSeconds}
                 step={0.1}
                 value={controller.timelineValue}
-                onPointerDown={controller.scrubStart}
-                onMouseDown={controller.scrubStart}
-                onTouchStart={controller.scrubStart}
+                onPointerDown={(event) =>
+                  controller.scrubStart({
+                    eventId: createSafeId("room-input"),
+                    action: "seek_to",
+                    source: "pointer",
+                    rawInput: buildRawInputFromPointerEvent(event.nativeEvent),
+                    notes: "timeline_scrub_started",
+                  })
+                }
+                onMouseDown={(event) =>
+                  controller.scrubStart({
+                    eventId: createSafeId("room-input"),
+                    action: "seek_to",
+                    source: "pointer",
+                    rawInput: buildRawInputFromPointerEvent(event.nativeEvent),
+                    notes: "timeline_mouse_scrub_started",
+                  })
+                }
+                onTouchStart={() =>
+                  controller.scrubStart({
+                    eventId: createSafeId("room-input"),
+                    action: "seek_to",
+                    source: "pointer",
+                    rawInput: null,
+                    notes: "timeline_touch_scrub_started",
+                  })
+                }
                 onInput={(event) =>
                   controller.scrubPreview(Number(event.currentTarget.value))
                 }
@@ -728,13 +955,31 @@ export function RoomPlaybackSurface({
                   controller.scrubPreview(Number(event.currentTarget.value))
                 }
                 onPointerUp={(event) =>
-                  controller.scrubCommit(Number(event.currentTarget.value))
+                  controller.scrubCommit(Number(event.currentTarget.value), {
+                    eventId: createSafeId("room-input"),
+                    action: "seek_to",
+                    source: "pointer",
+                    rawInput: buildRawInputFromPointerEvent(event.nativeEvent),
+                    notes: "timeline_scrub_committed",
+                  })
                 }
                 onMouseUp={(event) =>
-                  controller.scrubCommit(Number(event.currentTarget.value))
+                  controller.scrubCommit(Number(event.currentTarget.value), {
+                    eventId: createSafeId("room-input"),
+                    action: "seek_to",
+                    source: "pointer",
+                    rawInput: buildRawInputFromPointerEvent(event.nativeEvent),
+                    notes: "timeline_mouse_scrub_committed",
+                  })
                 }
                 onTouchEnd={(event) =>
-                  controller.scrubCommit(Number(event.currentTarget.value))
+                  controller.scrubCommit(Number(event.currentTarget.value), {
+                    eventId: createSafeId("room-input"),
+                    action: "seek_to",
+                    source: "pointer",
+                    rawInput: null,
+                    notes: "timeline_touch_scrub_committed",
+                  })
                 }
                 onPointerCancel={controller.scrubCancel}
                 onKeyUp={(event) => {
@@ -791,7 +1036,16 @@ export function RoomPlaybackSurface({
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => controller.handleSeekRelative(-seekStepSeconds)}
+                onClick={(event) =>
+                  controller.handleSeekRelative(
+                    -seekStepSeconds,
+                    createPointerDebugInput(
+                      event,
+                      "seek_backward",
+                      "mini_shell_seek_backward",
+                    ),
+                  )
+                }
                 className="flex h-10 w-10 items-center justify-center rounded-full border border-white/12 bg-white/8 text-white"
                 aria-label={`Seek backward ${seekStepSeconds} seconds`}
               >
@@ -799,7 +1053,15 @@ export function RoomPlaybackSurface({
               </button>
               <button
                 type="button"
-                onClick={controller.handlePlayPause}
+                onClick={(event) =>
+                  controller.handlePlayPause(
+                    createPointerDebugInput(
+                      event,
+                      "play_pause",
+                      "mini_shell_play_pause",
+                    ),
+                  )
+                }
                 className="flex h-10 w-10 items-center justify-center rounded-full border border-white/12 bg-white/12 text-white"
                 aria-label={playbackStatus === "playing" ? "Pause" : "Play"}
               >
@@ -807,7 +1069,16 @@ export function RoomPlaybackSurface({
               </button>
               <button
                 type="button"
-                onClick={() => controller.handleSeekRelative(seekStepSeconds)}
+                onClick={(event) =>
+                  controller.handleSeekRelative(
+                    seekStepSeconds,
+                    createPointerDebugInput(
+                      event,
+                      "seek_forward",
+                      "mini_shell_seek_forward",
+                    ),
+                  )
+                }
                 className="flex h-10 w-10 items-center justify-center rounded-full border border-white/12 bg-white/8 text-white"
                 aria-label={`Seek forward ${seekStepSeconds} seconds`}
               >

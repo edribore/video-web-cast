@@ -7,12 +7,22 @@ import {
 } from "react";
 import { usePathname } from "next/navigation";
 import {
+  buildRemoteDiagnosticsStorageValue,
+  remoteDiagnosticsStorageKey,
+  resolveRemoteDiagnosticsActivation,
+} from "@/lib/remote-diagnostics";
+import {
+  exportRemoteDiagnosticsSnapshot,
+  setRemoteDiagnosticsEnabled,
+} from "@/lib/remote-diagnostics-store";
+import {
   getDebugStoreSnapshot,
   initializeDebugStore,
   logDebugEvent,
   removeDebugPageState,
   removeDebugRuntimeState,
   sanitizeDebugPayload,
+  setDebugStoreEnabled,
   setDebugFeatureFlags,
   setDebugPageState,
   setDebugRuntimeState,
@@ -425,22 +435,26 @@ function downloadJsonFile(contents: string) {
 function ExportDebugJsonButton({
   configuredPublicBaseUrl,
   configuredCastBaseUrl,
+  visible,
 }: {
   configuredPublicBaseUrl: string | null;
   configuredCastBaseUrl: string | null;
+  visible: boolean;
 }) {
   const [exportState, setExportState] = useState<ExportState>("idle");
 
   function buildPayloadJson() {
-    return JSON.stringify(
-      buildDebugPayload(
-        getDebugStoreSnapshot(),
-        configuredPublicBaseUrl,
-        configuredCastBaseUrl,
-      ),
-      null,
-      2,
+    const legacyPayload = buildDebugPayload(
+      getDebugStoreSnapshot(),
+      configuredPublicBaseUrl,
+      configuredCastBaseUrl,
     );
+
+    return JSON.stringify(exportRemoteDiagnosticsSnapshot(legacyPayload), null, 2);
+  }
+
+  if (!visible) {
+    return null;
   }
 
   async function handleCopy() {
@@ -567,8 +581,44 @@ export function DebugRuntimeProvider({
   children,
 }: DebugRuntimeProviderProps) {
   const pathname = usePathname();
+  const [debugEnabled, setDebugEnabled] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
+    const currentSearch = window.location.search;
+    const storedValue = window.localStorage.getItem(remoteDiagnosticsStorageKey);
+    const activation = resolveRemoteDiagnosticsActivation({
+      search: currentSearch,
+      storedValue,
+    });
+    const explicitFlagPresent =
+      currentSearch.includes("debugRemote") ||
+      currentSearch.includes("debugSync") ||
+      currentSearch.includes("debugDiagnostics");
+
+    if (explicitFlagPresent) {
+      if (activation.enabled) {
+        window.localStorage.setItem(
+          remoteDiagnosticsStorageKey,
+          buildRemoteDiagnosticsStorageValue(true),
+        );
+      } else {
+        window.localStorage.removeItem(remoteDiagnosticsStorageKey);
+      }
+    }
+
+    queueMicrotask(() => {
+      if (!cancelled) {
+        setDebugEnabled(activation.enabled);
+      }
+    });
+    setDebugStoreEnabled(activation.enabled);
+    setRemoteDiagnosticsEnabled(activation.enabled, activation);
+
+    if (!activation.enabled) {
+      return;
+    }
+
     initializeDebugStore({
       appName,
       environment,
@@ -576,9 +626,17 @@ export function DebugRuntimeProvider({
     setDebugFeatureFlags({
       debugExportEnabled: true,
     });
-  }, [appName, environment]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [appName, environment, pathname]);
 
   useEffect(() => {
+    if (!debugEnabled) {
+      return;
+    }
+
     const route = `${pathname}${window.location.search}`;
 
     setDebugRuntimeState("app/context", {
@@ -597,10 +655,15 @@ export function DebugRuntimeProvider({
   }, [
     configuredCastBaseUrl,
     configuredPublicBaseUrl,
+    debugEnabled,
     pathname,
   ]);
 
   useEffect(() => {
+    if (!debugEnabled) {
+      return;
+    }
+
     const updateViewport = () => {
       setDebugRuntimeState("app/viewport", {
         width: window.innerWidth,
@@ -615,9 +678,13 @@ export function DebugRuntimeProvider({
     return () => {
       window.removeEventListener("resize", updateViewport);
     };
-  }, []);
+  }, [debugEnabled]);
 
   useEffect(() => {
+    if (!debugEnabled) {
+      return;
+    }
+
     const originalWarn = console.warn;
     const originalError = console.error;
     const originalFetch = window.fetch.bind(window);
@@ -729,7 +796,7 @@ export function DebugRuntimeProvider({
       window.removeEventListener("error", handleWindowError);
       window.removeEventListener("unhandledrejection", handleUnhandledRejection);
     };
-  }, []);
+  }, [debugEnabled]);
 
   return (
     <>
@@ -737,6 +804,7 @@ export function DebugRuntimeProvider({
       <ExportDebugJsonButton
         configuredPublicBaseUrl={configuredPublicBaseUrl}
         configuredCastBaseUrl={configuredCastBaseUrl}
+        visible={debugEnabled && !pathname.startsWith("/room/")}
       />
     </>
   );

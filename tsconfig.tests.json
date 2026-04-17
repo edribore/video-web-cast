@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowJs": false,
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": false,
+    "outDir": ".tmp-tests",
+    "rootDir": ".",
+    "target": "ES2022"
+  },
+  "include": [
+    "lib/remote-diagnostics.ts",
+    "types/playback.ts",
+    "types/remote-diagnostics.ts",
+    "tests/remote-diagnostics.test.ts"
+  ]
+}

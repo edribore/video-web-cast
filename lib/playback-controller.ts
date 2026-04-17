@@ -1,10 +1,26 @@
 import type { PlaybackStatus } from "@/types/playback";
 import type { SharedRoomControlType } from "@/types/room-sync";
+import type {
+  RemoteDiagnosticsAction,
+  RemoteDiagnosticsRawInput,
+  RemoteDiagnosticsSource,
+} from "@/types/remote-diagnostics";
 
 export type PlaybackControllerCommand = {
   type: SharedRoomControlType;
   deltaSeconds?: number;
   targetTimeSeconds?: number;
+  debugInput?: PlaybackControllerDebugInput | null;
+};
+
+export type PlaybackControllerDebugInput = {
+  eventId: string;
+  parentEventId?: string | null;
+  action: RemoteDiagnosticsAction;
+  source: RemoteDiagnosticsSource;
+  rawInput?: RemoteDiagnosticsRawInput | null;
+  notes?: string | null;
+  reason?: string | null;
 };
 
 export type PlaybackControllerMenu =

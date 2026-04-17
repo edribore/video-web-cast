@@ -8,6 +8,14 @@ import {
   useState,
   type RefObject,
 } from "react";
+import { createSafeId } from "@/lib/create-safe-id";
+import {
+  createEmptyRawInput,
+} from "@/lib/remote-diagnostics";
+import {
+  logRemoteDiagnosticsEvent,
+  recordRemoteDiagnosticsOverlaySnapshot,
+} from "@/lib/remote-diagnostics-store";
 import { logDebugEvent } from "@/lib/debug-store";
 import {
   clampTimelineValue,
@@ -21,6 +29,7 @@ import {
   shouldRenderMiniPlaybackShell,
   shouldScheduleMobileOverlayHide,
   startPlaybackScrub,
+  type PlaybackControllerDebugInput,
   type MobileOverlayEvent,
   type MobileOverlayState,
   type PlaybackControllerCommand,
@@ -112,15 +121,27 @@ export type RoomPlaybackController = {
   timelineValue: number;
   closeMenus(): void;
   handleActivity(): void;
-  handleCastToggle(): void;
-  handlePlayPause(): void;
-  handleSeekRelative(deltaSeconds: number): void;
-  handleSelectAudioTrack(trackId: string | null): void;
-  handleSelectSubtitleTrack(trackId: string | null): void;
+  handleCastToggle(input?: PlaybackControllerDebugInput | null): void;
+  handlePlayPause(input?: PlaybackControllerDebugInput | null): void;
+  handleSeekRelative(
+    deltaSeconds: number,
+    input?: PlaybackControllerDebugInput | null,
+  ): void;
+  handleSelectAudioTrack(
+    trackId: string | null,
+    input?: PlaybackControllerDebugInput | null,
+  ): void;
+  handleSelectSubtitleTrack(
+    trackId: string | null,
+    input?: PlaybackControllerDebugInput | null,
+  ): void;
   scrubCancel(): void;
-  scrubCommit(requestedTimeSeconds?: number | null): void;
+  scrubCommit(
+    requestedTimeSeconds?: number | null,
+    input?: PlaybackControllerDebugInput | null,
+  ): void;
   scrubPreview(requestedTimeSeconds: number): void;
-  scrubStart(): void;
+  scrubStart(input?: PlaybackControllerDebugInput | null): void;
   toggleFullscreen(surfaceRef: RefObject<HTMLElement | null>): Promise<void>;
   toggleMenu(menu: PlaybackControllerMenu): void;
 };
@@ -140,6 +161,9 @@ export function useRoomPlaybackController(
   } = input;
   const hideTimerRef = useRef<number | null>(null);
   const fadeTimerRef = useRef<number | null>(null);
+  const hideTimerStartedAtRef = useRef<number | null>(null);
+  const fadeTimerStartedAtRef = useRef<number | null>(null);
+  const lastOverlayKeepAliveActionRef = useRef<string | null>(null);
   const [activeMenu, setActiveMenu] = useState<PlaybackControllerMenu | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [scrubState, setScrubState] = useState<PlaybackScrubState>(
@@ -173,24 +197,163 @@ export function useRoomPlaybackController(
     playbackStatus,
   });
 
+  const recordOverlaySnapshot = useCallback(
+    (
+      eventType: string,
+      reason: string | null,
+      nextState: MobileOverlayState,
+      options?: {
+        hideTimerState?: "idle" | "scheduled" | "cleared" | "fired";
+        fadeTimerState?: "idle" | "scheduled" | "cleared" | "fired";
+      },
+    ) => {
+      recordRemoteDiagnosticsOverlaySnapshot({
+        recordedAtMs: Date.now(),
+        visibility: nextState.visibility,
+        pinnedReason: nextState.pinnedReason,
+        eventType,
+        reason,
+        hideTimerState:
+          options?.hideTimerState ??
+          (hideTimerRef.current != null ? "scheduled" : "idle"),
+        fadeTimerState:
+          options?.fadeTimerState ??
+          (fadeTimerRef.current != null ? "scheduled" : "idle"),
+        hideTimerDurationMs:
+          hideTimerStartedAtRef.current != null
+            ? Date.now() - hideTimerStartedAtRef.current
+            : null,
+        fadeTimerDurationMs:
+          fadeTimerStartedAtRef.current != null
+            ? Date.now() - fadeTimerStartedAtRef.current
+            : null,
+        activeMenu: activeMenuRef.current,
+        lastKeepAliveAction: lastOverlayKeepAliveActionRef.current,
+        playbackStatus,
+        isMobileClient,
+      });
+    },
+    [isMobileClient, playbackStatus],
+  );
+
   const clearOverlayTimers = useCallback(() => {
     if (hideTimerRef.current != null) {
       window.clearTimeout(hideTimerRef.current);
       hideTimerRef.current = null;
+      hideTimerStartedAtRef.current = null;
+      recordOverlaySnapshot(
+        "hide_timer_cleared",
+        "overlay_timer_reset",
+        overlayStateRef.current,
+        {
+          hideTimerState: "cleared",
+        },
+      );
     }
 
     if (fadeTimerRef.current != null) {
       window.clearTimeout(fadeTimerRef.current);
       fadeTimerRef.current = null;
+      fadeTimerStartedAtRef.current = null;
+      recordOverlaySnapshot(
+        "fade_timer_cleared",
+        "overlay_fade_reset",
+        overlayStateRef.current,
+        {
+          fadeTimerState: "cleared",
+        },
+      );
     }
-  }, []);
+  }, [recordOverlaySnapshot]);
 
   const applyOverlayEvent = useCallback((event: MobileOverlayEvent) => {
     const nextState = reduceMobileOverlayState(overlayStateRef.current, event);
     logOverlayTransition(overlayStateRef.current, nextState);
+    if (
+      event.type === "activity" ||
+      event.type === "menu_opened" ||
+      event.type === "menu_closed" ||
+      event.type === "scrub_started" ||
+      event.type === "scrub_finished" ||
+      event.type === "playback_paused" ||
+      event.type === "playback_resumed"
+    ) {
+      lastOverlayKeepAliveActionRef.current = event.type;
+    }
+
+    if (
+      overlayStateRef.current.visibility !== nextState.visibility ||
+      overlayStateRef.current.pinnedReason !== nextState.pinnedReason ||
+      event.type === "hide_timeout" ||
+      event.type === "fade_complete"
+    ) {
+      const overlayAction =
+        nextState.visibility === "hidden" ||
+        event.type === "hide_timeout" ||
+        event.type === "fade_complete"
+          ? "hide_controls"
+          : "show_controls";
+      const overlayEventId = createSafeId("overlay");
+
+      logRemoteDiagnosticsEvent({
+        eventId: overlayEventId,
+        parentEventId: null,
+        source:
+          event.type === "hide_timeout" || event.type === "fade_complete"
+            ? "timer"
+            : "custom",
+        action: overlayAction,
+        rawInput: createEmptyRawInput(),
+        wallClockTs: Date.now(),
+        stage:
+          event.type === "fade_complete"
+            ? "rendered"
+            : event.type === "hide_timeout"
+              ? "captured"
+              : "normalized",
+        sequenceNumber: null,
+        roomVersion: null,
+        stateVersion: null,
+        playbackStateVersion: null,
+        currentTimeSec: currentTimeSeconds,
+        durationSec: resolvedDurationSeconds,
+        paused: playbackStatus !== "playing",
+        playbackRate: null,
+        buffering: null,
+        seeking: scrubStateRef.current.phase === "scrubbing",
+        module: "components/use-room-playback-controller",
+        functionName: "applyOverlayEvent",
+        notes: event.type,
+        reason:
+          event.type === "hide_timeout"
+            ? "overlay_hide_timeout_elapsed"
+            : event.type === "fade_complete"
+              ? "overlay_fade_completed"
+              : nextState.pinnedReason,
+        status:
+          event.type === "fade_complete"
+            ? "rendered"
+            : event.type === "hide_timeout"
+              ? "pending"
+              : "observed",
+        actorSessionId: null,
+        transportDirection: "local",
+        extra: {
+          previousState: overlayStateRef.current,
+          nextState,
+        },
+      });
+    }
+
+    recordOverlaySnapshot(event.type, nextState.pinnedReason, nextState);
     overlayStateRef.current = nextState;
     setOverlayState(nextState);
-  }, []);
+  }, [
+    currentTimeSeconds,
+    playbackStatus,
+    recordOverlaySnapshot,
+    resolvedDurationSeconds,
+  ]);
 
   useEffect(() => {
     activeMenuRef.current = activeMenu;
@@ -244,8 +407,26 @@ export function useRoomPlaybackController(
     }
 
     hideTimerRef.current = window.setTimeout(() => {
+      hideTimerStartedAtRef.current = null;
+      recordOverlaySnapshot(
+        "hide_timer_fired",
+        "overlay_hide_delay_elapsed",
+        overlayStateRef.current,
+        {
+          hideTimerState: "fired",
+        },
+      );
       applyOverlayEvent({ type: "hide_timeout" });
     }, playbackControllerUiConfig.mobileOverlayHideDelayMs);
+    hideTimerStartedAtRef.current = Date.now();
+    recordOverlaySnapshot(
+      "hide_timer_started",
+      "overlay_hide_scheduled",
+      overlayState,
+      {
+        hideTimerState: "scheduled",
+      },
+    );
 
     return clearOverlayTimers;
   }, [
@@ -255,6 +436,7 @@ export function useRoomPlaybackController(
     isMobileClient,
     playbackStatus,
     overlayState,
+    recordOverlaySnapshot,
     scrubState,
   ]);
 
@@ -264,16 +446,49 @@ export function useRoomPlaybackController(
     }
 
     fadeTimerRef.current = window.setTimeout(() => {
+      fadeTimerStartedAtRef.current = null;
+      recordOverlaySnapshot(
+        "fade_timer_fired",
+        "overlay_fade_duration_elapsed",
+        overlayStateRef.current,
+        {
+          fadeTimerState: "fired",
+        },
+      );
       applyOverlayEvent({ type: "fade_complete" });
     }, playbackControllerUiConfig.mobileOverlayFadeDurationMs);
+    fadeTimerStartedAtRef.current = Date.now();
+    recordOverlaySnapshot(
+      "fade_timer_started",
+      "overlay_fade_scheduled",
+      overlayState,
+      {
+        fadeTimerState: "scheduled",
+      },
+    );
 
     return () => {
       if (fadeTimerRef.current != null) {
         window.clearTimeout(fadeTimerRef.current);
         fadeTimerRef.current = null;
+        fadeTimerStartedAtRef.current = null;
+        recordOverlaySnapshot(
+          "fade_timer_cleared",
+          "overlay_fade_reset",
+          overlayStateRef.current,
+          {
+            fadeTimerState: "cleared",
+          },
+        );
       }
     };
-  }, [applyOverlayEvent, isMobileClient, overlayState.visibility]);
+  }, [
+    applyOverlayEvent,
+    isMobileClient,
+    overlayState,
+    overlayState.visibility,
+    recordOverlaySnapshot,
+  ]);
 
   useEffect(() => clearOverlayTimers, [clearOverlayTimers]);
 
@@ -287,24 +502,29 @@ export function useRoomPlaybackController(
     applyOverlayEvent({ type: "menu_closed" });
   }, [applyOverlayEvent]);
 
-  const handlePlayPause = useCallback(() => {
+  const handlePlayPause = useCallback((inputMeta?: PlaybackControllerDebugInput | null) => {
     handleActivity();
     closeMenus();
     onRequestCommand({
       type: playbackStatus === "playing" ? "pause" : "play",
+      debugInput: inputMeta ?? null,
     });
   }, [closeMenus, handleActivity, onRequestCommand, playbackStatus]);
 
-  const handleSeekRelative = useCallback((deltaSeconds: number) => {
+  const handleSeekRelative = useCallback((
+    deltaSeconds: number,
+    inputMeta?: PlaybackControllerDebugInput | null,
+  ) => {
     handleActivity();
     closeMenus();
     onRequestCommand({
       type: "seek",
       deltaSeconds,
+      debugInput: inputMeta ?? null,
     });
   }, [closeMenus, handleActivity, onRequestCommand]);
 
-  const scrubStart = useCallback(() => {
+  const scrubStart = useCallback((inputMeta?: PlaybackControllerDebugInput | null) => {
     handleActivity();
     closeMenus();
     const nextScrubState = startPlaybackScrub({
@@ -314,7 +534,43 @@ export function useRoomPlaybackController(
     scrubStateRef.current = nextScrubState;
     setScrubState(nextScrubState);
     applyOverlayEvent({ type: "scrub_started" });
-  }, [applyOverlayEvent, closeMenus, currentTimeSeconds, handleActivity]);
+    if (inputMeta) {
+      logRemoteDiagnosticsEvent({
+        eventId: inputMeta.eventId,
+        parentEventId: inputMeta.parentEventId ?? null,
+        source: inputMeta.source,
+        action: "show_controls",
+        rawInput: inputMeta.rawInput ?? createEmptyRawInput(),
+        wallClockTs: Date.now(),
+        stage: "captured",
+        sequenceNumber: null,
+        roomVersion: null,
+        stateVersion: null,
+        playbackStateVersion: null,
+        currentTimeSec: currentTimeSeconds,
+        durationSec: resolvedDurationSeconds,
+        paused: playbackStatus !== "playing",
+        playbackRate: null,
+        buffering: null,
+        seeking: true,
+        module: "components/use-room-playback-controller",
+        functionName: "scrubStart",
+        notes: inputMeta.notes ?? "scrub_started",
+        reason: inputMeta.reason ?? null,
+        status: "observed",
+        actorSessionId: null,
+        transportDirection: "local",
+        extra: null,
+      });
+    }
+  }, [
+    applyOverlayEvent,
+    closeMenus,
+    currentTimeSeconds,
+    handleActivity,
+    playbackStatus,
+    resolvedDurationSeconds,
+  ]);
 
   const scrubPreview = useCallback((requestedTimeSeconds: number) => {
     handleActivity();
@@ -327,7 +583,10 @@ export function useRoomPlaybackController(
     setScrubState(nextScrubState);
   }, [handleActivity, resolvedDurationSeconds]);
 
-  const scrubCommit = useCallback((requestedTimeSeconds?: number | null) => {
+  const scrubCommit = useCallback((
+    requestedTimeSeconds?: number | null,
+    inputMeta?: PlaybackControllerDebugInput | null,
+  ) => {
     handleActivity();
     const scrubStateForCommit =
       scrubStateRef.current.phase === "scrubbing" &&
@@ -353,6 +612,7 @@ export function useRoomPlaybackController(
       onRequestCommand({
         type: "seek",
         targetTimeSeconds: commit.committedTimeSeconds,
+        debugInput: inputMeta ?? null,
       });
     }
 
@@ -401,22 +661,139 @@ export function useRoomPlaybackController(
     [handleActivity],
   );
 
-  const handleCastToggle = useCallback(() => {
+  const handleCastToggle = useCallback((inputMeta?: PlaybackControllerDebugInput | null) => {
     handleActivity();
+    if (inputMeta) {
+      logRemoteDiagnosticsEvent({
+        eventId: inputMeta.eventId,
+        parentEventId: inputMeta.parentEventId ?? null,
+        source: inputMeta.source,
+        action: inputMeta.action,
+        rawInput: inputMeta.rawInput ?? createEmptyRawInput(),
+        wallClockTs: Date.now(),
+        stage: "captured",
+        sequenceNumber: null,
+        roomVersion: null,
+        stateVersion: null,
+        playbackStateVersion: null,
+        currentTimeSec: currentTimeSeconds,
+        durationSec: resolvedDurationSeconds,
+        paused: playbackStatus !== "playing",
+        playbackRate: null,
+        buffering: null,
+        seeking: scrubStateRef.current.phase === "scrubbing",
+        module: "components/use-room-playback-controller",
+        functionName: "handleCastToggle",
+        notes: inputMeta.notes ?? null,
+        reason: inputMeta.reason ?? null,
+        status: "observed",
+        actorSessionId: null,
+        transportDirection: "local",
+        extra: null,
+      });
+    }
     onCastToggle();
-  }, [handleActivity, onCastToggle]);
+  }, [
+    currentTimeSeconds,
+    handleActivity,
+    onCastToggle,
+    playbackStatus,
+    resolvedDurationSeconds,
+  ]);
 
-  const handleSelectAudioTrack = useCallback((trackId: string | null) => {
+  const handleSelectAudioTrack = useCallback((
+    trackId: string | null,
+    inputMeta?: PlaybackControllerDebugInput | null,
+  ) => {
     handleActivity();
+    if (inputMeta) {
+      logRemoteDiagnosticsEvent({
+        eventId: inputMeta.eventId,
+        parentEventId: inputMeta.parentEventId ?? null,
+        source: inputMeta.source,
+        action: inputMeta.action,
+        rawInput: inputMeta.rawInput ?? createEmptyRawInput(),
+        wallClockTs: Date.now(),
+        stage: "captured",
+        sequenceNumber: null,
+        roomVersion: null,
+        stateVersion: null,
+        playbackStateVersion: null,
+        currentTimeSec: currentTimeSeconds,
+        durationSec: resolvedDurationSeconds,
+        paused: playbackStatus !== "playing",
+        playbackRate: null,
+        buffering: null,
+        seeking: scrubStateRef.current.phase === "scrubbing",
+        module: "components/use-room-playback-controller",
+        functionName: "handleSelectAudioTrack",
+        notes: inputMeta.notes ?? null,
+        reason: inputMeta.reason ?? null,
+        status: "observed",
+        actorSessionId: null,
+        transportDirection: "local",
+        extra: {
+          trackId,
+        },
+      });
+    }
     onSelectAudioTrack(trackId);
     closeMenus();
-  }, [closeMenus, handleActivity, onSelectAudioTrack]);
+  }, [
+    closeMenus,
+    currentTimeSeconds,
+    handleActivity,
+    onSelectAudioTrack,
+    playbackStatus,
+    resolvedDurationSeconds,
+  ]);
 
-  const handleSelectSubtitleTrack = useCallback((trackId: string | null) => {
+  const handleSelectSubtitleTrack = useCallback((
+    trackId: string | null,
+    inputMeta?: PlaybackControllerDebugInput | null,
+  ) => {
     handleActivity();
+    if (inputMeta) {
+      logRemoteDiagnosticsEvent({
+        eventId: inputMeta.eventId,
+        parentEventId: inputMeta.parentEventId ?? null,
+        source: inputMeta.source,
+        action: inputMeta.action,
+        rawInput: inputMeta.rawInput ?? createEmptyRawInput(),
+        wallClockTs: Date.now(),
+        stage: "captured",
+        sequenceNumber: null,
+        roomVersion: null,
+        stateVersion: null,
+        playbackStateVersion: null,
+        currentTimeSec: currentTimeSeconds,
+        durationSec: resolvedDurationSeconds,
+        paused: playbackStatus !== "playing",
+        playbackRate: null,
+        buffering: null,
+        seeking: scrubStateRef.current.phase === "scrubbing",
+        module: "components/use-room-playback-controller",
+        functionName: "handleSelectSubtitleTrack",
+        notes: inputMeta.notes ?? null,
+        reason: inputMeta.reason ?? null,
+        status: "observed",
+        actorSessionId: null,
+        transportDirection: "local",
+        extra: {
+          trackId,
+        },
+      });
+    }
     onSelectSubtitleTrack(trackId);
     closeMenus();
-  }, [closeMenus, handleActivity, onSelectSubtitleTrack]);
+  }, [
+    closeMenus,
+    currentTimeSeconds,
+    handleActivity,
+    onSelectSubtitleTrack,
+    playbackStatus,
+    resolvedDurationSeconds,
+  ]);
 
   return useMemo(
     () => ({

@@ -8,11 +8,16 @@ import {
   useRef,
   useState,
 } from "react";
+import { createSafeId } from "@/lib/create-safe-id";
 import { logDebugEvent } from "@/lib/debug-store";
 import {
   isPlayableAudioTrackSupport,
   type AudioTrackPlaybackSupport,
 } from "@/lib/audio-track-playback";
+import {
+  calculateDriftMilliseconds,
+  createEmptyRawInput,
+} from "@/lib/remote-diagnostics";
 import {
   assessPlaybackProgressStall,
   clampPlaybackRate,
@@ -33,6 +38,11 @@ import {
   type PlaybackSuppressionCause,
   type PlaybackSuppressionState,
 } from "@/lib/playback";
+import {
+  logRemoteDiagnosticsEvent,
+  recordRemoteDiagnosticsPipSnapshot,
+  recordRemoteDiagnosticsPlayerSnapshot,
+} from "@/lib/remote-diagnostics-store";
 import { useDebugRuntimeState } from "@/components/debug-runtime";
 import type { PlaybackStateSnapshot, PlaybackStatus } from "@/types/playback";
 import type {
@@ -462,6 +472,161 @@ export const RoomVideoPlayer = forwardRef<
 
   const emitSyncIssue = useEffectEvent((message: string | null) => {
     onSyncIssueChange(message);
+  });
+
+  const publishRemotePlayerSnapshot = useEffectEvent(
+    (playerKind: "local-web" | "pip", notes: string, extra?: Record<string, unknown>) => {
+      const snapshot = buildSnapshot(
+        videoRef.current,
+        externalAudioRef.current,
+        Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+        externalAudioIssue,
+        playbackRate,
+      );
+      const video = videoRef.current;
+
+      recordRemoteDiagnosticsPlayerSnapshot({
+        recordedAtMs: Date.now(),
+        playerKind,
+        currentTimeSec: snapshot.currentTime,
+        durationSec: snapshot.duration,
+        status: snapshot.status,
+        playbackRate: snapshot.playbackRate,
+        paused: snapshot.status !== "playing",
+        buffering: video ? video.readyState < 3 : null,
+        seeking: video?.seeking ?? null,
+        primaryClockSource: snapshot.primaryClockSource,
+        extra: {
+          audibleCurrentTimeSec: snapshot.audibleCurrentTime,
+          avDriftSeconds: snapshot.avDriftSeconds,
+          notes,
+          syncMode: snapshot.syncMode,
+          videoCurrentTimeSec: snapshot.videoCurrentTime,
+          ...extra,
+        },
+      });
+
+      return snapshot;
+    },
+  );
+
+  const logPlayerDiagnosticsEvent = useEffectEvent(
+    (input: {
+      action: "play" | "pause" | "seek_to" | "pip_enter" | "pip_exit" | "state_sync" | "custom";
+      notes: string;
+      reason?: string | null;
+      stage?: "received" | "applied" | "rendered" | "ack";
+      status?: "observed" | "applied" | "rendered" | "warning";
+      source?: "player" | "pip";
+    }) => {
+      const snapshot = buildSnapshot(
+        videoRef.current,
+        externalAudioRef.current,
+        Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+        externalAudioIssue,
+        playbackRate,
+      );
+      const video = videoRef.current;
+
+      logRemoteDiagnosticsEvent({
+        eventId: createSafeId("player"),
+        parentEventId: null,
+        source: input.source ?? "player",
+        action: input.action,
+        rawInput: createEmptyRawInput(),
+        wallClockTs: Date.now(),
+        stage: input.stage ?? "rendered",
+        sequenceNumber: authoritativePlaybackRef.current.version,
+        roomVersion: authoritativePlaybackRef.current.version,
+        stateVersion: authoritativePlaybackRef.current.version,
+        playbackStateVersion: authoritativePlaybackRef.current.version,
+        currentTimeSec: snapshot.currentTime,
+        durationSec: snapshot.duration,
+        paused: snapshot.status !== "playing",
+        playbackRate: snapshot.playbackRate,
+        buffering: video ? video.readyState < 3 : null,
+        seeking: video?.seeking ?? null,
+        module: "components/room-video-player",
+        functionName: "logPlayerDiagnosticsEvent",
+        notes: input.notes,
+        reason: input.reason ?? null,
+        status: input.status ?? "observed",
+        actorSessionId: null,
+        transportDirection: "local",
+        extra: {
+          audibleCurrentTimeSec: snapshot.audibleCurrentTime,
+          avDriftSeconds: snapshot.avDriftSeconds,
+          primaryClockSource: snapshot.primaryClockSource,
+          syncMode: snapshot.syncMode,
+          videoCurrentTimeSec: snapshot.videoCurrentTime,
+        },
+      });
+    },
+  );
+
+  const publishPipSnapshot = useEffectEvent((eventType: string, notes?: string | null) => {
+    const video = videoRef.current;
+    const supported =
+      typeof document !== "undefined" &&
+      "pictureInPictureEnabled" in document;
+    const active =
+      Boolean(video) &&
+      typeof document !== "undefined" &&
+      document.pictureInPictureElement === video;
+    const mainSnapshot = buildSnapshot(
+      video,
+      externalAudioRef.current,
+      Boolean(activeExternalAudioTrack) && !suppressLocalAudioOutput,
+      externalAudioIssue,
+      playbackRate,
+    );
+    const authoritativePlayback = authoritativePlaybackRef.current;
+    const authoritativeRoomTimeSec = resolveSynchronizedPlaybackTime(
+      authoritativePlayback,
+    );
+    const pipCurrentTimeSec = active ? mainSnapshot.currentTime : null;
+    const pipStatus = active ? mainSnapshot.status : null;
+    const followingCanonicalState =
+      active && pipCurrentTimeSec != null
+        ? Math.abs(
+            (calculateDriftMilliseconds(
+              pipCurrentTimeSec,
+              authoritativeRoomTimeSec,
+            ) ?? 0) / 1000,
+          ) <= 0.35 && mainSnapshot.status === authoritativePlayback.status
+        : null;
+
+    recordRemoteDiagnosticsPipSnapshot({
+      recordedAtMs: Date.now(),
+      supported,
+      active,
+      mode: supported ? "video-element" : "unavailable",
+      pipCurrentTimeSec,
+      mainPlayerCurrentTimeSec: mainSnapshot.currentTime,
+      authoritativeRoomTimeSec,
+      pipMinusRoomMs: calculateDriftMilliseconds(
+        pipCurrentTimeSec,
+        authoritativeRoomTimeSec,
+      ),
+      pipMinusMainMs: calculateDriftMilliseconds(
+        pipCurrentTimeSec,
+        mainSnapshot.currentTime,
+      ),
+      pipStatus,
+      mainStatus: mainSnapshot.status,
+      authoritativeStatus: authoritativePlayback.status,
+      followingCanonicalState,
+      lastCommandEventId: null,
+      lastCommandAction: null,
+      lastCommandReceivedAtMs: null,
+      notes: notes ?? eventType,
+    });
+
+    if (active) {
+      publishRemotePlayerSnapshot("pip", eventType, {
+        pipEventType: eventType,
+      });
+    }
   });
 
   const clearScheduledSharedStart = useEffectEvent(() => {
@@ -1407,6 +1572,8 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleTimeUpdate = () => {
       emitObservedStateChange();
+      publishRemotePlayerSnapshot("local-web", "video_timeupdate");
+      publishPipSnapshot("video_timeupdate");
 
       if (!video.paused) {
         void synchronizeExternalAudioWithVideo({
@@ -1419,6 +1586,12 @@ export const RoomVideoPlayer = forwardRef<
     const handlePlay = () => {
       updateLastMediaEvent("play");
       emitObservedStateChange();
+      logPlayerDiagnosticsEvent({
+        action: "play",
+        notes: "video_play_event",
+      });
+      publishRemotePlayerSnapshot("local-web", "video_play_event");
+      publishPipSnapshot("video_play_event");
       void synchronizeExternalAudioWithVideo({
         attemptPlayback: true,
         forceSeek: true,
@@ -1429,6 +1602,12 @@ export const RoomVideoPlayer = forwardRef<
     const handlePause = () => {
       updateLastMediaEvent("pause");
       emitObservedStateChange();
+      logPlayerDiagnosticsEvent({
+        action: "pause",
+        notes: "video_pause_event",
+      });
+      publishRemotePlayerSnapshot("local-web", "video_pause_event");
+      publishPipSnapshot("video_pause_event");
       void synchronizeExternalAudioWithVideo({
         publishDiagnostics: true,
       });
@@ -1438,6 +1617,13 @@ export const RoomVideoPlayer = forwardRef<
     const handleEnded = () => {
       updateLastMediaEvent("ended");
       emitObservedStateChange();
+      logPlayerDiagnosticsEvent({
+        action: "pause",
+        notes: "video_ended_event",
+        reason: "media_ended",
+      });
+      publishRemotePlayerSnapshot("local-web", "video_ended_event");
+      publishPipSnapshot("video_ended_event");
       void synchronizeExternalAudioWithVideo({
         forceSeek: true,
         publishDiagnostics: true,
@@ -1447,6 +1633,10 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleSeeked = () => {
       updateLastMediaEvent("seeked");
+      logPlayerDiagnosticsEvent({
+        action: "seek_to",
+        notes: "video_seeked_event",
+      });
       if (
         localSyncMode === "external_audio_mode" &&
         shouldSuppressEquivalentAudioRecoveryEvent("video_seeked", video.currentTime)
@@ -1461,14 +1651,31 @@ export const RoomVideoPlayer = forwardRef<
         video.currentTime,
       );
       emitObservedStateChange();
+      publishRemotePlayerSnapshot("local-web", "video_seeked_event");
+      publishPipSnapshot("video_seeked_event");
       void synchronizeExternalAudioWithVideo({
         forceSeek: true,
         publishDiagnostics: true,
       });
     };
 
+    const handleSeeking = () => {
+      logPlayerDiagnosticsEvent({
+        action: "seek_to",
+        notes: "video_seeking_event",
+        stage: "received",
+      });
+      publishRemotePlayerSnapshot("local-web", "video_seeking_event", {
+        seeking: true,
+      });
+    };
+
     const handleLoadedMetadata = () => {
       updateLastMediaEvent("loadedmetadata");
+      logPlayerDiagnosticsEvent({
+        action: "state_sync",
+        notes: "video_loadedmetadata_event",
+      });
       if (
         localSyncMode === "external_audio_mode" &&
         shouldSuppressEquivalentAudioRecoveryEvent(
@@ -1486,22 +1693,59 @@ export const RoomVideoPlayer = forwardRef<
         video.currentTime,
       );
       emitObservedStateChange();
+      publishRemotePlayerSnapshot("local-web", "video_loadedmetadata_event");
       void synchronizeExternalAudioWithVideo({
         forceSeek: true,
         publishDiagnostics: true,
       });
     };
 
+    const handleLoadedData = () => {
+      updateLastMediaEvent("loadeddata");
+      logPlayerDiagnosticsEvent({
+        action: "state_sync",
+        notes: "video_loadeddata_event",
+      });
+      publishRemotePlayerSnapshot("local-web", "video_loadeddata_event");
+    };
+
     const handleRateChange = () => {
       emitObservedStateChange();
+      logPlayerDiagnosticsEvent({
+        action: "state_sync",
+        notes: "video_ratechange_event",
+      });
+      publishRemotePlayerSnapshot("local-web", "video_ratechange_event");
+      publishPipSnapshot("video_ratechange_event");
       void synchronizeExternalAudioWithVideo({
         allowDriftCorrection: true,
         publishDiagnostics: true,
       });
     };
 
+    const handleWaiting = () => {
+      updateLastMediaEvent("waiting");
+      logPlayerDiagnosticsEvent({
+        action: "custom",
+        notes: "video_waiting_event",
+        reason: "buffering",
+        stage: "received",
+        status: "warning",
+      });
+      publishRemotePlayerSnapshot("local-web", "video_waiting_event", {
+        buffering: true,
+      });
+    };
+
     const handleVideoError = () => {
       updateLastMediaEvent("error");
+      logPlayerDiagnosticsEvent({
+        action: "custom",
+        notes: "video_error_event",
+        reason: "video_error",
+        status: "warning",
+      });
+      publishRemotePlayerSnapshot("local-web", "video_error_event");
       publishMediaDiagnostics();
       emitSyncIssue(
         "The shared video could not finish loading in this browser session.",
@@ -1554,11 +1798,13 @@ export const RoomVideoPlayer = forwardRef<
     const handleAudioPlay = () => {
       updateLastAudioEvent("play");
       publishMediaDiagnostics();
+      publishRemotePlayerSnapshot("local-web", "audio_play_event");
     };
 
     const handleAudioPause = () => {
       updateLastAudioEvent("pause");
       publishMediaDiagnostics();
+      publishRemotePlayerSnapshot("local-web", "audio_pause_event");
     };
 
     const handleAudioSeeked = () => {
@@ -1579,6 +1825,7 @@ export const RoomVideoPlayer = forwardRef<
 
     const handleAudioRateChange = () => {
       publishMediaDiagnostics();
+      publishRemotePlayerSnapshot("local-web", "audio_ratechange_event");
     };
 
     const handleAudioError = () => {
@@ -1587,16 +1834,46 @@ export const RoomVideoPlayer = forwardRef<
         "The selected external audio track could not finish loading in this browser session.",
       );
       publishMediaDiagnostics();
+      publishRemotePlayerSnapshot("local-web", "audio_error_event");
+    };
+
+    const handleEnterPictureInPicture = () => {
+      logPlayerDiagnosticsEvent({
+        action: "pip_enter",
+        notes: "video_enterpictureinpicture_event",
+        source: "pip",
+      });
+      publishPipSnapshot("enterpictureinpicture", "video_enterpictureinpicture_event");
+    };
+
+    const handleLeavePictureInPicture = () => {
+      logPlayerDiagnosticsEvent({
+        action: "pip_exit",
+        notes: "video_leavepictureinpicture_event",
+        source: "pip",
+      });
+      publishPipSnapshot("leavepictureinpicture", "video_leavepictureinpicture_event");
     };
 
     video.addEventListener("timeupdate", handleTimeUpdate);
     video.addEventListener("play", handlePlay);
     video.addEventListener("pause", handlePause);
     video.addEventListener("ended", handleEnded);
+    video.addEventListener("seeking", handleSeeking);
     video.addEventListener("seeked", handleSeeked);
+    video.addEventListener("loadeddata", handleLoadedData);
     video.addEventListener("loadedmetadata", handleLoadedMetadata);
     video.addEventListener("ratechange", handleRateChange);
+    video.addEventListener("waiting", handleWaiting);
     video.addEventListener("error", handleVideoError);
+    video.addEventListener(
+      "enterpictureinpicture",
+      handleEnterPictureInPicture as EventListener,
+    );
+    video.addEventListener(
+      "leavepictureinpicture",
+      handleLeavePictureInPicture as EventListener,
+    );
 
     audio.addEventListener("loadedmetadata", handleAudioLoadedMetadata);
     audio.addEventListener("canplay", handleAudioCanPlay);
@@ -1611,10 +1888,21 @@ export const RoomVideoPlayer = forwardRef<
       video.removeEventListener("play", handlePlay);
       video.removeEventListener("pause", handlePause);
       video.removeEventListener("ended", handleEnded);
+      video.removeEventListener("seeking", handleSeeking);
       video.removeEventListener("seeked", handleSeeked);
+      video.removeEventListener("loadeddata", handleLoadedData);
       video.removeEventListener("loadedmetadata", handleLoadedMetadata);
       video.removeEventListener("ratechange", handleRateChange);
+      video.removeEventListener("waiting", handleWaiting);
       video.removeEventListener("error", handleVideoError);
+      video.removeEventListener(
+        "enterpictureinpicture",
+        handleEnterPictureInPicture as EventListener,
+      );
+      video.removeEventListener(
+        "leavepictureinpicture",
+        handleLeavePictureInPicture as EventListener,
+      );
 
       audio.removeEventListener("loadedmetadata", handleAudioLoadedMetadata);
       audio.removeEventListener("canplay", handleAudioCanPlay);
@@ -1625,6 +1913,17 @@ export const RoomVideoPlayer = forwardRef<
       audio.removeEventListener("error", handleAudioError);
     };
   }, [localSyncMode, reconciliationProfile]);
+
+  useEffect(() => {
+    publishPipSnapshot("player_effect_init", "initial_pip_snapshot");
+    const intervalId = window.setInterval(() => {
+      publishPipSnapshot("player_poll", "periodic_pip_snapshot");
+    }, 1_500);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, []);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
