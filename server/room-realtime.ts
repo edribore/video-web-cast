@@ -11,7 +11,6 @@ import {
   roundWallClockMs,
 } from "../lib/playback";
 import { getPrismaClient } from "./prisma";
-import type { RemoteDiagnosticsTransportMeta } from "../types/remote-diagnostics";
 import type {
   RoomSocketHydrationPayload,
   RoomSocketPlaybackSyncPayload,
@@ -152,34 +151,6 @@ function buildPlaybackEventPayload(
   };
 }
 
-function buildTransportDiagnostics(input: {
-  actorSessionId: string | null;
-  clientEventId: string;
-  debugTrace?: SharedRoomControlCommand["debugTrace"];
-  commandSource: SharedRoomControlSource | null;
-  roomVersion: number | null;
-  serverReceivedAtMs: number;
-  serverBroadcastAtMs: number;
-}): RemoteDiagnosticsTransportMeta {
-  return {
-    eventId: input.debugTrace?.eventId ?? input.clientEventId,
-    parentEventId: input.debugTrace?.parentEventId ?? null,
-    serverReceivedAtMs: input.serverReceivedAtMs,
-    serverBroadcastAtMs: input.serverBroadcastAtMs,
-    serverSequenceNumber: input.roomVersion,
-    serverRoomVersion: input.roomVersion,
-    actorSessionId: input.actorSessionId,
-    commandSource: input.commandSource,
-    sourceClientEventId: input.clientEventId,
-    debugClientWallClockTs: input.debugTrace?.wallClockTs ?? null,
-    debugClientMonotonicTs: input.debugTrace?.monotonicTs ?? null,
-    debugClientType: input.debugTrace?.clientType ?? null,
-    debugSource: input.debugTrace?.source ?? null,
-    debugAction: input.debugTrace?.action ?? null,
-    rawInput: input.debugTrace?.rawInput ?? null,
-  };
-}
-
 export async function getRoomRealtimeSnapshot(
   publicRoomId: string,
 ): Promise<RoomSocketHydrationPayload | null> {
@@ -257,7 +228,6 @@ export async function recordRoomJoin(
     return {
       playback,
       lastEvent: toRoomSyncEvent(publicRoomId, joinEvent, playback),
-      serverTimeMs: Date.now(),
     };
   });
 }
@@ -266,7 +236,6 @@ export async function applySharedRoomControl(
   command: SharedRoomControlCommand,
 ): Promise<RoomSocketPlaybackSyncPayload | null> {
   const prisma = getPrismaClient();
-  const serverReceivedAtMs = Date.now();
 
   return prisma.$transaction(async (tx) => {
     const room = await tx.room.findUnique({
@@ -343,21 +312,11 @@ export async function applySharedRoomControl(
         ),
       },
     });
-    const serverBroadcastAtMs = Date.now();
 
     return {
       playback: playbackSnapshot,
       event: toRoomSyncEvent(command.roomId, roomEvent, playbackSnapshot)!,
       sourceClientEventId: command.clientEventId,
-      transportDiagnostics: buildTransportDiagnostics({
-        actorSessionId: command.actorSessionId,
-        clientEventId: command.clientEventId,
-        debugTrace: command.debugTrace,
-        commandSource: command.commandSource ?? null,
-        roomVersion: playbackSnapshot.version,
-        serverReceivedAtMs,
-        serverBroadcastAtMs,
-      }),
     };
   });
 }

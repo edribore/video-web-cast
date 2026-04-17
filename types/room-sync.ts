@@ -1,8 +1,4 @@
 import type { PlaybackStateSnapshot, PlaybackStatus } from "@/types/playback";
-import type {
-  RemoteDiagnosticsCommandTrace,
-  RemoteDiagnosticsTransportMeta,
-} from "@/types/remote-diagnostics";
 
 export const roomSyncEventTypes = [
   "join",
@@ -62,32 +58,17 @@ export type SharedRoomControlCommand = {
   currentTime: number;
   playbackRate: number;
   commandSource?: SharedRoomControlSource | null;
-  debugTrace?: RemoteDiagnosticsCommandTrace | null;
 };
 
 export type RoomSocketHydrationPayload = {
   playback: PlaybackStateSnapshot;
   lastEvent: RoomSyncEvent | null;
-  serverTimeMs?: number | null;
 };
 
 export type RoomSocketPlaybackSyncPayload = {
   playback: PlaybackStateSnapshot;
   event: RoomSyncEvent;
   sourceClientEventId: string | null;
-  transportDiagnostics?: RemoteDiagnosticsTransportMeta | null;
-};
-
-export type RoomDebugClockSyncRequest = {
-  sampleId: string;
-  clientSentAtMs: number;
-};
-
-export type RoomDebugClockSyncResponse = {
-  sampleId: string;
-  clientSentAtMs: number;
-  serverReceivedAtMs: number;
-  serverSentAtMs: number;
 };
 
 export type RoomAudioTrackSummary = {

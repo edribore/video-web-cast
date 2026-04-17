@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { createSafeId } from "@/lib/create-safe-id";
 import {
   confirmCastRemoteControlSession,
   expireCastRemoteControlSession,
@@ -13,8 +12,6 @@ import {
 } from "@/lib/cast-remote-control";
 import { logDebugEvent, setDebugRuntimeState } from "@/lib/debug-store";
 import { isCastableAbsoluteUrl } from "@/lib/public-origin";
-import { buildRawInputFromCastObservation } from "@/lib/remote-diagnostics";
-import { logRemoteDiagnosticsEvent } from "@/lib/remote-diagnostics-store";
 import {
   assessCastRemoteObservationPlausibility,
   computeExpectedCastRemoteTimeAtObservation,
@@ -31,10 +28,6 @@ import type {
   CastResolverWarning,
 } from "@/types/cast";
 import type { PlaybackStateSnapshot, PlaybackStatus } from "@/types/playback";
-import type {
-  RemoteDiagnosticsEvent,
-  RemoteDiagnosticsRawInput,
-} from "@/types/remote-diagnostics";
 import type { RoomMediaSummary } from "@/types/room-sync";
 
 const castSdkUrl =
@@ -303,7 +296,6 @@ type CastRemoteIntentState =
   | "cast_remote_intent_rejected";
 
 export type ChromecastRemotePlaybackEvent = {
-  eventId: string;
   type: CastRemoteRoomCommandType;
   status: PlaybackStatus;
   currentTime: number;
@@ -319,7 +311,6 @@ export type ChromecastRemotePlaybackEvent = {
   seekDeltaSeconds: number | null;
   seekDirection: "forward" | "backward" | null;
   source: "cast_remote";
-  rawInput: RemoteDiagnosticsRawInput | null;
 };
 
 type ChromecastRemotePlaybackListener = (
@@ -566,74 +557,6 @@ function buildPlaybackStateSignature(input: {
     currentTime: roundPlaybackTimeForSignature(input.currentTime),
     playbackRate: normalizeObservedPlaybackRate(input.playbackRate),
     selectionSignature: input.selectionSignature,
-  });
-}
-
-function resolveDiagnosticsActionFromCastRemoteEvent(input: {
-  type: CastRemoteRoomCommandType;
-  seekDirection: "forward" | "backward" | null;
-}) {
-  if (input.type === "play") {
-    return "play" as const;
-  }
-
-  if (input.type === "pause") {
-    return "pause" as const;
-  }
-
-  if (input.type === "seek") {
-    if (input.seekDirection === "backward") {
-      return "seek_backward" as const;
-    }
-
-    return "seek_forward" as const;
-  }
-
-  return "custom" as const;
-}
-
-function logCastRemoteDiagnosticsEvent(
-  event: ChromecastRemotePlaybackEvent,
-  stage: RemoteDiagnosticsEvent["stage"],
-  notes: string,
-  reason: string | null,
-  extra: Record<string, unknown> | null = null,
-) {
-  logRemoteDiagnosticsEvent({
-    eventId: event.eventId,
-    parentEventId: null,
-    source: "cast-input",
-    action: resolveDiagnosticsActionFromCastRemoteEvent({
-      type: event.type,
-      seekDirection: event.seekDirection,
-    }),
-    rawInput: event.rawInput,
-    wallClockTs: new Date(event.observedAt).getTime(),
-    monotonicTs: null,
-    stage,
-    sequenceNumber: null,
-    roomVersion: null,
-    stateVersion: null,
-    playbackStateVersion: null,
-    currentTimeSec: event.currentTime,
-    durationSec: null,
-    paused: event.status !== "playing",
-    playbackRate: event.playbackRate,
-    buffering: null,
-    seeking: event.type === "seek",
-    module: "lib/chromecast",
-    functionName: "observeChromecastRemotePlaybackState",
-    notes,
-    reason,
-    status:
-      stage === "ignored"
-        ? "ignored"
-        : stage === "received"
-          ? "observed"
-          : "pending",
-    actorSessionId: null,
-    transportDirection: "inbound",
-    extra,
   });
 }
 
@@ -956,13 +879,6 @@ function rejectCastRemoteIntent(
   event: ChromecastRemotePlaybackEvent,
   data: Record<string, unknown> = {},
 ) {
-  logCastRemoteDiagnosticsEvent(
-    event,
-    "ignored",
-    "cast_remote_intent_rejected",
-    reason,
-    data,
-  );
   updateCastRemoteIntentState("cast_remote_intent_rejected", reason, event);
   updateChromecastRuntimeState({
     lastCastRemoteRejectionReason: reason,
@@ -1483,16 +1399,6 @@ function commitCastRemoteIntent(
     });
   }
 
-  logCastRemoteDiagnosticsEvent(
-    candidate.event,
-    "received",
-    "cast_remote_intent_committed",
-    null,
-    {
-      observationCount: candidate.observationCount,
-      trustedInteractionSessionActive,
-    },
-  );
   notifyChromecastRemotePlaybackListeners(candidate.event);
 }
 
@@ -1578,15 +1484,6 @@ function rejectCastRemoteObservation(
     | "rejected_due_to_insufficient_remote_stability",
   data: Record<string, unknown>,
 ) {
-  if ("event" in data && data.event) {
-    logCastRemoteDiagnosticsEvent(
-      data.event as ChromecastRemotePlaybackEvent,
-      "ignored",
-      "cast_remote_observation_rejected",
-      reason,
-      data,
-    );
-  }
   updateChromecastRuntimeState({
     lastSuppressedRemoteStateSignature:
       typeof data.signature === "string" ? data.signature : null,
@@ -1606,13 +1503,6 @@ function queuePendingCastRemoteCandidate(
   event: ChromecastRemotePlaybackEvent,
   signature: string,
 ) {
-  logCastRemoteDiagnosticsEvent(
-    event,
-    "queued",
-    "cast_remote_candidate_queued",
-    "awaiting_stability_debounce",
-    { signature },
-  );
   clearPendingCastRemoteCandidate("new_candidate");
   markCastRemoteControlSessionForObservation(event, "candidate_observed");
   rejectCastRemoteObservation("rejected_due_to_insufficient_remote_stability", {
@@ -1820,16 +1710,6 @@ function queuePendingCastRemoteCandidate(
         data: event,
       });
     }
-    logCastRemoteDiagnosticsEvent(
-      event,
-      "received",
-      "cast_remote_candidate_committed",
-      null,
-      {
-        trustedContinuationActive,
-        trustedInteractionSessionActive,
-      },
-    );
     notifyChromecastRemotePlaybackListeners(event);
     clearPendingCastRemoteCandidate("accepted");
   }, playbackSynchronizationConfig.castRemoteObservation.seekIntentConfirmationWindowMs);
@@ -1984,16 +1864,6 @@ function queuePendingCastRemoteIntent(
     "cast_remote_intent_stabilizing",
     "awaiting_confirmation_window",
     event,
-  );
-  logCastRemoteDiagnosticsEvent(
-    event,
-    "queued",
-    "cast_remote_intent_queued",
-    "awaiting_confirmation_window",
-    {
-      confirmationWindowMs,
-      signature,
-    },
   );
 }
 
@@ -2598,12 +2468,6 @@ function stopChromecastRemotePlaybackObservation(reason: string) {
 function notifyChromecastRemotePlaybackListeners(
   event: ChromecastRemotePlaybackEvent,
 ) {
-  logCastRemoteDiagnosticsEvent(
-    event,
-    "received",
-    "cast_remote_listener_dispatch",
-    null,
-  );
   chromecastRemotePlaybackListeners.forEach((listener) => {
     Promise.resolve(listener(event)).catch((error) => {
       logDebugEvent({
@@ -2813,7 +2677,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
       rejectCastRemoteIntent(
         "rejected_due_to_recent_local_cast_command",
         {
-          eventId: createSafeId("cast-remote"),
           type: commandType,
           status,
           currentTime: Math.round(currentTime * 1000) / 1000,
@@ -2829,12 +2692,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
           seekDeltaSeconds: null,
           seekDirection: null,
           source: "cast_remote",
-          rawInput: buildRawInputFromCastObservation({
-            eventType: "cast_remote_rejected_recent_local_command",
-            playerState,
-            currentTime,
-            isPaused,
-          }),
         },
         { matchingLocalCommand, signature: nextSignature },
       );
@@ -2887,7 +2744,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
 
     if (pauseCandidateDuringStabilization) {
       const pauseEvent: ChromecastRemotePlaybackEvent = {
-        eventId: createSafeId("cast-remote"),
         type: commandType,
         status,
         currentTime: Math.round(currentTime * 1000) / 1000,
@@ -2903,23 +2759,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
         seekDeltaSeconds: null,
         seekDirection: null,
         source: "cast_remote",
-        rawInput: buildRawInputFromCastObservation({
-          eventType: "cast_remote_pause_candidate",
-          playerState,
-          currentTime,
-          isPaused,
-        }),
       };
-      logCastRemoteDiagnosticsEvent(
-        pauseEvent,
-        "captured",
-        "cast_remote_pause_candidate",
-        "stabilization_fast_path",
-        {
-          expectedCurrentTime,
-          observationDelayMs,
-        },
-      );
 
       logDebugEvent({
         level: "info",
@@ -2949,7 +2789,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
 
     if (playCandidateDuringTrustedContinuationStabilization) {
       const playEvent: ChromecastRemotePlaybackEvent = {
-        eventId: createSafeId("cast-remote"),
         type: commandType,
         status,
         currentTime: Math.round(currentTime * 1000) / 1000,
@@ -2965,23 +2804,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
         seekDeltaSeconds: null,
         seekDirection: null,
         source: "cast_remote",
-        rawInput: buildRawInputFromCastObservation({
-          eventType: "cast_remote_play_candidate",
-          playerState,
-          currentTime,
-          isPaused,
-        }),
       };
-      logCastRemoteDiagnosticsEvent(
-        playEvent,
-        "captured",
-        "cast_remote_play_candidate",
-        "trusted_session_fast_path",
-        {
-          expectedCurrentTime,
-          observationDelayMs,
-        },
-      );
 
       logDebugEvent({
         level: "info",
@@ -3020,7 +2843,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
       });
       queuePendingCastRemoteCandidate(
         {
-          eventId: createSafeId("cast-remote"),
           type: commandType,
           status,
           currentTime: Math.round(currentTime * 1000) / 1000,
@@ -3045,12 +2867,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
                 ? "forward"
                 : "backward",
           source: "cast_remote",
-          rawInput: buildRawInputFromCastObservation({
-            eventType: "cast_remote_seek_candidate",
-            playerState,
-            currentTime,
-            isPaused,
-          }),
         },
         nextSignature,
       );
@@ -3075,7 +2891,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
       rejectCastRemoteIntent(
         "rejected_due_to_cast_stabilization_window",
         {
-          eventId: createSafeId("cast-remote"),
           type: commandType,
           status,
           currentTime: Math.round(currentTime * 1000) / 1000,
@@ -3091,12 +2906,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
           seekDeltaSeconds: null,
           seekDirection: null,
           source: "cast_remote",
-          rawInput: buildRawInputFromCastObservation({
-            eventType: "cast_remote_rejected_stabilization_window",
-            playerState,
-            currentTime,
-            isPaused,
-          }),
         },
         { signature: nextSignature },
       );
@@ -3140,7 +2949,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
       rejectCastRemoteIntent(
         "rejected_due_to_implausible_remote_time",
         {
-          eventId: createSafeId("cast-remote"),
           type: commandType,
           status,
           currentTime: Math.round(currentTime * 1000) / 1000,
@@ -3156,12 +2964,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
           seekDeltaSeconds: null,
           seekDirection: null,
           source: "cast_remote",
-          rawInput: buildRawInputFromCastObservation({
-            eventType: "cast_remote_rejected_implausible_time",
-            playerState,
-            currentTime,
-            isPaused,
-          }),
         },
         { driftSeconds: plausibility.driftSeconds, signature: nextSignature },
       );
@@ -3196,7 +2998,6 @@ function observeChromecastRemotePlaybackState(reason: string) {
       ? Math.round((currentTime - previousObservedCurrentTime) * 1000) / 1000
       : null;
   const event: ChromecastRemotePlaybackEvent = {
-    eventId: createSafeId("cast-remote"),
     type: commandType,
     status,
     currentTime: Math.round(currentTime * 1000) / 1000,
@@ -3217,24 +3018,7 @@ function observeChromecastRemotePlaybackState(reason: string) {
         ? "forward"
         : "backward",
     source: "cast_remote",
-    rawInput: buildRawInputFromCastObservation({
-      eventType: "cast_remote_observed",
-      playerState,
-      currentTime,
-      isPaused,
-    }),
   };
-  logCastRemoteDiagnosticsEvent(
-    event,
-    "captured",
-    "cast_remote_observed",
-    null,
-    {
-      expectedCurrentTime,
-      observationDelayMs,
-      signature: nextSignature,
-    },
-  );
 
   if (commandType === "play" || commandType === "pause") {
     queuePendingCastRemoteIntent(event, nextSignature);

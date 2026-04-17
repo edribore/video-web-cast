@@ -7,7 +7,6 @@
     "build": "prisma generate && next build",
     "start": "node node_modules/tsx/dist/cli.mjs server.ts --prod",
     "lint": "eslint",
-    "test": "tsc -p tsconfig.tests.json && node .tmp-tests/tests/remote-diagnostics.test.js && node -e \"require('node:fs').rmSync('.tmp-tests', { recursive: true, force: true })\"",
     "postinstall": "prisma generate"
   },
   "dependencies": {

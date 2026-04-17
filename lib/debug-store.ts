@@ -44,7 +44,6 @@ type DebugSnapshotEntry = {
 };
 
 type DebugStoreState = {
-  enabled: boolean;
   appName: string;
   environment: string;
   initializedAt: string;
@@ -66,7 +65,6 @@ type DebugStore = {
   removeRuntimeState(scope: string): void;
   setFeatureFlags(flags: Record<string, boolean>): void;
   setLastKnownActionSource(source: DebugActionSource | null): void;
-  setEnabled(enabled: boolean): void;
 };
 
 const debugStoreKey = "__VIDEO_WEB_CAST_DEBUG_STORE__";
@@ -211,7 +209,6 @@ function sanitizeDebugValue(
 
 function createInitialDebugState(): DebugStoreState {
   return {
-    enabled: false,
     appName: "SyncPass",
     environment: "development",
     initializedAt: new Date().toISOString(),
@@ -255,37 +252,7 @@ function createDebugStore(): DebugStore {
       };
       notify();
     },
-    setEnabled(enabled) {
-      if (!enabled) {
-        state = {
-          ...createInitialDebugState(),
-          enabled: false,
-          appName: state.appName,
-          environment: state.environment,
-        };
-        notify();
-        return;
-      }
-
-      state = {
-        ...state,
-        enabled: true,
-      };
-      notify();
-    },
     log(entry) {
-      if (!state.enabled) {
-        return {
-          id: "debug-disabled",
-          timestamp: new Date().toISOString(),
-          level: entry.level,
-          category: entry.category,
-          message: entry.message,
-          source: entry.source,
-          data: undefined,
-        };
-      }
-
       const nextEntry: DebugLogEntry = {
         id: createSafeId(),
         timestamp: new Date().toISOString(),
@@ -305,10 +272,6 @@ function createDebugStore(): DebugStore {
       return nextEntry;
     },
     setPageState(scope, data) {
-      if (!state.enabled) {
-        return;
-      }
-
       state = {
         ...state,
         pageState: {
@@ -322,10 +285,6 @@ function createDebugStore(): DebugStore {
       notify();
     },
     removePageState(scope) {
-      if (!state.enabled && !(scope in state.pageState)) {
-        return;
-      }
-
       const nextPageState = { ...state.pageState };
       delete nextPageState[scope];
       state = {
@@ -335,10 +294,6 @@ function createDebugStore(): DebugStore {
       notify();
     },
     setRuntimeState(scope, data) {
-      if (!state.enabled) {
-        return;
-      }
-
       state = {
         ...state,
         runtimeState: {
@@ -352,10 +307,6 @@ function createDebugStore(): DebugStore {
       notify();
     },
     removeRuntimeState(scope) {
-      if (!state.enabled && !(scope in state.runtimeState)) {
-        return;
-      }
-
       const nextRuntimeState = { ...state.runtimeState };
       delete nextRuntimeState[scope];
       state = {
@@ -365,10 +316,6 @@ function createDebugStore(): DebugStore {
       notify();
     },
     setFeatureFlags(flags) {
-      if (!state.enabled) {
-        return;
-      }
-
       state = {
         ...state,
         featureFlags: {
@@ -379,10 +326,6 @@ function createDebugStore(): DebugStore {
       notify();
     },
     setLastKnownActionSource(source) {
-      if (!state.enabled) {
-        return;
-      }
-
       state = {
         ...state,
         lastKnownActionSource: source,
@@ -410,10 +353,6 @@ export function initializeDebugStore(
   metadata: Partial<Pick<DebugStoreState, "appName" | "environment">>,
 ) {
   getDebugStore().initialize(metadata);
-}
-
-export function setDebugStoreEnabled(enabled: boolean) {
-  getDebugStore().setEnabled(enabled);
 }
 
 export function subscribeToDebugStore(listener: () => void) {

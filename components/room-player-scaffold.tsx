@@ -2,7 +2,6 @@
 
 import { io, type Socket } from "socket.io-client";
 import {
-  useCallback,
   useEffect,
   useEffectEvent,
   useMemo,
@@ -37,39 +36,16 @@ import {
   resolvePlaybackStartDelayMs,
   type PlaybackLeadershipMode,
 } from "@/lib/playback";
-import {
-  calculateDriftMilliseconds,
-  createEmptyRawInput,
-  getMonotonicTimestamp,
-} from "@/lib/remote-diagnostics";
-import {
-  configureRemoteDiagnosticsSession,
-  getRemoteDiagnosticsStoreSnapshot,
-  logRemoteDiagnosticsEvent,
-  recordRemoteDiagnosticsClockSyncSample,
-  recordRemoteDiagnosticsDriftSnapshot,
-  recordRemoteDiagnosticsPlayerSnapshot,
-  recordRemoteDiagnosticsSequenceSnapshot,
-} from "@/lib/remote-diagnostics-store";
 import { getOrCreateParticipantSessionId } from "@/lib/participant-session";
 import { logDebugEvent, setDebugLastActionSource } from "@/lib/debug-store";
 import { useDebugFeatureFlags, useDebugRuntimeState } from "@/components/debug-runtime";
-import type { PlaybackControllerDebugInput } from "@/lib/playback-controller";
 import type {
   ParticipantMediaPreferences,
   PlaybackStateSnapshot,
   PlaybackStatus,
 } from "@/types/playback";
 import type {
-  RemoteDiagnosticsAction,
-  RemoteDiagnosticsClientType,
-  RemoteDiagnosticsEvent,
-  RemoteDiagnosticsSource,
-  RemoteDiagnosticsTransportMeta,
-} from "@/types/remote-diagnostics";
-import type {
   RoomAudioTrackSummary,
-  RoomDebugClockSyncResponse,
   RoomScaffoldSnapshot,
   RoomSocketHydrationPayload,
   RoomSocketPlaybackSyncPayload,
@@ -83,7 +59,6 @@ import {
   type RoomVideoPlayerLocalAudioState,
   type RoomVideoPlayerSnapshot,
 } from "@/components/room-video-player";
-import { RoomDiagnosticsPanel } from "@/components/room-diagnostics-panel";
 import { RoomPlaybackSurface } from "@/components/room-playback-surface";
 import { useRoomPlaybackController } from "@/components/use-room-playback-controller";
 
@@ -485,58 +460,6 @@ function resolvePlaybackLeadershipMode(input: {
     : "local_follower";
 }
 
-function resolveDiagnosticsActionFromSharedCommand(input: {
-  type: SharedRoomControlType;
-  deltaSeconds?: number;
-  targetTimeSeconds?: number;
-}) {
-  switch (input.type) {
-    case "play":
-      return "play" as const;
-    case "pause":
-      return "pause" as const;
-    case "stop":
-      return "custom" as const;
-    case "seek":
-      if (typeof input.targetTimeSeconds === "number") {
-        return "seek_to" as const;
-      }
-
-      return (input.deltaSeconds ?? 0) >= 0
-        ? ("seek_forward" as const)
-        : ("seek_backward" as const);
-  }
-}
-
-function resolveRoomDiagnosticsClientType(
-  isMobileClient: boolean,
-): RemoteDiagnosticsClientType {
-  return isMobileClient ? "mobile-web" : "web";
-}
-
-function resolveDiagnosticsSourceFromRoomActionSource(
-  source: RoomActionSource,
-): RemoteDiagnosticsSource {
-  switch (source) {
-    case "cast_remote":
-      return "cast-input";
-    case "cast_local_command":
-    case "local_user":
-      return "ui-button";
-    case "socket":
-    case "socket_echo":
-    case "hydration":
-      return "transport";
-    case "reconciliation":
-      return "player";
-    case "cast":
-      return "cast-input";
-    case "system":
-    default:
-      return "custom";
-  }
-}
-
 export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   const [state, dispatch] = useReducer(reducer, {
     playback: snapshot.playback,
@@ -586,7 +509,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   } = useChromecastAvailability();
   const castDisplayStatus: ChromecastAvailabilityStatus = castStatus;
   const playbackTarget: PlaybackTarget = isCastActive ? "cast" : "local";
-  const diagnosticsClientType = resolveRoomDiagnosticsClientType(isMobileClient);
   const roomDisplayTitle =
     snapshot.movie?.title ?? snapshot.media?.title ?? "SyncPass room";
   const visibleCastIssue =
@@ -843,207 +765,15 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     pendingCommandCount,
   });
 
-  useEffect(() => {
-    configureRemoteDiagnosticsSession({
-      roomId: snapshot.roomId,
-      clientId: participantSessionId,
-      clientType: diagnosticsClientType,
-    });
-  }, [diagnosticsClientType, participantSessionId, snapshot.roomId]);
-
-  const recordDiagnosticsStage = useCallback(
-    (input: {
-      eventId: string;
-      parentEventId?: string | null;
-      source: RemoteDiagnosticsSource;
-      action: RemoteDiagnosticsAction;
-      stage: RemoteDiagnosticsEvent["stage"];
-      rawInput?: PlaybackControllerDebugInput["rawInput"] | null;
-      wallClockTs?: number;
-      currentTimeSec?: number | null;
-      durationSec?: number | null;
-      paused?: boolean | null;
-      playbackRate?: number | null;
-      sequenceNumber?: number | null;
-      roomVersion?: number | null;
-      stateVersion?: number | null;
-      playbackStateVersion?: number | null;
-      notes?: string | null;
-      reason?: string | null;
-      status?: RemoteDiagnosticsEvent["status"];
-      transportDirection?: RemoteDiagnosticsEvent["transportDirection"];
-      actorSessionId?: string | null;
-      estimatedServerOffsetMs?: number | null;
-      estimatedServerTimeMs?: number | null;
-      extra?: Record<string, unknown> | null;
-    }) => {
-      logRemoteDiagnosticsEvent({
-        eventId: input.eventId,
-        parentEventId: input.parentEventId ?? null,
-        source: input.source,
-        action: input.action,
-        rawInput: input.rawInput ?? createEmptyRawInput(),
-        wallClockTs: input.wallClockTs ?? Date.now(),
-        monotonicTs: getMonotonicTimestamp(),
-        stage: input.stage,
-        sequenceNumber: input.sequenceNumber ?? state.playback.version,
-        roomVersion: input.roomVersion ?? state.playback.version,
-        stateVersion: input.stateVersion ?? state.playback.version,
-        playbackStateVersion:
-          input.playbackStateVersion ?? state.playback.version,
-        currentTimeSec:
-          input.currentTimeSec ?? resolvedAuthoritativeCurrentTime,
-        durationSec: input.durationSec ?? snapshot.media?.durationSeconds ?? null,
-        paused:
-          input.paused ?? (state.playback.status !== "playing"),
-        playbackRate: input.playbackRate ?? state.playback.playbackRate,
-        buffering: null,
-        seeking: false,
-        module: "components/room-player-scaffold",
-        functionName: "recordDiagnosticsStage",
-        notes: input.notes ?? null,
-        reason: input.reason ?? null,
-        status: input.status ?? null,
-        actorSessionId: input.actorSessionId ?? participantSessionId,
-        transportDirection: input.transportDirection ?? "local",
-        estimatedServerOffsetMs: input.estimatedServerOffsetMs ?? null,
-        estimatedServerTimeMs: input.estimatedServerTimeMs ?? null,
-        extra: input.extra ?? null,
-      });
-    },
-    [
-      participantSessionId,
-      resolvedAuthoritativeCurrentTime,
-      snapshot.media?.durationSeconds,
-      state.playback.playbackRate,
-      state.playback.status,
-      state.playback.version,
-    ],
-  );
-
   const applyAuthoritativePlayback = useEffectEvent(
-    async (
-      playback: PlaybackStateSnapshot,
-      source: RoomActionSource,
-      diagnostics?: {
-        eventId?: string | null;
-        parentEventId?: string | null;
-        action?: RemoteDiagnosticsAction;
-        rawInput?: PlaybackControllerDebugInput["rawInput"] | null;
-        transport?: RemoteDiagnosticsTransportMeta | null;
-        notes?: string | null;
-        reason?: string | null;
-      },
-    ) => {
+    async (playback: PlaybackStateSnapshot, source: RoomActionSource) => {
       authoritativePlaybackRef.current = playback;
       setDebugLastActionSource(source);
       const player = playerRef.current;
-      const eventId =
-        diagnostics?.eventId ??
-        diagnostics?.transport?.eventId ??
-        playback.sourceClientEventId ??
-        createSafeId("room-sync");
-      const diagnosticsAction =
-        diagnostics?.action ??
-        (source === "hydration"
-          ? ("state_sync" as const)
-          : state.lastEvent
-            ? resolveDiagnosticsActionFromSharedCommand({
-                type: state.lastEvent.type === "join" ? "seek" : state.lastEvent.type,
-                targetTimeSeconds:
-                  state.lastEvent.type === "join"
-                    ? state.lastEvent.currentTime
-                    : undefined,
-              })
-            : ("state_sync" as const));
-      const diagnosticsSource =
-        diagnostics?.transport?.debugSource ??
-        resolveDiagnosticsSourceFromRoomActionSource(source);
-      const synchronizedTime = resolveSynchronizedPlaybackTime(playback);
-
-      recordDiagnosticsStage({
-        eventId,
-        parentEventId:
-          diagnostics?.parentEventId ??
-          diagnostics?.transport?.parentEventId ??
-          null,
-        source: diagnosticsSource,
-        action: diagnosticsAction,
-        rawInput:
-          diagnostics?.rawInput ?? diagnostics?.transport?.rawInput ?? null,
-        wallClockTs: Date.now(),
-        currentTimeSec: synchronizedTime,
-        durationSec: snapshot.media?.durationSeconds ?? null,
-        paused: playback.status !== "playing",
-        playbackRate: playback.playbackRate,
-        sequenceNumber:
-          diagnostics?.transport?.serverSequenceNumber ?? playback.version,
-        roomVersion:
-          diagnostics?.transport?.serverRoomVersion ?? playback.version,
-        stateVersion: playback.version,
-        playbackStateVersion: playback.version,
-        stage: "applied",
-        notes: diagnostics?.notes ?? `authoritative_apply:${source}`,
-        reason: diagnostics?.reason ?? null,
-        status: "applied",
-        actorSessionId:
-          diagnostics?.transport?.actorSessionId ?? participantSessionId,
-        transportDirection:
-          source === "local_user" || source === "cast_local_command"
-            ? "outbound"
-            : "inbound",
-        estimatedServerTimeMs:
-          diagnostics?.transport?.serverBroadcastAtMs ?? null,
-        extra:
-          diagnostics?.transport == null
-            ? null
-            : {
-                serverReceivedAtMs: diagnostics.transport.serverReceivedAtMs,
-                serverBroadcastAtMs: diagnostics.transport.serverBroadcastAtMs,
-              },
-      });
 
       if (player) {
         await player.applySharedPlayback(playback);
       }
-
-      requestAnimationFrame(() => {
-        recordDiagnosticsStage({
-          eventId,
-          parentEventId:
-            diagnostics?.parentEventId ??
-            diagnostics?.transport?.parentEventId ??
-            null,
-          source: diagnosticsSource,
-          action: diagnosticsAction,
-          rawInput:
-            diagnostics?.rawInput ?? diagnostics?.transport?.rawInput ?? null,
-          wallClockTs: Date.now(),
-          currentTimeSec: resolveSynchronizedPlaybackTime(playback),
-          durationSec: snapshot.media?.durationSeconds ?? null,
-          paused: playback.status !== "playing",
-          playbackRate: playback.playbackRate,
-          sequenceNumber:
-            diagnostics?.transport?.serverSequenceNumber ?? playback.version,
-          roomVersion:
-            diagnostics?.transport?.serverRoomVersion ?? playback.version,
-          stateVersion: playback.version,
-          playbackStateVersion: playback.version,
-          stage: "rendered",
-          notes: diagnostics?.notes ?? `authoritative_render:${source}`,
-          reason: diagnostics?.reason ?? null,
-          status: "rendered",
-          actorSessionId:
-            diagnostics?.transport?.actorSessionId ?? participantSessionId,
-          transportDirection:
-            source === "local_user" || source === "cast_local_command"
-              ? "outbound"
-              : "inbound",
-          estimatedServerTimeMs:
-            diagnostics?.transport?.serverBroadcastAtMs ?? null,
-          extra: null,
-        });
-      });
 
       if (castStatusRef.current === "connected") {
         try {
@@ -1107,73 +837,15 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       playbackRate: number;
     },
     source: RoomActionSource,
-    debugInput?: PlaybackControllerDebugInput | null,
   ) {
     dispatch({ type: "last_action_source", source });
     setDebugLastActionSource(source);
-    const action =
-      debugInput?.action ??
-      resolveDiagnosticsActionFromSharedCommand({
-        type: command.type,
-      });
-    const eventId = debugInput?.eventId ?? createSafeId("room-command");
-
-    recordDiagnosticsStage({
-      eventId,
-      parentEventId: debugInput?.parentEventId ?? null,
-      source: debugInput?.source ?? resolveDiagnosticsSourceFromRoomActionSource(source),
-      action,
-      rawInput: debugInput?.rawInput ?? null,
-      wallClockTs: Date.now(),
-      currentTimeSec: command.currentTime,
-      durationSec: snapshot.media?.durationSeconds ?? null,
-      paused: command.status !== "playing",
-      playbackRate: command.playbackRate,
-      sequenceNumber: state.playback.version,
-      roomVersion: state.playback.version,
-      stateVersion: state.playback.version,
-      playbackStateVersion: state.playback.version,
-      stage: "normalized",
-      notes: debugInput?.notes ?? `emit_shared_${command.type}`,
-      reason: debugInput?.reason ?? null,
-      status: "observed",
-      actorSessionId: participantSessionId,
-      transportDirection: "outbound",
-      extra: {
-        commandSource: source,
-      },
-    });
 
     const socket = socketRef.current;
 
     if (!socket?.connected) {
       const message = "Room sync is offline, so this change stayed local.";
       dispatch({ type: "sync_issue", message });
-      recordDiagnosticsStage({
-        eventId,
-        parentEventId: debugInput?.parentEventId ?? null,
-        source:
-          debugInput?.source ??
-          resolveDiagnosticsSourceFromRoomActionSource(source),
-        action,
-        rawInput: debugInput?.rawInput ?? null,
-        wallClockTs: Date.now(),
-        currentTimeSec: command.currentTime,
-        durationSec: snapshot.media?.durationSeconds ?? null,
-        paused: command.status !== "playing",
-        playbackRate: command.playbackRate,
-        sequenceNumber: state.playback.version,
-        roomVersion: state.playback.version,
-        stateVersion: state.playback.version,
-        playbackStateVersion: state.playback.version,
-        stage: "dropped",
-        notes: debugInput?.notes ?? `emit_shared_${command.type}_offline`,
-        reason: "socket_offline",
-        status: "dropped",
-        actorSessionId: participantSessionId,
-        transportDirection: "outbound",
-        extra: null,
-      });
       logDebugEvent({
         level: "warn",
         category: "socket",
@@ -1183,7 +855,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       return false;
     }
 
-    const clientEventId = eventId;
+    const clientEventId = createSafeId("room-command");
     pendingClientEventIdsRef.current.set(clientEventId, source);
     setPendingCommandCount(pendingClientEventIdsRef.current.size);
     socket.emit("room:command", {
@@ -1195,51 +867,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       currentTime: command.currentTime,
       playbackRate: command.playbackRate,
       commandSource: resolveSharedRoomCommandSource(source),
-      debugTrace: {
-        eventId,
-        parentEventId: debugInput?.parentEventId ?? null,
-        source:
-          debugInput?.source ??
-          resolveDiagnosticsSourceFromRoomActionSource(source),
-        action,
-        clientType: diagnosticsClientType,
-        rawInput: debugInput?.rawInput ?? null,
-        wallClockTs: Date.now(),
-        monotonicTs: getMonotonicTimestamp(),
-        estimatedServerOffsetMs:
-          getRemoteDiagnosticsStoreSnapshot().latestServerOffsetMs,
-        roomVersion: state.playback.version,
-        playbackStateVersion: state.playback.version,
-        notes: debugInput?.notes ?? null,
-        reason: debugInput?.reason ?? null,
-      },
-    });
-    recordDiagnosticsStage({
-      eventId,
-      parentEventId: debugInput?.parentEventId ?? null,
-      source:
-        debugInput?.source ??
-        resolveDiagnosticsSourceFromRoomActionSource(source),
-      action,
-      rawInput: debugInput?.rawInput ?? null,
-      wallClockTs: Date.now(),
-      currentTimeSec: command.currentTime,
-      durationSec: snapshot.media?.durationSeconds ?? null,
-      paused: command.status !== "playing",
-      playbackRate: command.playbackRate,
-      sequenceNumber: state.playback.version,
-      roomVersion: state.playback.version,
-      stateVersion: state.playback.version,
-      playbackStateVersion: state.playback.version,
-      stage: "sent",
-      notes: debugInput?.notes ?? `socket_emit_${command.type}`,
-      reason: debugInput?.reason ?? null,
-      status: "pending",
-      actorSessionId: participantSessionId,
-      transportDirection: "outbound",
-      extra: {
-        clientEventId,
-      },
     });
     logDebugEvent({
       level: "info",
@@ -1315,50 +942,12 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     options?: {
       deltaSeconds?: number;
       targetTimeSeconds?: number;
-      debugInput?: PlaybackControllerDebugInput | null;
     },
   ) {
     const player = playerRef.current;
     const commandSource: RoomActionSource =
       playbackTarget === "cast" ? "cast_local_command" : "local_user";
     const socketConnected = Boolean(socketRef.current?.connected);
-    const diagnosticsAction =
-      options?.debugInput?.action ??
-      resolveDiagnosticsActionFromSharedCommand({
-        type,
-        deltaSeconds: options?.deltaSeconds,
-        targetTimeSeconds: options?.targetTimeSeconds,
-      });
-    const diagnosticsEventId =
-      options?.debugInput?.eventId ?? createSafeId("room-command");
-
-    recordDiagnosticsStage({
-      eventId: diagnosticsEventId,
-      parentEventId: options?.debugInput?.parentEventId ?? null,
-      source:
-        options?.debugInput?.source ??
-        resolveDiagnosticsSourceFromRoomActionSource(commandSource),
-      action: diagnosticsAction,
-      rawInput: options?.debugInput?.rawInput ?? null,
-      wallClockTs: Date.now(),
-      currentTimeSec: resolvedAuthoritativeCurrentTime,
-      durationSec: snapshot.media?.durationSeconds ?? null,
-      paused: state.playback.status !== "playing",
-      playbackRate: state.playback.playbackRate,
-      sequenceNumber: state.playback.version,
-      roomVersion: state.playback.version,
-      stateVersion: state.playback.version,
-      playbackStateVersion: state.playback.version,
-      stage: "captured",
-      notes: options?.debugInput?.notes ?? `dispatch_shared_${type}`,
-      reason: options?.debugInput?.reason ?? null,
-      status: "observed",
-      actorSessionId: participantSessionId,
-      transportDirection: "local",
-      extra: {
-        playbackTarget,
-      },
-    });
 
     if (!player || playbackTarget === "cast") {
       const syntheticSnapshot = buildSyntheticPlaybackSnapshot(
@@ -1395,14 +984,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           playbackRate: syntheticSnapshot.playbackRate,
         },
         commandSource,
-        {
-          ...options?.debugInput,
-          eventId: diagnosticsEventId,
-          source:
-            options?.debugInput?.source ??
-            resolveDiagnosticsSourceFromRoomActionSource(commandSource),
-          action: diagnosticsAction,
-        },
       );
       return;
     }
@@ -1413,90 +994,11 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
 
         if (offlineSnapshot) {
           dispatch({ type: "video_observed", snapshot: offlineSnapshot });
-          recordDiagnosticsStage({
-            eventId: diagnosticsEventId,
-            parentEventId: options?.debugInput?.parentEventId ?? null,
-            source:
-              options?.debugInput?.source ??
-              resolveDiagnosticsSourceFromRoomActionSource(commandSource),
-            action: diagnosticsAction,
-            rawInput: options?.debugInput?.rawInput ?? null,
-            wallClockTs: Date.now(),
-            currentTimeSec: offlineSnapshot.currentTime,
-            durationSec: offlineSnapshot.duration,
-            paused: offlineSnapshot.status !== "playing",
-            playbackRate: offlineSnapshot.playbackRate,
-            sequenceNumber: state.playback.version,
-            roomVersion: state.playback.version,
-            stateVersion: state.playback.version,
-            playbackStateVersion: state.playback.version,
-            stage: "applied",
-            notes: "offline_local_apply",
-            reason: "socket_offline",
-            status: "applied",
-            actorSessionId: participantSessionId,
-            transportDirection: "local",
-            extra: null,
-          });
-          requestAnimationFrame(() => {
-            recordDiagnosticsStage({
-              eventId: diagnosticsEventId,
-              parentEventId: options?.debugInput?.parentEventId ?? null,
-              source:
-                options?.debugInput?.source ??
-                resolveDiagnosticsSourceFromRoomActionSource(commandSource),
-              action: diagnosticsAction,
-              rawInput: options?.debugInput?.rawInput ?? null,
-              wallClockTs: Date.now(),
-              currentTimeSec: offlineSnapshot.currentTime,
-              durationSec: offlineSnapshot.duration,
-              paused: offlineSnapshot.status !== "playing",
-              playbackRate: offlineSnapshot.playbackRate,
-              sequenceNumber: state.playback.version,
-              roomVersion: state.playback.version,
-              stateVersion: state.playback.version,
-              playbackStateVersion: state.playback.version,
-              stage: "rendered",
-              notes: "offline_local_render",
-              reason: "socket_offline",
-              status: "rendered",
-              actorSessionId: participantSessionId,
-              transportDirection: "local",
-              extra: null,
-            });
-          });
         }
 
         dispatch({
           type: "sync_issue",
           message: "Room sync is offline, so this change stayed local.",
-        });
-        recordDiagnosticsStage({
-          eventId: diagnosticsEventId,
-          parentEventId: options?.debugInput?.parentEventId ?? null,
-          source:
-            options?.debugInput?.source ??
-            resolveDiagnosticsSourceFromRoomActionSource(commandSource),
-          action: diagnosticsAction,
-          rawInput: options?.debugInput?.rawInput ?? null,
-          wallClockTs: Date.now(),
-          currentTimeSec: offlineSnapshot?.currentTime ?? resolvedAuthoritativeCurrentTime,
-          durationSec: offlineSnapshot?.duration ?? snapshot.media?.durationSeconds ?? null,
-          paused:
-            (offlineSnapshot?.status ?? state.playback.status) !== "playing",
-          playbackRate:
-            offlineSnapshot?.playbackRate ?? state.playback.playbackRate,
-          sequenceNumber: state.playback.version,
-          roomVersion: state.playback.version,
-          stateVersion: state.playback.version,
-          playbackStateVersion: state.playback.version,
-          stage: "dropped",
-          notes: "socket_emit_skipped_while_offline",
-          reason: "socket_offline",
-          status: "dropped",
-          actorSessionId: participantSessionId,
-          transportDirection: "outbound",
-          extra: null,
         });
         logDebugEvent({
           level: "warn",
@@ -1523,58 +1025,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
 
       if (optimisticSnapshot) {
         dispatch({ type: "video_observed", snapshot: optimisticSnapshot });
-        recordDiagnosticsStage({
-          eventId: diagnosticsEventId,
-          parentEventId: options?.debugInput?.parentEventId ?? null,
-          source:
-            options?.debugInput?.source ??
-            resolveDiagnosticsSourceFromRoomActionSource(commandSource),
-          action: diagnosticsAction,
-          rawInput: options?.debugInput?.rawInput ?? null,
-          wallClockTs: Date.now(),
-          currentTimeSec: optimisticSnapshot.currentTime,
-          durationSec: optimisticSnapshot.duration,
-          paused: optimisticSnapshot.status !== "playing",
-          playbackRate: optimisticSnapshot.playbackRate,
-          sequenceNumber: state.playback.version,
-          roomVersion: state.playback.version,
-          stateVersion: state.playback.version,
-          playbackStateVersion: state.playback.version,
-          stage: "applied",
-          notes: "optimistic_local_apply",
-          reason: null,
-          status: "applied",
-          actorSessionId: participantSessionId,
-          transportDirection: "local",
-          extra: null,
-        });
-        requestAnimationFrame(() => {
-          recordDiagnosticsStage({
-            eventId: diagnosticsEventId,
-            parentEventId: options?.debugInput?.parentEventId ?? null,
-            source:
-              options?.debugInput?.source ??
-              resolveDiagnosticsSourceFromRoomActionSource(commandSource),
-            action: diagnosticsAction,
-            rawInput: options?.debugInput?.rawInput ?? null,
-            wallClockTs: Date.now(),
-            currentTimeSec: optimisticSnapshot.currentTime,
-            durationSec: optimisticSnapshot.duration,
-            paused: optimisticSnapshot.status !== "playing",
-            playbackRate: optimisticSnapshot.playbackRate,
-            sequenceNumber: state.playback.version,
-            roomVersion: state.playback.version,
-            stateVersion: state.playback.version,
-            playbackStateVersion: state.playback.version,
-            stage: "rendered",
-            notes: "optimistic_local_render",
-            reason: null,
-            status: "rendered",
-            actorSessionId: participantSessionId,
-            transportDirection: "local",
-            extra: null,
-          });
-        });
       }
 
       const nextCurrentTime =
@@ -1622,14 +1072,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           playbackRate: nextPlaybackRate,
         },
         commandSource,
-        {
-          ...options?.debugInput,
-          eventId: diagnosticsEventId,
-          source:
-            options?.debugInput?.source ??
-            resolveDiagnosticsSourceFromRoomActionSource(commandSource),
-          action: diagnosticsAction,
-        },
       );
     } catch (error) {
       const message = "This browser could not apply the requested playback change.";
@@ -1648,12 +1090,10 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     type: SharedRoomControlType;
     deltaSeconds?: number;
     targetTimeSeconds?: number;
-    debugInput?: PlaybackControllerDebugInput | null;
   }) {
     void dispatchSharedCommand(command.type, {
       deltaSeconds: command.deltaSeconds,
       targetTimeSeconds: command.targetTimeSeconds,
-      debugInput: command.debugInput ?? null,
     });
   }
 
@@ -1679,23 +1119,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           playbackRate: event.playbackRate,
         },
         "cast_remote",
-        {
-          eventId: event.eventId,
-          action:
-            event.type === "seek"
-              ? event.seekDirection === "backward"
-                ? "seek_backward"
-                : "seek_forward"
-              : event.type === "play"
-                ? "play"
-                : event.type === "pause"
-                  ? "pause"
-                  : "custom",
-          source: "cast-input",
-          rawInput: event.rawInput,
-          notes: "chromecast_remote_forwarded_to_room",
-          reason: null,
-        },
       );
     },
   );
@@ -1769,33 +1192,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     });
 
     socket.on("room:hydrated", async (payload: RoomSocketHydrationPayload) => {
-      const hydrationEventId = createSafeId("room-hydration");
-
       dispatch({ type: "room_hydrated", payload, source: "hydration" });
-      recordDiagnosticsStage({
-        eventId: hydrationEventId,
-        parentEventId: null,
-        source: "transport",
-        action: "state_sync",
-        rawInput: null,
-        wallClockTs: Date.now(),
-        currentTimeSec: resolveSynchronizedPlaybackTime(payload.playback),
-        durationSec: snapshot.media?.durationSeconds ?? null,
-        paused: payload.playback.status !== "playing",
-        playbackRate: payload.playback.playbackRate,
-        sequenceNumber: payload.playback.version,
-        roomVersion: payload.playback.version,
-        stateVersion: payload.playback.version,
-        playbackStateVersion: payload.playback.version,
-        stage: "received",
-        notes: "room_hydrated",
-        reason: null,
-        status: "observed",
-        actorSessionId: participantSessionId,
-        transportDirection: "inbound",
-        estimatedServerTimeMs: payload.serverTimeMs ?? null,
-        extra: null,
-      });
       logDebugEvent({
         level: "info",
         category: "sync",
@@ -1803,12 +1200,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
         source: "hydration",
         data: payload,
       });
-      await applyAuthoritativePlayback(payload.playback, "hydration", {
-        eventId: hydrationEventId,
-        action: "state_sync",
-        notes: "room_hydrated",
-        reason: null,
-      });
+      await applyAuthoritativePlayback(payload.playback, "hydration");
     });
 
     socket.on("room:playback-sync", async (payload: RoomSocketPlaybackSyncPayload) => {
@@ -1819,22 +1211,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
         eventCommandSource: payload.event.commandSource,
         pendingSource,
       });
-      const transport = payload.transportDiagnostics ?? null;
-      const eventAction =
-        transport?.debugAction ??
-        (payload.event.type === "join"
-          ? ("state_sync" as const)
-          : resolveDiagnosticsActionFromSharedCommand({
-              type: payload.event.type,
-              targetTimeSeconds:
-                payload.event.type === "seek"
-                  ? payload.event.currentTime
-                  : undefined,
-            }));
-      const diagnosticsEventId =
-        transport?.eventId ??
-        payload.sourceClientEventId ??
-        createSafeId("room-playback-sync");
 
       if (payload.sourceClientEventId) {
         pendingClientEventIdsRef.current.delete(payload.sourceClientEventId);
@@ -1842,121 +1218,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       }
 
       dispatch({ type: "room_playback_sync", payload, source });
-      if (transport) {
-        recordDiagnosticsStage({
-          eventId: diagnosticsEventId,
-          parentEventId: transport.parentEventId,
-          source: transport.debugSource ?? "transport",
-          action: eventAction,
-          rawInput: transport.rawInput,
-          wallClockTs: transport.serverReceivedAtMs,
-          currentTimeSec: payload.event.currentTime,
-          durationSec: snapshot.media?.durationSeconds ?? null,
-          paused: payload.playback.status !== "playing",
-          playbackRate: payload.playback.playbackRate,
-          sequenceNumber:
-            transport.serverSequenceNumber ?? payload.playback.version,
-          roomVersion: transport.serverRoomVersion ?? payload.playback.version,
-          stateVersion: payload.playback.version,
-          playbackStateVersion: payload.playback.version,
-          stage: "server_received",
-          notes: "server_received_room_command",
-          reason: null,
-          status: "observed",
-          actorSessionId: transport.actorSessionId,
-          transportDirection: "inbound",
-          estimatedServerTimeMs: transport.serverReceivedAtMs,
-          extra: {
-            sourceClientEventId: transport.sourceClientEventId,
-          },
-        });
-        recordDiagnosticsStage({
-          eventId: diagnosticsEventId,
-          parentEventId: transport.parentEventId,
-          source: transport.debugSource ?? "transport",
-          action: eventAction,
-          rawInput: transport.rawInput,
-          wallClockTs: transport.serverBroadcastAtMs,
-          currentTimeSec: payload.event.currentTime,
-          durationSec: snapshot.media?.durationSeconds ?? null,
-          paused: payload.playback.status !== "playing",
-          playbackRate: payload.playback.playbackRate,
-          sequenceNumber:
-            transport.serverSequenceNumber ?? payload.playback.version,
-          roomVersion: transport.serverRoomVersion ?? payload.playback.version,
-          stateVersion: payload.playback.version,
-          playbackStateVersion: payload.playback.version,
-          stage: "broadcast",
-          notes: "server_broadcast_room_command",
-          reason: null,
-          status: "observed",
-          actorSessionId: transport.actorSessionId,
-          transportDirection: "inbound",
-          estimatedServerTimeMs: transport.serverBroadcastAtMs,
-          extra: {
-            sourceClientEventId: transport.sourceClientEventId,
-          },
-        });
-      }
-      const sequenceSnapshot = recordRemoteDiagnosticsSequenceSnapshot({
-        eventId: diagnosticsEventId,
-        roomId: snapshot.roomId,
-        clientId: participantSessionId,
-        clientType: diagnosticsClientType,
-        recordedAtMs: Date.now(),
-        sequenceNumber:
-          transport?.serverSequenceNumber ?? payload.playback.version,
-        roomVersion: transport?.serverRoomVersion ?? payload.playback.version,
-        stateVersion: payload.playback.version,
-        sourceClientEventId: payload.sourceClientEventId,
-        notes: source,
-      });
-      recordDiagnosticsStage({
-        eventId: diagnosticsEventId,
-        parentEventId: transport?.parentEventId ?? null,
-        source: transport?.debugSource ?? "transport",
-        action: eventAction,
-        rawInput: transport?.rawInput ?? null,
-        wallClockTs: Date.now(),
-        currentTimeSec: payload.event.currentTime,
-        durationSec: snapshot.media?.durationSeconds ?? null,
-        paused: payload.playback.status !== "playing",
-        playbackRate: payload.playback.playbackRate,
-        sequenceNumber:
-          transport?.serverSequenceNumber ?? payload.playback.version,
-        roomVersion: transport?.serverRoomVersion ?? payload.playback.version,
-        stateVersion: payload.playback.version,
-        playbackStateVersion: payload.playback.version,
-        stage:
-          sequenceSnapshot?.relation === "duplicate"
-            ? "duplicate"
-            : sequenceSnapshot?.relation === "out_of_order"
-              ? "out_of_order"
-              : sequenceSnapshot?.relation === "stale"
-                ? "stale"
-                : "received",
-        notes: `room_playback_sync:${source}`,
-        reason:
-          sequenceSnapshot?.relation &&
-          sequenceSnapshot.relation !== "in_order" &&
-          sequenceSnapshot.relation !== "initial"
-            ? sequenceSnapshot.relation
-            : null,
-        status:
-          sequenceSnapshot?.relation === "duplicate" ||
-          sequenceSnapshot?.relation === "out_of_order" ||
-          sequenceSnapshot?.relation === "stale"
-            ? "warning"
-            : "observed",
-        actorSessionId: payload.event.actorSessionId,
-        transportDirection: "inbound",
-        estimatedServerTimeMs: transport?.serverBroadcastAtMs ?? null,
-        extra: {
-          relation: sequenceSnapshot?.relation ?? null,
-          gapSize: sequenceSnapshot?.gapSize ?? null,
-          sourceClientEventId: payload.sourceClientEventId,
-        },
-      });
       logDebugEvent({
         level: "info",
         category: "sync",
@@ -1964,20 +1225,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
         source,
         data: payload,
       });
-      await applyAuthoritativePlayback(payload.playback, source, {
-        eventId: diagnosticsEventId,
-        parentEventId: transport?.parentEventId ?? null,
-        action: eventAction,
-        rawInput: transport?.rawInput ?? null,
-        transport,
-        notes: `room_playback_sync:${source}`,
-        reason:
-          sequenceSnapshot?.relation &&
-          sequenceSnapshot.relation !== "in_order" &&
-          sequenceSnapshot.relation !== "initial"
-            ? sequenceSnapshot.relation
-            : null,
-      });
+      await applyAuthoritativePlayback(payload.playback, source);
     });
 
     return () => {
@@ -1985,14 +1233,7 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       socket.disconnect();
       socketRef.current = null;
     };
-  }, [
-    diagnosticsClientType,
-    participantSessionId,
-    recordDiagnosticsStage,
-    snapshot.media?.durationSeconds,
-    snapshot.playback,
-    snapshot.roomId,
-  ]);
+  }, [participantSessionId, snapshot.playback, snapshot.roomId]);
 
   useEffect(() => {
     if (!castIssue || castStatus === "loading" || castStatus === "available") {
@@ -2008,103 +1249,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
   }, [castIssue, castStatus]);
 
   useEffect(() => {
-    if (state.connectionStatus !== "connected") {
-      return;
-    }
-
-    const socket = socketRef.current;
-
-    if (!socket) {
-      return;
-    }
-
-    let cancelled = false;
-
-    const requestClockSample = () => {
-      const clientSentAtMs = Date.now();
-      const sampleId = createSafeId("clock-sync");
-
-      socket.emit(
-        "room:debug-clock-sync",
-        {
-          sampleId,
-          clientSentAtMs,
-        },
-        (response: RoomDebugClockSyncResponse) => {
-          if (cancelled) {
-            return;
-          }
-
-          const clientReceivedAtMs = Date.now();
-          const clockSample = recordRemoteDiagnosticsClockSyncSample({
-            sampleId: response.sampleId,
-            roomId: snapshot.roomId,
-            clientId: participantSessionId,
-            clientType: diagnosticsClientType,
-            recordedAtMs: clientReceivedAtMs,
-            clientSentAtMs: response.clientSentAtMs,
-            clientReceivedAtMs,
-            serverReceivedAtMs: response.serverReceivedAtMs,
-            serverSentAtMs: response.serverSentAtMs,
-          });
-
-          if (!clockSample) {
-            return;
-          }
-
-          recordDiagnosticsStage({
-            eventId: clockSample.id,
-            parentEventId: null,
-            source: "transport",
-            action: "state_sync",
-            rawInput: null,
-            wallClockTs: clientReceivedAtMs,
-            currentTimeSec: resolvedAuthoritativeCurrentTime,
-            durationSec: snapshot.media?.durationSeconds ?? null,
-            paused: state.playback.status !== "playing",
-            playbackRate: state.playback.playbackRate,
-            sequenceNumber: state.playback.version,
-            roomVersion: state.playback.version,
-            stateVersion: state.playback.version,
-            playbackStateVersion: state.playback.version,
-            stage: "ack",
-            notes: "clock_sync_sample",
-            reason: null,
-            status: "observed",
-            actorSessionId: participantSessionId,
-            transportDirection: "inbound",
-            estimatedServerOffsetMs: clockSample.estimatedOffsetMs,
-            estimatedServerTimeMs: clockSample.estimatedServerTimeMs,
-            extra: {
-              roundTripMs: clockSample.roundTripMs,
-              estimatedOneWayLatencyMs: clockSample.estimatedOneWayLatencyMs,
-            },
-          });
-        },
-      );
-    };
-
-    requestClockSample();
-    const intervalId = window.setInterval(requestClockSample, 5_000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(intervalId);
-    };
-  }, [
-    diagnosticsClientType,
-    participantSessionId,
-    recordDiagnosticsStage,
-    resolvedAuthoritativeCurrentTime,
-    snapshot.media?.durationSeconds,
-    snapshot.roomId,
-    state.connectionStatus,
-    state.playback.playbackRate,
-    state.playback.status,
-    state.playback.version,
-  ]);
-
-  useEffect(() => {
     logDebugEvent({
       level: "info",
       category: "cast",
@@ -2112,81 +1256,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
       source: "system",
     });
   }, [castDisplayStatus]);
-
-  useEffect(() => {
-    const emitDriftSnapshot = () => {
-      const diagnosticsSnapshot = getRemoteDiagnosticsStoreSnapshot();
-      const latestPipSnapshot = diagnosticsSnapshot.pipSnapshots.at(-1) ?? null;
-      const latestSequenceSnapshot =
-        diagnosticsSnapshot.sequenceSnapshots.at(-1) ?? null;
-      const chromecastTimeSec =
-        typeof castRuntimeState.lastObservedRemoteCurrentTime === "number"
-          ? castRuntimeState.lastObservedRemoteCurrentTime
-          : null;
-      const chromecastStatus =
-        typeof castRuntimeState.lastObservedRemoteStatus === "string"
-          ? (castRuntimeState.lastObservedRemoteStatus as PlaybackStatus)
-          : null;
-      const authoritativeRoomTimeSec = resolveSynchronizedPlaybackTime(
-        authoritativePlaybackRef.current,
-      );
-      const webClientTimeSec = state.observedPlayback?.currentTime ?? null;
-      const pipTimeSec = latestPipSnapshot?.pipCurrentTimeSec ?? null;
-
-      recordRemoteDiagnosticsDriftSnapshot({
-        recordedAtMs: Date.now(),
-        authoritativeRoomTimeSec,
-        chromecastTimeSec,
-        webClientTimeSec,
-        pipTimeSec,
-        chromecastMinusRoomMs: calculateDriftMilliseconds(
-          chromecastTimeSec,
-          authoritativeRoomTimeSec,
-        ),
-        webMinusRoomMs: calculateDriftMilliseconds(
-          webClientTimeSec,
-          authoritativeRoomTimeSec,
-        ),
-        pipMinusRoomMs: calculateDriftMilliseconds(
-          pipTimeSec,
-          authoritativeRoomTimeSec,
-        ),
-        chromecastMinusWebMs: calculateDriftMilliseconds(
-          chromecastTimeSec,
-          webClientTimeSec,
-        ),
-        authoritativeStatus: authoritativePlaybackRef.current.status,
-        chromecastStatus,
-        webStatus: state.observedPlayback?.status ?? null,
-        pipStatus: latestPipSnapshot?.pipStatus ?? null,
-        authoritativePlaybackVersion: authoritativePlaybackRef.current.version,
-        lastSequenceNumber: diagnosticsSnapshot.lastSequenceNumber,
-        lastAppliedStateVersion: authoritativePlaybackRef.current.version,
-        lastSeekSource:
-          state.lastEvent?.type === "seek"
-            ? (state.lastEvent.commandSource ?? state.lastActionSource ?? null)
-            : null,
-        lastPlayPauseSource:
-          state.lastEvent?.type === "play" || state.lastEvent?.type === "pause"
-            ? (state.lastEvent.commandSource ?? state.lastActionSource ?? null)
-            : null,
-        staleWarning: latestSequenceSnapshot?.relation === "stale",
-        outOfOrderWarning: latestSequenceSnapshot?.relation === "out_of_order",
-      });
-    };
-
-    emitDriftSnapshot();
-    const intervalId = window.setInterval(emitDriftSnapshot, 1_000);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [
-    castRuntimeState,
-    state.lastActionSource,
-    state.lastEvent,
-    state.observedPlayback,
-  ]);
 
   useEffect(() => {
     if (castStatus !== "connected") {
@@ -2285,81 +1354,8 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
     onSelectSubtitleTrack: handleSubtitleTrackSelection,
   });
 
-  useEffect(() => {
-    if (!state.observedPlayback) {
-      return;
-    }
-
-    recordRemoteDiagnosticsPlayerSnapshot({
-      recordedAtMs: Date.now(),
-      playerKind: "local-web",
-      currentTimeSec: state.observedPlayback.currentTime,
-      durationSec: state.observedPlayback.duration,
-      status: state.observedPlayback.status,
-      playbackRate: state.observedPlayback.playbackRate,
-      paused: state.observedPlayback.status !== "playing",
-      buffering: null,
-      seeking: null,
-      primaryClockSource: state.observedPlayback.primaryClockSource,
-      extra: {
-        audibleCurrentTimeSec: state.observedPlayback.audibleCurrentTime,
-        avDriftSeconds: state.observedPlayback.avDriftSeconds,
-        syncMode: state.observedPlayback.syncMode,
-        videoCurrentTimeSec: state.observedPlayback.videoCurrentTime,
-      },
-    });
-  }, [state.observedPlayback]);
-
-  useEffect(() => {
-    const chromecastTimeSec =
-      typeof castRuntimeState.lastObservedRemoteCurrentTime === "number"
-        ? castRuntimeState.lastObservedRemoteCurrentTime
-        : null;
-    const chromecastStatus =
-      typeof castRuntimeState.lastObservedRemoteStatus === "string"
-        ? (castRuntimeState.lastObservedRemoteStatus as PlaybackStatus)
-        : null;
-    const chromecastPlaybackRate =
-      typeof castRuntimeState.lastObservedRemotePlaybackRate === "number"
-        ? castRuntimeState.lastObservedRemotePlaybackRate
-        : typeof castRuntimeState.remotePlaybackRate === "number"
-          ? castRuntimeState.remotePlaybackRate
-          : null;
-
-    if (chromecastTimeSec == null && chromecastStatus == null) {
-      return;
-    }
-
-    recordRemoteDiagnosticsPlayerSnapshot({
-      recordedAtMs: Date.now(),
-      playerKind: "chromecast-remote",
-      currentTimeSec: chromecastTimeSec,
-      durationSec: null,
-      status: chromecastStatus,
-      playbackRate: chromecastPlaybackRate,
-      paused:
-        chromecastStatus == null ? null : chromecastStatus !== "playing",
-      buffering: false,
-      seeking: false,
-      primaryClockSource: "chromecast-remote-player",
-      extra: {
-        castObservationDelayMs:
-          typeof castRuntimeState.castObservationDelayMs === "number"
-            ? castRuntimeState.castObservationDelayMs
-            : null,
-        remotePlayerObserved: castRemotePlayerObserved,
-        remotePlayerState:
-          typeof castRuntimeState.lastObservedRemotePlayerState === "string"
-            ? castRuntimeState.lastObservedRemotePlayerState
-            : null,
-      },
-    });
-  }, [castRemotePlayerObserved, castRuntimeState]);
-
   return (
-    <>
-      <RoomDiagnosticsPanel roomId={snapshot.roomId} />
-      <div className="grid gap-6 xl:grid-cols-[1.45fr_0.85fr]">
+    <div className="grid gap-6 xl:grid-cols-[1.45fr_0.85fr]">
       <section
         data-debug-room-sync="true"
         className="rounded-[2rem] border border-white/10 bg-[#151117]/90 p-8 shadow-[0_24px_70px_rgba(0,0,0,0.28)]"
@@ -2754,7 +1750,6 @@ export function RoomPlayerScaffold({ snapshot }: RoomPlayerScaffoldProps) {
           )}
         </section>
       </aside>
-      </div>
-    </>
+    </div>
   );
 }

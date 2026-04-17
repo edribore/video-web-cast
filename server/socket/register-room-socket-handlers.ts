@@ -1,8 +1,6 @@
 import type { Server, Socket } from "socket.io";
 import { applySharedRoomControl, recordRoomJoin } from "../room-realtime";
 import type {
-  RoomDebugClockSyncRequest,
-  RoomDebugClockSyncResponse,
   SharedRoomControlCommand,
   SharedRoomControlSource,
 } from "../../types/room-sync";
@@ -61,23 +59,6 @@ function isSharedRoomControlSource(
     value === "local_user" ||
     value === "cast_local_command" ||
     value === "cast_remote"
-  );
-}
-
-function isRoomDebugClockSyncRequest(
-  value: unknown,
-): value is RoomDebugClockSyncRequest {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const candidate = value as Partial<RoomDebugClockSyncRequest>;
-
-  return (
-    typeof candidate.sampleId === "string" &&
-    candidate.sampleId.trim().length > 0 &&
-    typeof candidate.clientSentAtMs === "number" &&
-    Number.isFinite(candidate.clientSentAtMs)
   );
 }
 
@@ -164,27 +145,5 @@ export function registerRoomSocketHandlers(io: Server) {
         });
       }
     });
-
-    socket.on(
-      "room:debug-clock-sync",
-      (
-        payload: unknown,
-        callback?: (response: RoomDebugClockSyncResponse) => void,
-      ) => {
-        if (!isRoomDebugClockSyncRequest(payload) || typeof callback !== "function") {
-          return;
-        }
-
-        const serverReceivedAtMs = Date.now();
-        const response: RoomDebugClockSyncResponse = {
-          sampleId: payload.sampleId,
-          clientSentAtMs: payload.clientSentAtMs,
-          serverReceivedAtMs,
-          serverSentAtMs: Date.now(),
-        };
-
-        callback(response);
-      },
-    );
   });
 }
